@@ -1,0 +1,27 @@
+[package]
+name = "wiiu_rpl"
+description = "RPX/RPL loader: ELF parsing, section placement, relocation and import resolution"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flate2 = "1"
+log = { workspace = true }
+thiserror = { workspace = true }
+wiiu_mem_addr = { workspace = true }
+wiiu_memory = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Expose `builder::RplBuilder` for other crates' tests.
+builder = []

@@ -1,0 +1,16 @@
+/target
+*.log
+/flora.toml
+/roms.json
+
+# ROMs and anything derived from them never enter the repository.
+/roms/
+*.rpx
+*.rpl
+*.wud
+*.wux
+*.wua
+*.iso
+/rom_captures/
+/resources/
+save/

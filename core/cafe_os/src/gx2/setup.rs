@@ -1,0 +1,100 @@
+//! GX2 initialisation helpers with little or no GPU-visible effect.
+use wiiu_hle_macros::hle_export;
+
+use crate::hle::{HleContext, HleError};
+
+/// GX2R resource allocator callbacks (used by GX2R buffer creation).
+#[hle_export(lib = "gx2", name = "GX2RSetAllocator")]
+fn gx2r_set_allocator(ctx: &mut HleContext<'_>, alloc: u32, free: u32) {
+    ctx.os.gx2.gx2r_allocator = (alloc, free);
+}
+
+/// Cache invalidation: memory is always coherent here.
+#[hle_export(lib = "gx2", name = "GX2Invalidate")]
+fn gx2_invalidate(_ctx: &mut HleContext<'_>, _flags: u32, _address: u32, _size: u32) {}
+
+/// Scan buffers are recorded by `GX2CopyColorBufferToScanBuffer`; the TV/DRC
+/// buffer memory itself is not needed.
+#[hle_export(lib = "gx2", name = "GX2SetTVBuffer")]
+fn gx2_set_tv_buffer(
+    _ctx: &mut HleContext<'_>,
+    _buffer: u32,
+    _size: u32,
+    _mode: u32,
+    _format: u32,
+    _buffering: u32,
+) {
+}
+
+#[hle_export(lib = "gx2", name = "GX2SetDRCBuffer")]
+fn gx2_set_drc_buffer(
+    _ctx: &mut HleContext<'_>,
+    _buffer: u32,
+    _size: u32,
+    _mode: u32,
+    _format: u32,
+    _buffering: u32,
+) {
+}
+
+#[hle_export(lib = "gx2", name = "GX2SetTVScale")]
+fn gx2_set_tv_scale(_ctx: &mut HleContext<'_>, _width: u32, _height: u32) {}
+
+#[hle_export(lib = "gx2", name = "GX2SetDRCScale")]
+fn gx2_set_drc_scale(_ctx: &mut HleContext<'_>, _width: u32, _height: u32) {}
+
+/// `SQ_PGM_RESOURCES_*` is the first register of every GX2 shader structure.
+fn resources(ctx: &HleContext<'_>, shader: u32) -> Result<u32, HleError> {
+    Ok(ctx.memory.read_u32(shader)?)
+}
+
+#[hle_export(lib = "gx2", name = "GX2GetVertexShaderGPRs")]
+fn gx2_get_vertex_shader_gprs(ctx: &mut HleContext<'_>, shader: u32) -> Result<u32, HleError> {
+    Ok(resources(ctx, shader)? & 0xFF)
+}
+
+#[hle_export(lib = "gx2", name = "GX2GetVertexShaderStackEntries")]
+fn gx2_get_vertex_shader_stack_entries(
+    ctx: &mut HleContext<'_>,
+    shader: u32,
+) -> Result<u32, HleError> {
+    Ok((resources(ctx, shader)? >> 8) & 0xFF)
+}
+
+#[hle_export(lib = "gx2", name = "GX2GetPixelShaderGPRs")]
+fn gx2_get_pixel_shader_gprs(ctx: &mut HleContext<'_>, shader: u32) -> Result<u32, HleError> {
+    Ok(resources(ctx, shader)? & 0xFF)
+}
+
+#[hle_export(lib = "gx2", name = "GX2GetPixelShaderStackEntries")]
+fn gx2_get_pixel_shader_stack_entries(
+    ctx: &mut HleContext<'_>,
+    shader: u32,
+) -> Result<u32, HleError> {
+    Ok((resources(ctx, shader)? >> 8) & 0xFF)
+}
+
+#[hle_export(lib = "gx2", name = "GX2GetGeometryShaderGPRs")]
+fn gx2_get_geometry_shader_gprs(ctx: &mut HleContext<'_>, shader: u32) -> Result<u32, HleError> {
+    Ok(resources(ctx, shader)? & 0xFF)
+}
+
+#[hle_export(lib = "gx2", name = "GX2GetGeometryShaderStackEntries")]
+fn gx2_get_geometry_shader_stack_entries(
+    ctx: &mut HleContext<'_>,
+    shader: u32,
+) -> Result<u32, HleError> {
+    Ok((resources(ctx, shader)? >> 8) & 0xFF)
+}
+
+#[hle_export(lib = "gx2", name = "GX2PerfInit")]
+fn gx2_perf_init(_ctx: &mut HleContext<'_>, _perf: u32, _max_tags: u32, _allocator: u32) {}
+
+#[hle_export(lib = "gx2", name = "GX2PerfSetCollectionMethod")]
+fn gx2_perf_set_collection_method(_ctx: &mut HleContext<'_>, _perf: u32, _method: u32) {}
+
+#[hle_export(lib = "gx2", name = "GX2PerfMetricsClear")]
+fn gx2_perf_metrics_clear(_ctx: &mut HleContext<'_>, _perf: u32) {}
+
+#[hle_export(lib = "gx2", name = "GX2PerfTagEnable")]
+fn gx2_perf_tag_enable(_ctx: &mut HleContext<'_>, _perf: u32, _tag: u32, _enable: bool) {}

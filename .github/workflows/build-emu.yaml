@@ -1,0 +1,69 @@
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "**/*.md"
+  pull_request:
+    branches: ["*"]
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROFILE: release
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - package: flora_egui
+            app_name: flora_egui
+            bin_name: flora_egui
+            features: release
+            no_default_features: true
+
+        target:
+          # - target: aarch64-apple-darwin
+          #   os: macos-latest
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+          # - target: x86_64-unknown-linux-gnu
+          #   os: ubuntu-latest
+
+    runs-on: ${{ matrix.target.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup environment
+        uses: ./.github/actions/setup-deps
+        with:
+          platform: ${{ matrix.target.os }}
+          build_profile: ${{ env.PROFILE }}
+
+      - name: Build
+        shell: bash
+        run: cargo build -p "${{ matrix.app.package }}" --release
+
+      - name: Move exe -> ./build
+        uses: ./.github/actions/setup-release
+        with:
+          app_name: ${{ matrix.app.app_name }}
+          bin_name: ${{ matrix.app.bin_name || matrix.app.app_name }}
+          build_profile: ${{ env.PROFILE }}
+
+      - name: Upload a Build Artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ${{ matrix.app.bin_name || matrix.app.app_name }}-${{ runner.os }}
+          path: ./build/

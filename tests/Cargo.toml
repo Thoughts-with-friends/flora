@@ -1,0 +1,30 @@
+[package]
+name = "flora_tests"
+description = "Developer tools and ROM smoke tests; nothing in core/ or gui/ depends on this crate"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+publish = false
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+env_logger = "0.11"
+flora_game_library = { workspace = true }
+flora_render = { workspace = true }
+png = "0.18"
+pollster = "0.4"
+wiiu_cafe_os = { workspace = true }
+wiiu_emu = { workspace = true }
+wiiu_gpu = { workspace = true }
+wiiu_rpl = { workspace = true }
+
+[lints]
+workspace = true

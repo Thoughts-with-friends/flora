@@ -1,0 +1,19 @@
+[package]
+name = "wiiu_peripherals"
+description = "Small Wii U devices: timebase, RTC and controller state (GamePad, Pro Controller)"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bitflags = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+
+[lints]
+workspace = true

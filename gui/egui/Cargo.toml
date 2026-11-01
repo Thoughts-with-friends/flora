@@ -1,0 +1,25 @@
+[package]
+name = "flora_egui"
+description = "flora: the default egui front end"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
+env_logger = "0.11"
+flora_game_library = { workspace = true }
+flora_gui_common = { workspace = true }
+flora_render = { workspace = true }
+log = { workspace = true }
+rfd = "0.15"
+wiiu_emu = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "wiiu_mem_addr"
+description = "Wii U memory map: address ranges of the effective and physical address spaces"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

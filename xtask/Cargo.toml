@@ -1,0 +1,15 @@
+# Build/run dispatcher for the front ends. Invoked via the `cargo xtask` alias in
+# `.cargo/config.toml`. Not published, not part of `default-members`.
+[package]
+name = "xtask"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "wiiu_title"
+description = "Wii U title formats: installed title directories, meta/app XML and WUX images"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+roxmltree = "0.21"
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

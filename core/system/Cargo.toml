@@ -1,0 +1,32 @@
+[package]
+name = "wiiu_emu"
+description = "The Wii U system: wires CPU cores, memory, OS, IOSU and GPU into a runnable emulator"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
+wiiu_cafe_os = { workspace = true }
+wiiu_cpu = { workspace = true }
+wiiu_fs = { workspace = true }
+wiiu_gpu = { workspace = true }
+wiiu_iosu = { workspace = true }
+wiiu_mem_addr = { workspace = true }
+wiiu_memory = { workspace = true }
+wiiu_peripherals = { workspace = true }
+wiiu_rpl = { workspace = true }
+wiiu_title = { workspace = true }
+
+[dev-dependencies]
+wiiu_rpl = { workspace = true, features = ["builder"] }
+
+[lints]
+workspace = true

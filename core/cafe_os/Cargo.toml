@@ -1,0 +1,32 @@
+[package]
+name = "wiiu_cafe_os"
+description = "Cafe OS HLE: coreinit, gx2, sndcore2, vpad and other system libraries"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flate2 = "1"
+log = { workspace = true }
+thiserror = { workspace = true }
+wiiu_cpu = { workspace = true }
+wiiu_gpu = { workspace = true }
+wiiu_hle_macros = { workspace = true }
+wiiu_iosu = { workspace = true }
+wiiu_mem_addr = { workspace = true }
+wiiu_memory = { workspace = true }
+wiiu_peripherals = { workspace = true }
+wiiu_rpl = { workspace = true }
+wiiu_sound = { workspace = true }
+
+[dev-dependencies]
+wiiu_fs = { workspace = true }
+
+[lints]
+workspace = true

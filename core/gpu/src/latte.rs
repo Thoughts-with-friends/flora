@@ -1,0 +1,1429 @@
+//! Turns register state into host work: render targets, shaders, textures,
+//! vertex data and pipeline state of a draw.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::cast_precision_loss
+)]
+
+use std::{collections::HashMap, sync::Arc};
+
+use wiiu_memory::Memory;
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::{
+    addrlib::{self, tile_mode},
+    command::opcode::SURFACE_WORDS,
+    regs::{RegisterFile, base, config, context as reg, resource},
+    render::{
+        AddressMode, BindingKind, BlendState, BoundTexture, DepthClear, DrawCommand, HostFormat,
+        MipData, PipelineState, RenderCommand, SamplerDesc, ShaderModule, StencilFace, SurfaceKey,
+        TextureUpload, Topology,
+    },
+    shader::{self, PixelInputs, TEXTURE_UNITS, TextureDim, TextureKind, TextureSignature},
+    tiling::{Layout, detile, swizzle_from_address},
+};
+
+/// Size of the arena every vertex, index and uniform byte goes through.
+pub const ARENA_SIZE: u32 = 0x2000_0000;
+/// Alignment of draw parameter blocks (`min_storage_buffer_offset_alignment`).
+const PARAMS_ALIGN: u32 = 256;
+/// Size of `DrawParams` in the shader prelude.
+const PARAMS_SIZE: usize = 32 + 4 * 16 * 4;
+/// Texture contents are re-checked once per this many frames at most.
+const TEXTURE_RECHECK_FRAMES: u64 = 2;
+/// Bytes hashed per step when checking whether a texture changed.
+const HASH_STRIDE: usize = 64;
+
+/// Primitive modes of `VGT_PRIMITIVE_TYPE`.
+mod primitive {
+    pub const POINTS: u32 = 1;
+    pub const LINES: u32 = 2;
+    pub const LINE_STRIP: u32 = 3;
+    pub const TRIANGLES: u32 = 4;
+    pub const TRIANGLE_FAN: u32 = 5;
+    pub const TRIANGLE_STRIP: u32 = 6;
+    pub const RECTS: u32 = 0x11;
+    pub const LINE_LOOP: u32 = 0x12;
+    pub const QUADS: u32 = 0x13;
+    pub const QUAD_STRIP: u32 = 0x14;
+}
+
+/// `VGT_DMA_INDEX_TYPE` values GX2 uses.
+pub mod index_type {
+    pub const U16_LE: u32 = 0;
+    pub const U32_LE: u32 = 1;
+    pub const U16_BE: u32 = 4;
+    pub const U32_BE: u32 = 9;
+}
+
+/// The surface descriptor of the HLE packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SurfaceWords {
+    pub address: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub pitch: u32,
+    pub tile_mode: u32,
+    pub swizzle: u32,
+    pub format: u32,
+    pub aa: u32,
+    pub level: u32,
+    pub slice: u32,
+}
+
+impl SurfaceWords {
+    pub fn parse(words: &[u32]) -> Option<Self> {
+        let w: &[u32; SURFACE_WORDS] = words.get(..SURFACE_WORDS)?.try_into().ok()?;
+        Some(Self {
+            address: w[0],
+            width: w[1],
+            height: w[2],
+            depth: w[3],
+            pitch: w[4],
+            tile_mode: w[5],
+            swizzle: w[6],
+            format: w[7],
+            aa: w[8],
+            level: w[9] >> 16,
+            slice: w[9] & 0xFFFF,
+        })
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        self.address != 0 && self.width != 0 && self.height != 0
+    }
+}
+
+/// `E_GX2SURFFMT` → host format.
+pub fn host_format(gx2_format: u32) -> HostFormat {
+    use HostFormat as H;
+    match gx2_format {
+        0x001 => H::R8Unorm,
+        0x201 => H::R8Snorm,
+        0x101 => H::R8Uint,
+        0x301 => H::R8Sint,
+        0x002 | 0x007 => H::Rg8Unorm,
+        0x207 => H::Rg8Snorm,
+        0x107 => H::Rg8Uint,
+        0x307 => H::Rg8Sint,
+        // These are widened on upload.
+        0x008..=0x00C => H::Rgba8Unorm,
+        0x01A => H::Rgba8Unorm,
+        0x21A => H::Rgba8Snorm,
+        0x11A => H::Rgba8Uint,
+        0x31A => H::Rgba8Sint,
+        0x41A => H::Rgba8Srgb,
+        0x005 => H::R16Unorm,
+        0x105 => H::R16Uint,
+        0x305 => H::R16Sint,
+        0x806 => H::R16Float,
+        0x00F => H::Rg16Unorm,
+        0x10F => H::Rg16Uint,
+        0x30F => H::Rg16Sint,
+        0x810 => H::Rg16Float,
+        0x01F => H::Rgba16Unorm,
+        0x21F => H::Rgba16Snorm,
+        0x11F => H::Rgba16Uint,
+        0x31F => H::Rgba16Sint,
+        0x820 => H::Rgba16Float,
+        0x10D => H::R32Uint,
+        0x30D => H::R32Sint,
+        0x80E => H::R32Float,
+        0x11D => H::Rg32Uint,
+        0x31D => H::Rg32Sint,
+        0x81E => H::Rg32Float,
+        0x122 => H::Rgba32Uint,
+        0x322 => H::Rgba32Sint,
+        0x823 => H::Rgba32Float,
+        0x019 | 0x01B | 0x419 => H::Rgb10a2Unorm,
+        0x816 => H::Rg11b10Float,
+        0x031 => H::Bc1Unorm,
+        0x431 => H::Bc1Srgb,
+        0x032 => H::Bc2Unorm,
+        0x432 => H::Bc2Srgb,
+        0x033 => H::Bc3Unorm,
+        0x433 => H::Bc3Srgb,
+        0x034 => H::Bc4Unorm,
+        0x234 => H::Bc4Snorm,
+        0x035 => H::Bc5Unorm,
+        0x235 => H::Bc5Snorm,
+        other => {
+            log::debug!("unmapped surface format {other:#05x}");
+            H::Rgba8Unorm
+        }
+    }
+}
+
+/// `E_GX2SURFFMT` of a depth buffer → host format.
+pub fn host_depth_format(gx2_format: u32) -> HostFormat {
+    match gx2_format {
+        0x005 => HostFormat::Depth16Unorm,
+        0x011 => HostFormat::Depth24PlusStencil8,
+        0x806 | 0x80E => HostFormat::Depth32Float,
+        _ => HostFormat::Depth32FloatStencil8,
+    }
+}
+
+/// Reconstructs `E_GX2SURFFMT` from `SQ_TEX_RESOURCE_WORD1/4`.
+pub const fn format_from_resource(word1: u32, word4: u32) -> u32 {
+    let hw = (word1 >> 26) & 0x3F;
+    let mut format = hw;
+    if word4 & 1 != 0 {
+        format |= 0x200;
+    }
+    match (word4 >> 8) & 3 {
+        1 => format |= 0x100,
+        2 => format |= 0x800,
+        _ => {}
+    }
+    if (word4 >> 11) & 1 != 0 {
+        format |= 0x400;
+    }
+    format
+}
+
+/// Widens guest texel formats the host lacks; `None` means bytes pass through.
+fn widen_texels(gx2_format: u32, data: &[u8]) -> Option<Vec<u8>> {
+    let scale5 = |v: u16| ((u32::from(v) * 255 + 15) / 31) as u8;
+    let scale6 = |v: u16| ((u32::from(v) * 255 + 31) / 63) as u8;
+    let scale4 = |v: u16| (v * 17) as u8;
+    let pixels16 = || data.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]]));
+    match gx2_format & 0xFF {
+        // R in the low bits (see Cemu's "Vulkan has R in MSB, GPU7 has it in LSB").
+        0x08 => Some(
+            pixels16()
+                .flat_map(|v| [scale5(v & 0x1F), scale6((v >> 5) & 0x3F), scale5(v >> 11), 255])
+                .collect(),
+        ),
+        0x09 => Some(
+            pixels16()
+                .flat_map(|v| [scale6(v & 0x3F), scale5((v >> 6) & 0x1F), scale5(v >> 11), 255])
+                .collect(),
+        ),
+        0x0A => Some(
+            pixels16()
+                .flat_map(|v| {
+                    [
+                        scale5(v & 0x1F),
+                        scale5((v >> 5) & 0x1F),
+                        scale5((v >> 10) & 0x1F),
+                        if v >> 15 != 0 { 255 } else { 0 },
+                    ]
+                })
+                .collect(),
+        ),
+        0x0C => Some(
+            pixels16()
+                .flat_map(|v| {
+                    [
+                        scale5(v >> 11),
+                        scale5((v >> 6) & 0x1F),
+                        scale5((v >> 1) & 0x1F),
+                        if v & 1 != 0 { 255 } else { 0 },
+                    ]
+                })
+                .collect(),
+        ),
+        0x0B => Some(
+            pixels16()
+                .flat_map(|v| {
+                    [
+                        scale4(v & 0xF),
+                        scale4((v >> 4) & 0xF),
+                        scale4((v >> 8) & 0xF),
+                        scale4(v >> 12),
+                    ]
+                })
+                .collect(),
+        ),
+        0x02 => Some(data.iter().flat_map(|v| [(v & 0xF) * 17, (v >> 4) * 17]).collect()),
+        0x1B => Some(
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| {
+                    let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                    let swapped = (v >> 22)
+                        | (((v >> 12) & 0x3FF) << 10)
+                        | (((v >> 2) & 0x3FF) << 20)
+                        | ((v & 3) << 30);
+                    swapped.to_le_bytes()
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn dim_of(gx2_dim: u32) -> TextureDim {
+    match gx2_dim {
+        addrlib::dim::D3 => TextureDim::D3,
+        addrlib::dim::CUBE => TextureDim::Cube,
+        addrlib::dim::D1_ARRAY | addrlib::dim::D2_ARRAY | addrlib::dim::D2_ARRAY_MSAA => {
+            TextureDim::D2Array
+        }
+        _ => TextureDim::D2,
+    }
+}
+
+/// Copy of a guest buffer in the arena.
+#[derive(Debug, Clone, Copy)]
+struct ArenaSlice {
+    offset: u32,
+}
+
+#[derive(Debug, Clone)]
+struct KnownTexture {
+    content_hash: u64,
+    last_check: u64,
+}
+
+/// A program that has been translated, by source hash and dependencies.
+#[derive(Debug)]
+struct ProgramPair {
+    vertex: Arc<ShaderModule>,
+    pixel: Arc<ShaderModule>,
+    vs_samplers: Vec<(u8, u8)>,
+    ps_samplers: Vec<(u8, u8)>,
+    vs_textures: Vec<u8>,
+    ps_textures: Vec<u8>,
+    color_exports: u8,
+}
+
+/// GPU-side caches and what they need to stay coherent with the renderer.
+#[derive(Debug)]
+pub struct Latte {
+    pub commands: Vec<RenderCommand>,
+    /// Bound render targets as declared by GX2.
+    pub color_targets: [SurfaceWords; 8],
+    pub depth_target: SurfaceWords,
+    frame: u64,
+    arena_cursor: u32,
+    arena_entries: HashMap<u64, ArenaSlice>,
+    /// Surfaces rendered to: `(masked address, width, height)` → key.
+    host_surfaces: HashMap<(u32, u32, u32), SurfaceKey>,
+    textures: HashMap<SurfaceKey, KnownTexture>,
+    programs: HashMap<u64, Arc<ProgramPair>>,
+    /// Hash of a shader program, valid for a guest address.
+    code_cache: HashMap<(u32, u32), (u64, Arc<[u8]>, u64)>,
+    next_module_id: u64,
+    pub skipped_draws: u64,
+}
+
+impl Default for Latte {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            color_targets: [SurfaceWords::default(); 8],
+            depth_target: SurfaceWords::default(),
+            frame: 0,
+            arena_cursor: 0,
+            arena_entries: HashMap::new(),
+            host_surfaces: HashMap::new(),
+            textures: HashMap::new(),
+            programs: HashMap::new(),
+            code_cache: HashMap::new(),
+            next_module_id: 1,
+            skipped_draws: 0,
+        }
+    }
+}
+
+/// Swizzle bits never take part in a surface's identity.
+const fn masked_address(address: u32, tile: u32) -> u32 {
+    if tile_mode::is_macro_tiled(tile) { address & !0x7FF } else { address }
+}
+
+impl Latte {
+    pub const fn end_frame(&mut self) {
+        self.frame += 1;
+    }
+
+    fn arena_reserve(&mut self, size: u32, align: u32) -> u32 {
+        let mut offset = self.arena_cursor.next_multiple_of(align);
+        if u64::from(offset) + u64::from(size) > u64::from(ARENA_SIZE) {
+            self.commands.push(RenderCommand::ArenaWrap);
+            self.arena_entries.clear();
+            offset = 0;
+        }
+        self.arena_cursor = offset + size;
+        offset
+    }
+
+    /// Appends bytes, reusing an identical copy if there is one.
+    fn arena_store(&mut self, data: &[u8], align: u32) -> u32 {
+        if data.is_empty() {
+            return 0;
+        }
+        let hash = xxh3_64(data) ^ (u64::from(align) << 56) ^ (data.len() as u64).rotate_left(23);
+        if let Some(slice) = self.arena_entries.get(&hash) {
+            return slice.offset;
+        }
+        let offset = self.arena_reserve(data.len() as u32, align);
+        self.commands.push(RenderCommand::ArenaWrite { offset, bytes: Arc::from(data) });
+        self.arena_entries.insert(hash, ArenaSlice { offset });
+        offset
+    }
+
+    /// Indices of two triangles per rect. The second one is chosen in the vertex
+    /// shader, which alone knows the corner positions: see `RECT_ENTRY_POINT`.
+    fn rect_corners(&mut self, list: &[u32], base_vertex: u32) -> Vec<u32> {
+        let corners: Vec<u32> = list.iter().map(|i| i.wrapping_add(base_vertex)).collect();
+        let bytes: Vec<u8> = corners.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let first_word = self.arena_store(&bytes, 4) >> 2;
+        let mut out = Vec::with_capacity(corners.len() * 2);
+        for (rect, triangle) in corners.as_chunks::<3>().0.iter().enumerate() {
+            let word = first_word + rect as u32 * 3;
+            out.extend_from_slice(triangle);
+            out.extend((0..3).map(|corner| {
+                shader::RECT_CORNER_FLAG | (corner << shader::RECT_CORNER_SHIFT) | word
+            }));
+        }
+        out
+    }
+
+    fn arena_write_unique(&mut self, data: &[u8], align: u32) -> u32 {
+        let offset = self.arena_reserve(data.len() as u32, align);
+        self.commands.push(RenderCommand::ArenaWrite { offset, bytes: Arc::from(data) });
+        offset
+    }
+
+    fn key_of_target(words: &SurfaceWords, is_depth: bool) -> SurfaceKey {
+        let format =
+            if is_depth { host_depth_format(words.format) } else { host_format(words.format) };
+        SurfaceKey {
+            address: masked_address(words.address, words.tile_mode),
+            width: words.width,
+            height: words.height,
+            layers: words.depth.max(1),
+            format,
+        }
+    }
+
+    fn note_target(&mut self, key: SurfaceKey) {
+        self.host_surfaces.insert((key.address, key.width, key.height), key);
+    }
+
+    pub fn clear(
+        &mut self,
+        flags: u32,
+        color: Option<&SurfaceWords>,
+        depth: Option<&SurfaceWords>,
+        rgba: [f32; 4],
+        depth_value: f32,
+        stencil: u32,
+    ) {
+        use crate::command::opcode::clear;
+        let color_clear = color.filter(|w| flags & clear::COLOR != 0 && w.is_valid()).map(|w| {
+            let key = Self::key_of_target(w, false);
+            self.note_target(key);
+            (key, w.slice, rgba)
+        });
+        let depth_clear = depth
+            .filter(|w| flags & (clear::DEPTH | clear::STENCIL) != 0 && w.is_valid())
+            .map(|w| {
+                let key = Self::key_of_target(w, true);
+                self.note_target(key);
+                DepthClear {
+                    surface: key,
+                    slice: w.slice,
+                    depth: (flags & clear::DEPTH != 0).then_some(depth_value),
+                    stencil: (flags & clear::STENCIL != 0 && key.format.has_stencil())
+                        .then_some(stencil),
+                }
+            });
+        self.commands.push(RenderCommand::Clear { color: color_clear, depth: depth_clear });
+    }
+
+    pub fn copy_to_scan(&mut self, words: &SurfaceWords, screen: crate::Screen) {
+        let key = Self::key_of_target(words, false);
+        self.commands.push(RenderCommand::CopyToScanBuffer {
+            surface: key,
+            slice: words.slice,
+            screen,
+        });
+    }
+
+    pub fn copy_surface(&mut self, memory: &Memory, source: &SurfaceWords, target: &SurfaceWords) {
+        let source_key = self.surface_for_read(memory, source);
+        let mut target_key = Self::key_of_target(target, false);
+        target_key.layers = target.depth.max(1);
+        self.note_target(target_key);
+        self.commands.push(RenderCommand::CopySurface {
+            source: source_key,
+            source_level: 0,
+            source_slice: source.slice,
+            target: target_key,
+            target_level: target.level,
+            target_slice: target.slice,
+        });
+    }
+
+    /// The host surface for `words`: a known render target, or a fresh upload.
+    fn surface_for_read(&mut self, memory: &Memory, words: &SurfaceWords) -> SurfaceKey {
+        let address = masked_address(words.address, words.tile_mode);
+        if let Some(key) = self.host_surfaces.get(&(address, words.width, words.height)) {
+            return *key;
+        }
+        let key = SurfaceKey {
+            address,
+            width: words.width,
+            height: words.height,
+            layers: words.depth.max(1),
+            format: host_format(words.format),
+        };
+        self.upload_texture(memory, key, words, TextureDim::D2, 1, words.address);
+        key
+    }
+
+    /// Uploads the texture when its guest memory changed.
+    fn upload_texture(
+        &mut self,
+        memory: &Memory,
+        key: SurfaceKey,
+        words: &SurfaceWords,
+        dim: TextureDim,
+        mip_count: u32,
+        mip_base: u32,
+    ) {
+        let frame = self.frame;
+        if let Some(known) = self.textures.get(&key) {
+            if frame.wrapping_sub(known.last_check) < TEXTURE_RECHECK_FRAMES {
+                return;
+            }
+        }
+        let info = addrlib::gx2_surface_info(
+            words.format,
+            words.width,
+            words.height,
+            words.depth.max(1),
+            gx2_dim(dim),
+            words.tile_mode,
+            words.aa,
+            0,
+            false,
+            false,
+        );
+        let size = (info.surf_size as u32).max(1);
+        let Some(effective) = wiiu_mem_addr::physical_to_effective(words.address) else { return };
+        let Ok(base) = memory.slice(
+            masked_address(effective, words.tile_mode) & !0xFF,
+            size.saturating_add(0xFF).min(0x0400_0000),
+        ) else {
+            log::debug!("texture at {:#010x} outside mapped memory", words.address);
+            return;
+        };
+        let hash = sampled_hash(base);
+        if let Some(known) = self.textures.get_mut(&key) {
+            known.last_check = frame;
+            if known.content_hash == hash {
+                return;
+            }
+        }
+        let mips = decode_mips(memory, words, dim, mip_count, mip_base);
+        self.textures.insert(key, KnownTexture { content_hash: hash, last_check: frame });
+        self.commands.push(RenderCommand::Upload(Box::new(TextureUpload { key, dim, mips })));
+    }
+
+    fn cached_code(
+        &mut self,
+        memory: &Memory,
+        physical: u32,
+        size: u32,
+    ) -> Option<(u64, Arc<[u8]>)> {
+        if size == 0 {
+            return None;
+        }
+        let frame = self.frame;
+        if let Some((hash, code, seen)) = self.code_cache.get_mut(&(physical, size)) {
+            if *seen == frame {
+                return Some((*hash, Arc::clone(code)));
+            }
+        }
+        let effective = wiiu_mem_addr::physical_to_effective(physical)?;
+        let bytes = memory.slice(effective, size).ok()?;
+        let hash = xxh3_64(bytes);
+        let code: Arc<[u8]> = match self.code_cache.get(&(physical, size)) {
+            Some((old_hash, code, _)) if *old_hash == hash => Arc::clone(code),
+            _ => Arc::from(bytes),
+        };
+        self.code_cache.insert((physical, size), (hash, Arc::clone(&code), frame));
+        Some((hash, code))
+    }
+
+    /// Reads the seven dwords of texture unit `unit`.
+    fn texture_signature(
+        &self,
+        regs: &RegisterFile,
+        stage_base: u32,
+        unit: usize,
+        samplers: u32,
+    ) -> Option<(TextureSignature, [u32; 7])> {
+        let start = base::RESOURCE + stage_base + unit as u32 * 7;
+        let words: [u32; 7] = std::array::from_fn(|i| regs.get(start + i as u32));
+        if words[2] == 0 {
+            return None;
+        }
+        let format = format_from_resource(words[1], words[4]);
+        let address = words[2] << 8;
+        let width = ((words[0] >> 19) & 0x1FFF) + 1;
+        let height = (words[1] & 0x1FFF) + 1;
+        let tile = (words[0] >> 3) & 0xF;
+        let host_surface = self.host_surfaces.get(&(masked_address(address, tile), width, height));
+        let mut kind =
+            host_surface.map_or_else(|| host_format(format).kind(), |key| key.format.kind());
+        let dim = dim_of(words[0] & 7);
+        let sampler_word0 = regs.get(base::SAMPLER + samplers * 3);
+        let comparison = (sampler_word0 >> 26) & 7 != 0 && kind == TextureKind::Depth;
+        if kind == TextureKind::Depth && dim == TextureDim::D3 {
+            kind = TextureKind::Float;
+        }
+        let comp = |shift: u32| ((words[4] >> shift) & 7) as u8;
+        Some((
+            TextureSignature {
+                dim,
+                kind,
+                comp_sel: [comp(16), comp(19), comp(22), comp(25)],
+                comparison,
+            },
+            words,
+        ))
+    }
+
+    /// Everything shader translation depends on, translated once.
+    fn program_pair(
+        &mut self,
+        memory: &Memory,
+        regs: &RegisterFile,
+        vs: (u64, Arc<[u8]>),
+        ps: (u64, Arc<[u8]>),
+        fetch: Arc<[u8]>,
+    ) -> Arc<ProgramPair> {
+        const VS_STAGE: u32 = resource::VS_TEXTURE;
+        const PS_STAGE: u32 = resource::PS_TEXTURE;
+        let _ = memory;
+        let vs_signatures: [TextureSignature; TEXTURE_UNITS] = std::array::from_fn(|unit| {
+            self.texture_signature(regs, VS_STAGE, unit, 18 + unit as u32)
+                .map_or_else(TextureSignature::default, |s| s.0)
+        });
+        let ps_signatures: [TextureSignature; TEXTURE_UNITS] = std::array::from_fn(|unit| {
+            self.texture_signature(regs, PS_STAGE, unit, unit as u32)
+                .map_or_else(TextureSignature::default, |s| s.0)
+        });
+        let semantic_table: Vec<u32> =
+            (0..32).map(|i| regs.get(reg::SQ_VTX_SEMANTIC_0 + i)).collect();
+        let out_ids: Vec<u32> = (0..10).map(|i| regs.get(reg::SPI_VS_OUT_ID_0 + i)).collect();
+        let vs_out_semantics: Vec<u32> =
+            (0..40).map(|p: usize| (out_ids[p / 4] >> ((p % 4) * 8)) & 0xFF).collect();
+        let control0 = regs.get(reg::SPI_PS_IN_CONTROL_0);
+        let control1 = regs.get(reg::SPI_PS_IN_CONTROL_0 + 1);
+        let input_controls: Vec<u32> =
+            (0..32).map(|i| regs.get(reg::SPI_PS_INPUT_CNTL_0 + i)).collect();
+        let alpha_control = regs.get(reg::SX_ALPHA_TEST_CONTROL);
+        let alpha_function = (alpha_control & 8 != 0).then_some(alpha_control & 7);
+        let uniform_blocks = regs.get(config::SQ_CONFIG) & (1 << 8) == 0;
+        let target_kinds: [TextureKind; 8] = std::array::from_fn(|i| {
+            let w = &self.color_targets[i];
+            if w.is_valid() { host_format(w.format).kind() } else { TextureKind::Float }
+        });
+
+        let mut key = Vec::with_capacity(512);
+        key.extend_from_slice(&vs.0.to_le_bytes());
+        key.extend_from_slice(&ps.0.to_le_bytes());
+        key.extend_from_slice(&xxh3_64(&fetch).to_le_bytes());
+        for word in semantic_table.iter().chain(&out_ids).chain(&input_controls) {
+            key.extend_from_slice(&word.to_le_bytes());
+        }
+        key.extend_from_slice(&control0.to_le_bytes());
+        key.extend_from_slice(&control1.to_le_bytes());
+        key.push(alpha_function.map_or(0xFF, |f| f as u8));
+        key.push(u8::from(uniform_blocks));
+        for kind in target_kinds {
+            key.push(kind as u8);
+        }
+        for signature in vs_signatures.iter().chain(&ps_signatures) {
+            key.push(signature.dim as u8);
+            key.push(signature.kind as u8);
+            key.extend_from_slice(&signature.comp_sel);
+            key.push(u8::from(signature.comparison));
+        }
+        let hash = xxh3_64(&key);
+        if let Some(pair) = self.programs.get(&hash) {
+            return Arc::clone(pair);
+        }
+
+        // The vertex shader only needs to know which of its params the pixel
+        // shader reads flat; translate the export mask first.
+        let probe = shader::translate_vertex(
+            &vs.1,
+            &[],
+            &semantic_table,
+            uniform_blocks,
+            &vs_signatures,
+            0,
+        );
+        let vs_exports = exported_params(&probe.wgsl);
+        let inputs = PixelInputs {
+            control0,
+            control1,
+            input_controls: &input_controls,
+            vs_out_semantics: &vs_out_semantics,
+            vs_exports,
+            alpha_function,
+            target_kinds,
+        };
+        let (pixel, flat_params) =
+            shader::translate_pixel(&ps.1, &inputs, uniform_blocks, &ps_signatures);
+        let attributes = shader::parse_fetch_shader(&fetch);
+        let vertex = shader::translate_vertex(
+            &vs.1,
+            &attributes,
+            &semantic_table,
+            uniform_blocks,
+            &vs_signatures,
+            flat_params,
+        );
+
+        let make_bindings = |translated: &shader::TranslatedShader,
+                             signatures: &[TextureSignature; TEXTURE_UNITS],
+                             stage_base: u32| {
+            let mut bindings = Vec::new();
+            for &unit in &translated.textures {
+                let signature = signatures[usize::from(unit)];
+                bindings.push((
+                    (stage_base + u32::from(unit)) * 2,
+                    BindingKind::Texture { dim: signature.dim, kind: signature.kind },
+                ));
+            }
+            let mut seen = Vec::new();
+            for &(unit, _) in &translated.samplers {
+                if seen.contains(&unit) {
+                    continue;
+                }
+                seen.push(unit);
+                let signature = signatures[usize::from(unit)];
+                bindings.push((
+                    (stage_base + u32::from(unit)) * 2 + 1,
+                    BindingKind::Sampler {
+                        comparison: signature.comparison,
+                        filtering: signature.kind == TextureKind::Float && !signature.comparison,
+                    },
+                ));
+            }
+            bindings
+        };
+        let vs_module = Arc::new(ShaderModule {
+            id: self.next_module_id,
+            bindings: make_bindings(&vertex, &vs_signatures, 0),
+            wgsl: vertex.wgsl,
+        });
+        let ps_module = Arc::new(ShaderModule {
+            id: self.next_module_id + 1,
+            bindings: make_bindings(&pixel, &ps_signatures, TEXTURE_UNITS as u32),
+            wgsl: pixel.wgsl,
+        });
+        self.next_module_id += 2;
+        let pair = Arc::new(ProgramPair {
+            vertex: vs_module,
+            pixel: ps_module,
+            vs_samplers: vertex.samplers,
+            ps_samplers: pixel.samplers,
+            vs_textures: vertex.textures,
+            ps_textures: pixel.textures,
+            color_exports: pixel.color_exports,
+        });
+        self.programs.insert(hash, Arc::clone(&pair));
+        pair
+    }
+
+    fn bind_textures(
+        &mut self,
+        memory: &Memory,
+        regs: &RegisterFile,
+        out: &mut Vec<BoundTexture>,
+        stage_base: u32,
+        binding_base: u32,
+        sampler_base: u32,
+        units: &[u8],
+        samplers: &[(u8, u8)],
+    ) {
+        for &unit in units {
+            let sampler_unit = samplers.iter().find(|(t, _)| *t == unit).map(|(_, s)| *s);
+            let Some((signature, words)) = self.texture_signature(
+                regs,
+                stage_base,
+                usize::from(unit),
+                sampler_base + u32::from(sampler_unit.unwrap_or(unit)),
+            ) else {
+                continue;
+            };
+            let format = format_from_resource(words[1], words[4]);
+            let address = words[2] << 8;
+            let width = ((words[0] >> 19) & 0x1FFF) + 1;
+            let height = (words[1] & 0x1FFF) + 1;
+            let tile = (words[0] >> 3) & 0xF;
+            let hw_dim = words[0] & 7;
+            let depth_field = ((words[1] >> 13) & 0x1FFF) + 1;
+            let layers = if hw_dim == addrlib::dim::CUBE { depth_field * 6 } else { depth_field };
+            let base_level = (words[4] >> 28) & 0xF;
+            let last_level = words[5] & 0xF;
+            let base_layer = (words[5] >> 4) & 0x1FFF;
+            let last_layer = (words[5] >> 17) & 0x1FFF;
+            let masked = masked_address(address, tile);
+            let host = self.host_surfaces.get(&(masked, width, height)).copied();
+            let key = if let Some(key) = host {
+                key
+            } else {
+                let key = SurfaceKey {
+                    address: masked,
+                    width,
+                    height,
+                    layers,
+                    format: host_format(format),
+                };
+                let pixel_pitch = ((words[0] >> 8) & 0x7FF).wrapping_add(1) << 3;
+                let surface = SurfaceWords {
+                    address,
+                    width,
+                    height,
+                    depth: layers,
+                    pitch: if addrlib::is_compressed(format & 0x3F) {
+                        pixel_pitch / 4
+                    } else {
+                        pixel_pitch
+                    },
+                    tile_mode: tile,
+                    swizzle: address & 0x700,
+                    format,
+                    aa: 0,
+                    level: 0,
+                    slice: 0,
+                };
+                let mip_count = (last_level + 1).clamp(1, 16);
+                self.upload_texture(memory, key, &surface, signature.dim, mip_count, words[3] << 8);
+                key
+            };
+            let is_multi_level = host.is_none();
+            let sampler =
+                sampler_unit.map(|s| read_sampler(regs, sampler_base + u32::from(s), signature));
+            out.push(BoundTexture {
+                binding: (binding_base + u32::from(unit)) * 2,
+                key,
+                dim: signature.dim,
+                base_level: if is_multi_level { base_level } else { 0 },
+                level_count: if is_multi_level {
+                    (last_level + 1).saturating_sub(base_level).max(1)
+                } else {
+                    1
+                },
+                base_layer: if is_multi_level { base_layer } else { 0 },
+                layer_count: (last_layer + 1).saturating_sub(base_layer).max(1),
+                sampler,
+            });
+        }
+    }
+
+    /// Stores the uniform block of unit `index` and returns its arena offset.
+    fn store_uniform_block(
+        &mut self,
+        memory: &Memory,
+        regs: &RegisterFile,
+        stage_base: u32,
+        index: u32,
+    ) -> u32 {
+        let start = base::RESOURCE + stage_base + index * 7;
+        let (physical, size) = (regs.get(start), regs.get(start + 1).wrapping_add(1));
+        if physical == 0 || size == 0 || size > 0x10_0000 {
+            return 0;
+        }
+        let Some(effective) = wiiu_mem_addr::physical_to_effective(physical) else { return 0 };
+        let Ok(bytes) = memory.slice(effective, size) else { return 0 };
+        // Titles endian-swap uniform blocks themselves (GX2EndianSwap): the GPU reads them as they are.
+        let owned = bytes.to_vec();
+        self.arena_store(&owned, 16)
+    }
+
+    /// Executes a draw from the current registers.
+    pub fn draw(&mut self, memory: &Memory, regs: &RegisterFile, draw: &DrawRequest<'_>) {
+        if regs.get(reg::VGT_GS_MODE) & 3 != 0 {
+            // Geometry shaders have no host equivalent yet.
+            self.skipped_draws += 1;
+            return;
+        }
+        if regs.get(reg::PA_CL_CLIP_CNTL) & (1 << 22) != 0 {
+            // DX_RASTERIZATION_KILL: only stream out or queries could observe it.
+            return;
+        }
+        let program_size = |start: u32| regs.get(start + 1) << 3;
+        let code = |this: &mut Self, start: u32| {
+            this.cached_code(memory, regs.get(start) << 8, program_size(start))
+        };
+        let (Some(vs), Some(ps), Some(fetch)) = (
+            code(self, reg::SQ_PGM_START_VS),
+            code(self, reg::SQ_PGM_START_PS),
+            code(self, reg::SQ_PGM_START_FS),
+        ) else {
+            self.skipped_draws += 1;
+            return;
+        };
+        let pair = self.program_pair(memory, regs, vs, ps, fetch.1);
+
+        let mut textures = Vec::new();
+        self.bind_textures(
+            memory,
+            regs,
+            &mut textures,
+            resource::VS_TEXTURE,
+            0,
+            18,
+            &pair.vs_textures,
+            &pair.vs_samplers,
+        );
+        self.bind_textures(
+            memory,
+            regs,
+            &mut textures,
+            resource::PS_TEXTURE,
+            TEXTURE_UNITS as u32,
+            0,
+            &pair.ps_textures,
+            &pair.ps_samplers,
+        );
+
+        // Render targets.
+        let cb_target_mask = regs.get(reg::CB_TARGET_MASK);
+        let cb_shader_mask = regs.get(reg::CB_SHADER_MASK);
+        let color_control = regs.get(reg::CB_COLOR_CONTROL);
+        let color_enabled = (color_control >> 4) & 7 == 0;
+        let mut state = pipeline_state(regs);
+        let mut color_targets = [None; 8];
+        for target in 0..8 {
+            let words = self.color_targets[target];
+            let mask =
+                ((cb_target_mask >> (4 * target)) & (cb_shader_mask >> (4 * target)) & 0xF) as u8;
+            if !color_enabled || !words.is_valid() || pair.color_exports & (1 << target) == 0 {
+                continue;
+            }
+            let key = Self::key_of_target(&words, false);
+            self.note_target(key);
+            state.color_formats[target] = Some(key.format);
+            state.color_masks[target] = mask;
+            color_targets[target] = Some((key, words.slice));
+        }
+        let depth_words = self.depth_target;
+        let depth_control = regs.get(reg::DB_DEPTH_CONTROL);
+        let wants_depth = depth_control & 0b111 != 0;
+        let depth_target = (depth_words.is_valid() && wants_depth).then(|| {
+            let key = Self::key_of_target(&depth_words, true);
+            self.note_target(key);
+            state.depth_format = Some(key.format);
+            (key, depth_words.slice)
+        });
+        if depth_target.is_none() {
+            state.depth_test = false;
+            state.depth_write = false;
+            state.stencil_test = false;
+        }
+        if color_targets.iter().all(Option::is_none) && depth_target.is_none() {
+            self.skipped_draws += 1;
+            return;
+        }
+
+        // Uniforms: registers or blocks.
+        let mut params = [0_u32; PARAMS_SIZE / 4];
+        let uniform_blocks = regs.get(config::SQ_CONFIG) & (1 << 8) == 0;
+        if uniform_blocks {
+            for block in 0..16 {
+                params[8 + block as usize] =
+                    self.store_uniform_block(memory, regs, resource::VS_UNIFORM_BLOCK, block);
+                params[24 + block as usize] =
+                    self.store_uniform_block(memory, regs, resource::PS_UNIFORM_BLOCK, block);
+            }
+        } else {
+            let read_alu = |offset: u32| -> Vec<u8> {
+                (0..0x400)
+                    .flat_map(|i| regs.get(base::ALU_CONST + offset + i).to_le_bytes())
+                    .collect()
+            };
+            let ps_regs = read_alu(0);
+            let vs_regs = read_alu(0x400);
+            params[0] = self.arena_store(&vs_regs, 16);
+            params[1] = self.arena_store(&ps_regs, 16);
+        }
+
+        // Vertex data.
+        let mut max_index = draw.base_vertex.saturating_add(draw.count);
+        let mut restart = false;
+        let (mut indices, mut index_count) = (None, draw.count);
+        let mode = regs.get(config::VGT_PRIMITIVE_TYPE);
+        let expanded = if let Some(source) = draw.indices {
+            let resets = regs.get(reg::VGT_MULTI_PRIM_IB_RESET_EN) & 1 != 0;
+            let reset_index = regs.get(reg::VGT_MULTI_PRIM_IB_RESET_INDX);
+            let mut converted = read_indices(source, draw.count, draw.index_type, draw.immediate);
+            restart = resets
+                && matches!(
+                    mode,
+                    primitive::LINE_STRIP | primitive::TRIANGLE_STRIP | primitive::TRIANGLE_FAN
+                );
+            if restart {
+                for index in &mut converted {
+                    if *index == reset_index {
+                        *index = u32::MAX;
+                    }
+                }
+            }
+            max_index = converted
+                .iter()
+                .copied()
+                .filter(|i| *i != u32::MAX)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            expand_indices(mode, Some(converted))
+        } else {
+            expand_indices(mode, needs_expansion(mode).then(|| (0..draw.count).collect()))
+        };
+        if let Some(list) = expanded {
+            let list = if mode == primitive::RECTS {
+                self.rect_corners(&list, draw.base_vertex)
+            } else {
+                list
+            };
+            index_count = list.len() as u32;
+            let bytes: Vec<u8> = list.iter().flat_map(|i| i.to_le_bytes()).collect();
+            indices = Some(self.arena_store(&bytes, 4));
+        }
+
+        // Attribute buffers are stored raw: the shader decodes them.
+        let attributes = shader::parse_fetch_shader(&code_of(self, regs).unwrap_or_default());
+        let vertex_end = max_index.saturating_add(draw.base_vertex);
+        let instance_end = draw.instances.max(1);
+        let mut used_buffers = [false; 16];
+        for attribute in &attributes {
+            used_buffers[attribute.buffer as usize] = true;
+        }
+        for (buffer, used) in used_buffers.iter().enumerate() {
+            if !*used {
+                continue;
+            }
+            let start = base::RESOURCE + resource::ATTRIBUTE_BLOCK + buffer as u32 * 7;
+            let (physical, size, word2) =
+                (regs.get(start), regs.get(start + 1).wrapping_add(1), regs.get(start + 2));
+            let stride = (word2 >> 11) & 0xFFFF;
+            if physical == 0 {
+                continue;
+            }
+            let Some(effective) = wiiu_mem_addr::physical_to_effective(physical) else { continue };
+            let per_instance =
+                attributes.iter().any(|a| a.buffer as usize == buffer && a.rate != 0);
+            let count = if per_instance { instance_end } else { vertex_end };
+            let needed = u64::from(count) * u64::from(stride.max(1)) + 64;
+            let available = needed.min(u64::from(size)).min(0x0400_0000) as u32;
+            let Ok(bytes) = memory.slice(effective, available) else { continue };
+            params[40 + buffer] = self.arena_store(bytes, 4);
+            params[56 + buffer] = stride;
+        }
+        let y_scale = f32::from_bits(regs.get(reg::PA_CL_VPORT_XSCALE + 2));
+        params[2] = regs.get(reg::SX_ALPHA_REF);
+        params[3] = (if y_scale > 0.0 { -1.0_f32 } else { 1.0_f32 }).to_bits();
+        let clip_control = regs.get(reg::PA_CL_CLIP_CNTL);
+        params[4] = u32::from(clip_control & (1 << 19) != 0);
+        params[5] = regs.get(reg::VGT_INSTANCE_STEP_RATE_0);
+        params[6] = regs.get(reg::VGT_INSTANCE_STEP_RATE_0 + 1);
+        params[7] = draw.base_instance;
+        let params_bytes: Vec<u8> = params.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let params_offset = self.arena_write_unique(&params_bytes, PARAMS_ALIGN);
+
+        let viewport = viewport_of(regs);
+        let scissor_tl = regs.get(reg::PA_SC_GENERIC_SCISSOR_TL);
+        let scissor_br = regs.get(reg::PA_SC_GENERIC_SCISSOR_BR);
+        let (sx, sy) = (scissor_tl & 0x7FFF, (scissor_tl >> 16) & 0x7FFF);
+        let (ex, ey) = (scissor_br & 0x7FFF, (scissor_br >> 16) & 0x7FFF);
+        let stencil_reference = (regs.get(reg::DB_STENCILREFMASK) & 0xFF) as u8;
+        let blend_constant =
+            std::array::from_fn(|i| f32::from_bits(regs.get(reg::CB_BLEND_RED + i as u32)));
+        state.topology = topology_of(mode);
+        let command = DrawCommand {
+            vertex: Arc::clone(&pair.vertex),
+            pixel: Arc::clone(&pair.pixel),
+            state,
+            color_targets,
+            depth_target,
+            textures,
+            params_offset,
+            viewport,
+            scissor: [sx, sy, ex.saturating_sub(sx), ey.saturating_sub(sy)],
+            stencil_reference,
+            blend_constant,
+            count: index_count,
+            instances: draw.instances.max(1),
+            first_vertex: 0,
+            index_offset: indices,
+            // Rect corners carry the base vertex already.
+            base_vertex: if mode == primitive::RECTS { 0 } else { draw.base_vertex.cast_signed() },
+        };
+        let _ = restart;
+        self.commands.push(RenderCommand::Draw(Box::new(command)));
+    }
+}
+
+/// Fetch shader of the current state.
+fn code_of(latte: &mut Latte, regs: &RegisterFile) -> Option<Vec<u8>> {
+    let physical = regs.get(reg::SQ_PGM_START_FS) << 8;
+    let size = regs.get(reg::SQ_PGM_START_FS + 1) << 3;
+    latte.code_cache.get(&(physical, size)).map(|(_, code, _)| code.to_vec())
+}
+
+/// Indices of the draw being set up.
+#[derive(Debug, Clone, Copy)]
+pub struct DrawRequest<'a> {
+    pub count: u32,
+    pub instances: u32,
+    pub base_vertex: u32,
+    pub base_instance: u32,
+    pub index_type: u32,
+    /// Guest bytes of the index buffer (indexed draws).
+    pub indices: Option<&'a [u8]>,
+    /// The indices came embedded in the packet (`DRAW_INDEX_IMMD`).
+    pub immediate: bool,
+}
+
+/// Which parameters a translated vertex shader exports (from its `VsOut` struct).
+fn exported_params(wgsl: &str) -> u32 {
+    let mut mask = 0;
+    for line in wgsl.lines() {
+        if let Some(rest) = line.strip_prefix("@location(") {
+            if let Some((number, _)) = rest.split_once(')') {
+                if let Ok(index) = number.parse::<u32>() {
+                    mask |= 1_u32 << index.min(31);
+                }
+            }
+        }
+    }
+    mask
+}
+
+const fn needs_expansion(mode: u32) -> bool {
+    matches!(
+        mode,
+        primitive::TRIANGLE_FAN
+            | primitive::RECTS
+            | primitive::LINE_LOOP
+            | primitive::QUADS
+            | primitive::QUAD_STRIP
+    )
+}
+
+fn read_indices(source: &[u8], count: u32, kind: u32, immediate: bool) -> Vec<u32> {
+    let count = count as usize;
+    let is_32 = matches!(kind, index_type::U32_LE | index_type::U32_BE);
+    let big_endian = matches!(kind, index_type::U32_BE | index_type::U16_BE) || immediate;
+    if is_32 {
+        source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(count)
+            .map(|b| {
+                if big_endian {
+                    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+                } else {
+                    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                }
+            })
+            .collect()
+    } else {
+        source
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(count)
+            .map(|b| {
+                u32::from(if big_endian {
+                    u16::from_be_bytes([b[0], b[1]])
+                } else {
+                    u16::from_le_bytes([b[0], b[1]])
+                })
+            })
+            .collect()
+    }
+}
+
+/// Primitive modes the host lacks become triangle or line lists.
+fn expand_indices(mode: u32, indices: Option<Vec<u32>>) -> Option<Vec<u32>> {
+    let indices = indices?;
+    Some(match mode {
+        primitive::TRIANGLE_FAN => {
+            let mut out = Vec::with_capacity(indices.len().saturating_sub(2) * 3);
+            for pair in indices.windows(2).skip(1) {
+                out.extend([indices[0], pair[0], pair[1]]);
+            }
+            out
+        }
+        primitive::QUADS => {
+            let mut out = Vec::with_capacity(indices.len() / 4 * 6);
+            for quad in indices.as_chunks::<4>().0 {
+                out.extend([quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
+            }
+            out
+        }
+        primitive::QUAD_STRIP => {
+            let mut out = Vec::with_capacity(indices.len() * 3);
+            for quad in indices.windows(4).step_by(2) {
+                out.extend([quad[0], quad[1], quad[3], quad[0], quad[3], quad[2]]);
+            }
+            out
+        }
+        primitive::RECTS => indices.as_chunks::<3>().0.iter().flatten().copied().collect(),
+        primitive::LINE_LOOP => {
+            let mut out = indices.clone();
+            if let Some(first) = indices.first() {
+                out.push(*first);
+            }
+            out
+        }
+        _ => indices,
+    })
+}
+
+const fn topology_of(mode: u32) -> Topology {
+    match mode {
+        primitive::POINTS => Topology::Points,
+        primitive::LINES => Topology::Lines,
+        primitive::LINE_STRIP | primitive::LINE_LOOP => Topology::LineStrip,
+        primitive::TRIANGLE_STRIP => Topology::TriangleStrip,
+        primitive::RECTS => Topology::Rects,
+        _ => Topology::Triangles,
+    }
+}
+
+fn viewport_of(regs: &RegisterFile) -> [f32; 6] {
+    let v = |i: u32| f32::from_bits(regs.get(reg::PA_CL_VPORT_XSCALE + i));
+    let (xs, xo, ys, yo, zs, zo) = (v(0), v(1), v(2), v(3), v(4), v(5));
+    let half_z = regs.get(reg::PA_CL_CLIP_CNTL) & (1 << 19) != 0;
+    let (near, far) = if half_z { (zo, zo + zs) } else { (zo - zs, zo + zs) };
+    let height = ys.abs() * 2.0;
+    [
+        xo - xs,
+        yo - ys.abs(),
+        xs * 2.0,
+        height,
+        near.clamp(0.0, 1.0).min(far.clamp(0.0, 1.0)),
+        far.clamp(0.0, 1.0).max(near.clamp(0.0, 1.0)),
+    ]
+}
+
+fn pipeline_state(regs: &RegisterFile) -> PipelineState {
+    let depth = regs.get(reg::DB_DEPTH_CONTROL);
+    let mode = regs.get(reg::PA_SU_SC_MODE_CNTL);
+    let blend_mask = (regs.get(reg::CB_COLOR_CONTROL) >> 8) & 0xFF;
+    let blend = std::array::from_fn(|i| {
+        let word = regs.get(reg::CB_BLEND0_CONTROL + i as u32);
+        let separate = word & (1 << 29) != 0;
+        let (color_src, color_op, color_dst) =
+            ((word & 0x1F) as u8, ((word >> 5) & 7) as u8, ((word >> 8) & 0x1F) as u8);
+        BlendState {
+            enabled: blend_mask & (1 << i) != 0,
+            color_src,
+            color_dst,
+            color_op,
+            alpha_src: if separate { ((word >> 16) & 0x1F) as u8 } else { color_src },
+            alpha_dst: if separate { ((word >> 24) & 0x1F) as u8 } else { color_dst },
+            alpha_op: if separate { ((word >> 21) & 7) as u8 } else { color_op },
+        }
+    });
+    let front = StencilFace {
+        compare: ((depth >> 8) & 7) as u8,
+        fail: ((depth >> 11) & 7) as u8,
+        pass: ((depth >> 14) & 7) as u8,
+        depth_fail: ((depth >> 17) & 7) as u8,
+    };
+    let back = if depth & (1 << 7) != 0 {
+        StencilFace {
+            compare: ((depth >> 20) & 7) as u8,
+            fail: ((depth >> 23) & 7) as u8,
+            pass: ((depth >> 26) & 7) as u8,
+            depth_fail: ((depth >> 29) & 7) as u8,
+        }
+    } else {
+        front
+    };
+    let stencil = regs.get(reg::DB_STENCILREFMASK);
+    let bias_enabled = mode & (3 << 11) != 0;
+    let bias = if bias_enabled {
+        [
+            regs.get(reg::PA_SU_POLY_OFFSET_FRONT_SCALE),
+            regs.get(reg::PA_SU_POLY_OFFSET_FRONT_SCALE + 1),
+            regs.get(reg::PA_SU_POLY_OFFSET_CLAMP),
+        ]
+    } else {
+        [0; 3]
+    };
+    PipelineState {
+        topology: Topology::Triangles,
+        color_formats: [None; 8],
+        color_masks: [0; 8],
+        blend,
+        depth_format: None,
+        depth_test: depth & 0b10 != 0,
+        depth_write: depth & 0b100 != 0,
+        depth_compare: ((depth >> 4) & 7) as u8,
+        stencil_test: depth & 1 != 0,
+        stencil_front: front,
+        stencil_back: back,
+        stencil_read_mask: ((stencil >> 8) & 0xFF) as u8,
+        stencil_write_mask: ((stencil >> 16) & 0xFF) as u8,
+        cull_front: mode & 1 != 0,
+        cull_back: mode & 2 != 0,
+        front_face_cw: mode & 4 != 0,
+        depth_bias: bias,
+    }
+}
+
+const fn address_mode(bits: u32) -> AddressMode {
+    match bits {
+        0 => AddressMode::Repeat,
+        1 | 3 | 5 | 7 => AddressMode::Mirror,
+        6 => AddressMode::Border,
+        _ => AddressMode::Clamp,
+    }
+}
+
+fn read_sampler(regs: &RegisterFile, index: u32, signature: TextureSignature) -> SamplerDesc {
+    let word0 = regs.get(base::SAMPLER + index * 3);
+    let word1 = regs.get(base::SAMPLER + index * 3 + 1);
+    let non_filterable = signature.kind != TextureKind::Float;
+    let filter = |bits: u32| !non_filterable && matches!(bits & 7, 1 | 5);
+    SamplerDesc {
+        address: [
+            address_mode(word0 & 7),
+            address_mode((word0 >> 3) & 7),
+            address_mode((word0 >> 6) & 7),
+        ],
+        mag_linear: filter((word0 >> 9) & 7),
+        min_linear: filter((word0 >> 12) & 7),
+        mip_linear: !non_filterable && (word0 >> 17) & 3 == 2,
+        anisotropy: 0,
+        min_lod: (word1 & 0x3FF) as u16,
+        max_lod: ((word1 >> 10) & 0x3FF) as u16,
+        compare: signature.comparison.then_some(((word0 >> 26) & 7) as u8),
+        non_filterable,
+    }
+}
+
+const fn gx2_dim(dim: TextureDim) -> u32 {
+    match dim {
+        TextureDim::D2 => addrlib::dim::D2,
+        TextureDim::D2Array => addrlib::dim::D2_ARRAY,
+        TextureDim::D3 => addrlib::dim::D3,
+        TextureDim::Cube => addrlib::dim::CUBE,
+    }
+}
+
+/// Samples a large surface: hashing all of it per frame would dominate.
+fn sampled_hash(bytes: &[u8]) -> u64 {
+    if bytes.len() <= 0x4000 {
+        return xxh3_64(bytes);
+    }
+    let step = (bytes.len() / 256).max(HASH_STRIDE);
+    let mut hash = bytes.len() as u64;
+    let mut at = 0;
+    while at + HASH_STRIDE <= bytes.len() {
+        hash = hash.rotate_left(7) ^ xxh3_64(&bytes[at..at + HASH_STRIDE]);
+        at += step;
+    }
+    hash
+}
+
+fn decode_mips(
+    memory: &Memory,
+    words: &SurfaceWords,
+    dim: TextureDim,
+    mip_count: u32,
+    mip_base: u32,
+) -> Vec<MipData> {
+    let is_compressed = addrlib::is_compressed(words.format & 0x3F);
+    let hw_dim = gx2_dim(dim);
+    let mut mips = Vec::with_capacity(mip_count as usize);
+    let mut mip_offset = 0_u32;
+    let mut previous_size = 0_u32;
+    let base_tile = words.tile_mode;
+    let swizzle = words.address & 0x700;
+    let mut last_tile = base_tile;
+    let mut macro_stopped = false;
+    for level in 0..mip_count {
+        let info = addrlib::gx2_surface_info(
+            words.format,
+            words.width,
+            words.height,
+            words.depth.max(1),
+            hw_dim,
+            base_tile,
+            words.aa,
+            level,
+            false,
+            false,
+        );
+        let align = info.base_align.max(1);
+        let address = if level == 0 {
+            masked_address(words.address, base_tile) & !0xFF
+        } else {
+            // Mips are laid out back to back, each on its alignment boundary.
+            if level == 1 {
+                mip_offset = 0;
+            } else {
+                let stop = tile_mode::is_macro_tiled(last_tile)
+                    && !tile_mode::is_macro_tiled(info.hw_tile_mode);
+                if stop && !macro_stopped {
+                    macro_stopped = true;
+                    mip_offset += swizzle;
+                }
+                mip_offset += previous_size;
+                mip_offset = mip_offset.next_multiple_of(align);
+            }
+            (masked_address(mip_base, base_tile) & !0xFF).wrapping_add(mip_offset)
+        };
+        last_tile = info.hw_tile_mode;
+        previous_size = info.surf_size as u32;
+        let width = (words.width >> level).max(1);
+        let height = (words.height >> level).max(1);
+        let (blocks_x, blocks_y) =
+            if is_compressed { (width.div_ceil(4), height.div_ceil(4)) } else { (width, height) };
+        let layers = match dim {
+            TextureDim::D3 => (words.depth >> level).max(1),
+            TextureDim::D2 => 1,
+            _ => words.depth.max(1),
+        };
+        let swizzled = tile_mode::is_macro_tiled(info.hw_tile_mode);
+        let (pipe_swizzle, bank_swizzle) =
+            if swizzled { swizzle_from_address(swizzle) } else { (0, 0) };
+        let layout = Layout {
+            tile_mode: info.hw_tile_mode,
+            bpp: info.bpp,
+            pitch: info.pitch,
+            height: info.height,
+            samples: 1,
+            is_depth: false,
+            pipe_swizzle,
+            bank_swizzle,
+        };
+        let Some(effective) = wiiu_mem_addr::physical_to_effective(address) else { break };
+        let size = (info.surf_size as u32).max(1).min(0x0800_0000);
+        let Ok(source) = memory.slice(effective, size) else {
+            log::debug!("mip {level} at {address:#010x} is outside mapped memory");
+            break;
+        };
+        let mut data = Vec::with_capacity(
+            blocks_x as usize * blocks_y as usize * (info.bpp as usize / 8) * layers as usize,
+        );
+        for slice in 0..layers {
+            detile(source, &layout, blocks_x, blocks_y, slice, &mut data);
+        }
+        let data = widen_texels(words.format, &data).unwrap_or(data);
+        mips.push(MipData { width, height, layers, data });
+    }
+    mips
+}

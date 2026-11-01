@@ -1,0 +1,199 @@
+//! Cafe OS HLE.
+//!
+//! ```text
+//!  guest `bl OSReport` ──► stub [hle_call N; blr] ──► StepEvent::HleCall(N)
+//!                                                          │ (wiiu_emu)
+//!                                                          ▼
+//!                       hle::dispatch ──► registry entry N ──► coreinit::report::os_report
+//! ```
+//!
+//! * [`hle`] — calling convention glue (`FromArg`/`IntoReturn`, [`HleContext`]).
+//! * [`registry`] — export tables, stub generation, import resolution.
+//! * [`coreinit`], [`gx2`], [`vpad`] — one module per system RPL.
+//! * [`process`] — boot: load the RPX, create the default heap and main stack.
+//!
+//! Only the main thread runs for now; thread-related exports behave as if no
+//! other thread exists.
+pub mod coreinit;
+pub mod gx2;
+pub mod hle;
+pub mod nn;
+pub mod proc_ui;
+pub mod process;
+pub mod registry;
+pub mod sndcore2;
+pub mod vpad;
+pub mod zlib125;
+
+pub use hle::{HleContext, HleError, dispatch};
+pub use process::{BootError, BootInfo};
+pub use registry::HleRegistry;
+use wiiu_peripherals::{GamePadState, TimeBase, controller::ButtonEdges};
+
+/// All Cafe OS state that lives outside guest memory.
+#[derive(Debug)]
+pub struct CafeOs {
+    pub registry: HleRegistry,
+    pub timebase: TimeBase,
+    pub coreinit: coreinit::CoreinitState,
+    pub gx2: gx2::Gx2State,
+    pub proc_ui: proc_ui::ProcUiState,
+    pub zlib: zlib125::ZlibState,
+    pub ax: sndcore2::AxState,
+    /// Entry point to run once `__preinit_user` returns.
+    pub pending_main: Option<process::MainEntry>,
+    /// Guest callbacks waiting to run / running.
+    pub callbacks: hle::callback::Callbacks,
+    /// Region and language reported to the title.
+    pub settings: coreinit::settings::SystemSettings,
+    /// Latest GamePad sample from the front end.
+    pub gamepad: GamePadState,
+    pub(crate) gamepad_edges: ButtonEdges,
+    /// Lines printed by `OSReport` and friends, drained by the front end.
+    pub console: Vec<String>,
+    /// Set by `exit`/`_Exit`.
+    pub exit_code: Option<i32>,
+    /// Set when the guest waits for vsync: the current frame should end.
+    pub frame_done: bool,
+}
+
+impl CafeOs {
+    pub fn new() -> Self {
+        let mut registry = HleRegistry::new();
+        registry.register_functions(coreinit::EXPORTS);
+        registry.register_functions(coreinit::thread::EXPORTS);
+        registry.register_data(coreinit::DATA_EXPORTS);
+        registry.register_functions(gx2::EXPORTS);
+        registry.register_functions(gx2::command::EXPORTS);
+        registry.register_functions(gx2::draw::EXPORTS);
+        registry.register_functions(gx2::state::EXPORTS);
+        registry.register_functions(vpad::EXPORTS);
+        registry.register_functions(proc_ui::EXPORTS);
+        registry.register_functions(zlib125::EXPORTS);
+        registry.register_functions(process::EXPORTS);
+        registry.register_functions(coreinit::fs::mutate::EXPORTS);
+        registry.register_functions(nn::EXPORTS);
+        registry.register_functions(sndcore2::EXPORTS);
+        Self {
+            registry,
+            timebase: TimeBase::new(),
+            coreinit: coreinit::CoreinitState::default(),
+            gx2: gx2::Gx2State::default(),
+            proc_ui: proc_ui::ProcUiState::default(),
+            zlib: zlib125::ZlibState::default(),
+            ax: sndcore2::AxState::default(),
+            pending_main: None,
+            callbacks: hle::callback::Callbacks::default(),
+            settings: coreinit::settings::SystemSettings::default(),
+            gamepad: GamePadState::default(),
+            gamepad_edges: ButtonEdges::default(),
+            console: Vec::new(),
+            exit_code: None,
+            frame_done: false,
+        }
+    }
+
+    /// Appends a line to the guest console and the log.
+    pub fn print(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        log::info!(target: "guest", "{}", line.trim_end());
+        self.console.push(line);
+    }
+}
+
+impl Default for CafeOs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CafeOs {
+    /// Runs the scheduler on `cpu` (the main core's live registers).
+    ///
+    /// When no thread can run, the frame ends so time can pass.
+    pub fn schedule(
+        &mut self,
+        cpu: &mut wiiu_cpu::CpuState,
+        memory: &wiiu_memory::Memory,
+        mode: coreinit::thread::Reschedule,
+    ) -> coreinit::thread::Outcome {
+        let now = self.timebase.ticks_since_boot();
+        let outcome = self.coreinit.threads.schedule(cpu, memory, now, mode);
+        if outcome == coreinit::thread::Outcome::Idle {
+            self.frame_done = true;
+        }
+        outcome
+    }
+
+    /// `true` while the running thread is blocked (nothing to execute).
+    pub fn current_thread_blocked(&self) -> bool {
+        self.coreinit.threads.current_is_blocked()
+    }
+}
+
+impl CafeOs {
+    /// Starts the next queued guest callback on `cpu`, if the core is free.
+    ///
+    /// # Errors
+    /// Fails if the callback return stub cannot be written.
+    pub fn start_callback(
+        &mut self,
+        cpu: &mut wiiu_cpu::CpuState,
+        memory: &mut wiiu_memory::Memory,
+    ) -> Result<bool, wiiu_memory::MemoryError> {
+        if self.callbacks.active() || !self.callbacks.has_pending() {
+            return Ok(false);
+        }
+        let stub =
+            self.registry.function_stub(process::INTERNAL_LIBRARY, process::CALLBACK_RETURN.name);
+        self.registry.commit(memory)?;
+        Ok(self.callbacks.begin(cpu, stub))
+    }
+
+    /// Queues handlers of alarms that are due.
+    pub fn fire_due_alarms(&mut self) {
+        let now = self.timebase.ticks_since_epoch();
+        for call in self.coreinit.alarms.fire_due(now) {
+            self.callbacks.push(call);
+        }
+    }
+
+    /// Start-of-frame housekeeping: alarms, callbacks, waking blocked threads.
+    ///
+    /// # Errors
+    /// Fails if guest memory for stubs is unmapped.
+    pub fn begin_frame(
+        &mut self,
+        cpu: &mut wiiu_cpu::CpuState,
+        memory: &mut wiiu_memory::Memory,
+    ) -> Result<(), wiiu_memory::MemoryError> {
+        self.frame_done = false;
+        self.sound_tick(memory);
+        self.fire_due_alarms();
+        if self.callbacks.active() || self.start_callback(cpu, memory)? {
+            return Ok(());
+        }
+        if self.current_thread_blocked() {
+            self.schedule(cpu, memory, coreinit::thread::Reschedule::Block);
+        }
+        Ok(())
+    }
+
+    /// End of a time slice: alarms, callbacks, then round-robin.
+    ///
+    /// # Errors
+    /// Fails if guest memory for stubs is unmapped.
+    pub fn end_time_slice(
+        &mut self,
+        cpu: &mut wiiu_cpu::CpuState,
+        memory: &mut wiiu_memory::Memory,
+    ) -> Result<(), wiiu_memory::MemoryError> {
+        self.sound_tick(memory);
+        self.fire_due_alarms();
+        if self.callbacks.active() || self.start_callback(cpu, memory)? {
+            return Ok(());
+        }
+        self.schedule(cpu, memory, coreinit::thread::Reschedule::Yield);
+        Ok(())
+    }
+}

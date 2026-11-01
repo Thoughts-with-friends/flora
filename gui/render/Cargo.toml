@@ -1,0 +1,21 @@
+[package]
+name = "flora_render"
+description = "Host renderer for Latte render commands, on wgpu (Vulkan/DX12/Metal/GL)"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+egui-wgpu = "0.37"
+log = { workspace = true }
+serde = { workspace = true }
+wiiu_gpu = { workspace = true }
+
+[lints]
+workspace = true

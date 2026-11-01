@@ -1,0 +1,15 @@
+use std::path::PathBuf;
+
+#[derive(Debug, thiserror::Error)]
+pub enum EmuError {
+    #[error(transparent)]
+    Title(#[from] wiiu_title::TitleError),
+    #[error("{path}: {source}")]
+    Io { path: PathBuf, source: std::io::Error },
+    #[error(transparent)]
+    Boot(#[from] wiiu_cafe_os::BootError),
+    #[error(transparent)]
+    Memory(#[from] wiiu_memory::MemoryError),
+    #[error(transparent)]
+    Fs(#[from] wiiu_fs::FsError),
+}

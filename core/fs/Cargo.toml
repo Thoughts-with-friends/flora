@@ -1,0 +1,18 @@
+[package]
+name = "wiiu_fs"
+description = "Wii U virtual file system: device mount table over host directories"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

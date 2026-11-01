@@ -1,0 +1,403 @@
+//! Boots a title without a window and reports what happened.
+//!
+//! ```text
+//! cargo run --release -p flora_tests --example headless -- <TITLE_DIR | FILE.rpx> [FRAMES]
+//! ```
+//!
+//! Environment:
+//! * `FLORA_INTERP`: use the interpreter (precise faults) instead of the JIT.
+//! * `FLORA_DISASM="addr,count;addr,count"`: extra code listings at the end.
+//! * `FLORA_SHOTS="dir,every"`: render on the GPU and save the TV/GamePad image
+//!   every `every` flips. Files stay outside the repository unless you say otherwise.
+//! * `FLORA_PRESS="frame,button,frames;..."`: scripted GamePad input.
+//! * `FLORA_UNPACED`: do not wait for real time between frames.
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use flora_render::{LatteRenderer, RenderBackend, RenderCommand, Screen, request_device, wgpu};
+use wiiu_emu::{Config, Emulator, GamePadState, Status};
+
+/// One scripted button press.
+#[derive(Debug, Clone, Copy)]
+struct Press {
+    frame: u64,
+    button: u32,
+    frames: u64,
+}
+
+fn parse_presses(text: &str) -> Vec<Press> {
+    text.split(';')
+        .filter_map(|item| {
+            let mut parts = item.split(',');
+            let frame = parts.next()?.trim().parse().ok()?;
+            let button =
+                u32::from_str_radix(parts.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+            let frames = parts.next()?.trim().parse().ok()?;
+            Some(Press { frame, button, frames })
+        })
+        .collect()
+}
+
+fn create_renderer() -> Result<LatteRenderer, Box<dyn std::error::Error>> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        ..Default::default()
+    }))?;
+    println!("adapter: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
+    let (device, queue) = pollster::block_on(request_device(&adapter))?;
+    Ok(LatteRenderer::new(device, queue))
+}
+
+fn save_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let mut args = std::env::args_os().skip(1);
+    let path = PathBuf::from(args.next().ok_or("usage: headless <TITLE_DIR | FILE.rpx> [FRAMES]")?);
+    let frames: u64 = args.next().and_then(|f| f.to_str()?.parse().ok()).unwrap_or(60);
+
+    let config = Config { jit: std::env::var_os("FLORA_INTERP").is_none(), ..Config::default() };
+    let frame_time = config.frame_time;
+    let mut emu = Emulator::new(config)?;
+    emu.load_title(&path)?;
+    if let Some(title) = emu.title() {
+        println!("title: {} ({:016x?})", title.display_name(), title.meta.title_id);
+        println!("rpx:   {}", title.rpx_path.display());
+    }
+
+    let shots = std::env::var("FLORA_SHOTS").ok();
+    let (shot_dir, shot_every) = shots
+        .as_deref()
+        .and_then(|s| s.split_once(','))
+        .map_or((None, 60), |(dir, every)| (Some(PathBuf::from(dir)), every.parse().unwrap_or(60)));
+    let mut renderer = shot_dir.as_ref().map(|_| create_renderer()).transpose()?;
+    if let Some(dir) = &shot_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    let presses = parse_presses(&std::env::var("FLORA_PRESS").unwrap_or_default());
+    let unpaced = std::env::var_os("FLORA_UNPACED").is_some();
+
+    let start = Instant::now();
+    let mut flips = 0_u64;
+    let mut last_report = Instant::now();
+    let mut arena = std::collections::HashMap::new();
+    for frame in 0..frames {
+        let held = presses
+            .iter()
+            .filter(|p| frame >= p.frame && frame < p.frame + p.frames)
+            .fold(0, |bits, p| bits | p.button);
+        emu.set_gamepad(GamePadState::from_button_bits(held));
+        let frame_start = Instant::now();
+        emu.run_frame();
+        let commands = emu.take_render_commands();
+        let new_flips = commands.iter().filter(|c| matches!(c, RenderCommand::Flip)).count() as u64;
+        if std::env::var_os("FLORA_TRACE_DRAWS").is_some() {
+            for command in &commands {
+                if let RenderCommand::ArenaWrite { offset, bytes } = command {
+                    arena.insert(*offset, std::sync::Arc::clone(bytes));
+                }
+            }
+        }
+        // FLORA_TRACE_DRAWS="first_frame,count": prints draws and their shaders.
+        if let Some((first, count)) = std::env::var("FLORA_TRACE_DRAWS").ok().and_then(|s| {
+            let (a, b) = s.split_once(',')?;
+            Some((a.parse::<u64>().ok()?, b.parse::<usize>().ok()?))
+        }) {
+            if frame >= first {
+                let interesting: Vec<_> = commands
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c,
+                            RenderCommand::Draw(_)
+                                | RenderCommand::Clear { .. }
+                                | RenderCommand::CopyToScanBuffer { .. }
+                                | RenderCommand::CopySurface { .. }
+                        )
+                    })
+                    .collect();
+                for command in interesting.iter().skip(interesting.len().saturating_sub(count)) {
+                    match command {
+                        RenderCommand::Draw(draw) => {
+                            if let Some(params) = arena.get(&draw.params_offset) {
+                                let word = |i: usize| {
+                                    u32::from_le_bytes([
+                                        params[i * 4],
+                                        params[i * 4 + 1],
+                                        params[i * 4 + 2],
+                                        params[i * 4 + 3],
+                                    ])
+                                };
+                                println!(
+                                    "  params {:08x?} attr {:08x?} stride {:?}",
+                                    (0..8).map(word).collect::<Vec<_>>(),
+                                    (40..44).map(word).collect::<Vec<_>>(),
+                                    (56..60).map(word).collect::<Vec<_>>()
+                                );
+                                for (name, base) in [("vs", 8), ("ps", 24)] {
+                                    for block in 0..16 {
+                                        let offset = word(base + block);
+                                        if offset != 0 {
+                                            if let Some(data) = arena.get(&offset) {
+                                                let floats: Vec<f32> = data
+                                                    .chunks_exact(4)
+                                                    .take(16)
+                                                    .map(|b| {
+                                                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                                                    })
+                                                    .collect();
+                                                println!(
+                                                    "  {name} ubo{block} ({} bytes): {floats:?}",
+                                                    data.len()
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                for (name, offset) in [("vs", word(0)), ("ps", word(1))] {
+                                    if let Some(data) = arena.get(&offset) {
+                                        let floats: Vec<f32> = data
+                                            .chunks_exact(4)
+                                            .take(32)
+                                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                            .collect();
+                                        println!("  {name} alu: {floats:?}");
+                                    }
+                                }
+                                let attribute = word(40);
+                                if let Some(data) = arena.get(&attribute) {
+                                    println!(
+                                        "  vertex bytes: {:02x?}",
+                                        &data[..data.len().min(48)]
+                                    );
+                                }
+                            }
+                            println!(
+                                "draw vs{} ps{} count {} inst {} idx {:?} base {} topo {:?} blend {:?}\n  targets {:?}\n  depth {:?}\n  masks {:?} formats {:?}\n  vp {:?} sc {:?} depth_test {} write {} cmp {} cull {}/{} cw {}\n  textures {:?}",
+                                draw.vertex.id,
+                                draw.pixel.id,
+                                draw.count,
+                                draw.instances,
+                                draw.index_offset,
+                                draw.base_vertex,
+                                draw.state.topology,
+                                draw.state.blend[0],
+                                draw.color_targets.iter().flatten().collect::<Vec<_>>(),
+                                draw.depth_target,
+                                draw.state.color_masks,
+                                draw.state.color_formats,
+                                draw.viewport,
+                                draw.scissor,
+                                draw.state.depth_test,
+                                draw.state.depth_write,
+                                draw.state.depth_compare,
+                                draw.state.cull_front,
+                                draw.state.cull_back,
+                                draw.state.front_face_cw,
+                                draw.textures
+                                    .iter()
+                                    .map(|t| (
+                                        t.binding,
+                                        t.key.address,
+                                        t.key.format,
+                                        t.key.width,
+                                        t.key.height
+                                    ))
+                                    .collect::<Vec<_>>(),
+                            );
+                            if std::env::var_os("FLORA_TRACE_WGSL").is_some() {
+                                println!("{}\n{}", draw.vertex.wgsl, draw.pixel.wgsl);
+                            }
+                        }
+                        other => println!("{other:?}"),
+                    }
+                }
+                // FLORA_TRACE_SPAN: frames to keep tracing after the first one.
+                let span = std::env::var("FLORA_TRACE_SPAN")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if !commands.is_empty() && frame >= first + span {
+                    let Some(renderer) = &mut renderer else { return Ok(()) };
+                    renderer.execute(&commands);
+                    // FLORA_TRACE_TEX=dir saves the 8-bit textures the traced draws read.
+                    if let Some(dir) = std::env::var_os("FLORA_TRACE_TEX") {
+                        let keys: std::collections::HashSet<_> = commands
+                            .iter()
+                            .filter_map(|c| {
+                                if let RenderCommand::Draw(draw) = c {
+                                    Some(draw.textures.iter().map(|t| t.key))
+                                } else {
+                                    None
+                                }
+                            })
+                            .flatten()
+                            .collect();
+                        for key in keys {
+                            if let Some((width, height, rgba)) = renderer.read_surface(key) {
+                                let mean = |channel: usize| {
+                                    rgba.iter()
+                                        .skip(channel)
+                                        .step_by(4)
+                                        .map(|v| u64::from(*v))
+                                        .sum::<u64>()
+                                        / u64::from(width * height).max(1)
+                                };
+                                println!(
+                                    "  texture {:#010x} {width}x{height}: mean rgba {} {} {} {}",
+                                    key.address,
+                                    mean(0),
+                                    mean(1),
+                                    mean(2),
+                                    mean(3)
+                                );
+                                save_png(
+                                    &std::path::Path::new(&dir)
+                                        .join(format!("tex_{:08x}.png", key.address)),
+                                    width,
+                                    height,
+                                    &rgba,
+                                )?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(renderer) = &mut renderer {
+            renderer.execute(&commands);
+            renderer.submit();
+            // FLORA_SHOTS_FROM: first flip worth a screenshot.
+            let shots_from = std::env::var("FLORA_SHOTS_FROM")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if new_flips > 0
+                && flips >= shots_from
+                && flips / shot_every != (flips + new_flips) / shot_every
+            {
+                if let Some(dir) = &shot_dir {
+                    for screen in Screen::ALL {
+                        if let Some((width, height, rgba)) = renderer.read_screen(screen) {
+                            let name = format!("{:?}_{:06}.png", screen, flips + new_flips);
+                            save_png(&dir.join(name), width, height, &rgba)?;
+                        }
+                    }
+                    if std::env::var_os("FLORA_DUMP_TARGETS").is_some() {
+                        for (key, draws) in renderer.take_target_log() {
+                            println!(
+                                "  target {:#010x} {}x{} {:?}: {draws} draws",
+                                key.address, key.width, key.height, key.format
+                            );
+                            if let Some((width, height, rgba)) = renderer.read_surface(key) {
+                                let name = format!(
+                                    "rt{:06}_{:08x}_{}x{}.png",
+                                    flips + new_flips,
+                                    key.address,
+                                    width,
+                                    height
+                                );
+                                save_png(&dir.join(name), width, height, &rgba)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        flips += new_flips;
+        for line in emu.take_console() {
+            println!("[guest] {}", line.trim_end());
+        }
+        if *emu.status() != Status::Running {
+            break;
+        }
+        if last_report.elapsed() > Duration::from_secs(10) {
+            last_report = Instant::now();
+            let stats = emu.stats();
+            println!(
+                "... frame {frame} · {:.0} MIPS · {} flips · {} draws ({} skipped)",
+                stats.instructions as f64 / 1e6 / start.elapsed().as_secs_f64(),
+                stats.gpu.flips,
+                stats.gpu.draws,
+                stats.gpu.skipped_draws
+            );
+        }
+        if !unpaced {
+            std::thread::sleep(frame_time.saturating_sub(frame_start.elapsed()));
+        }
+    }
+    for (name, calls) in emu.hle_profile(8) {
+        println!("  {calls:>12}  {name}");
+    }
+    if !matches!(emu.status(), Status::Exited(_)) {
+        if let Some(cpu) = emu.core(1) {
+            println!(
+                "pc {:#010x} lr {:#010x} ctr {:#010x} cr {:08x}",
+                cpu.pc, cpu.lr, cpu.ctr, cpu.cr
+            );
+            for row in 0..8 {
+                let regs: Vec<String> = (0..4)
+                    .map(|c| format!("r{:<2}={:08x}", row * 4 + c, cpu.gpr[row * 4 + c]))
+                    .collect();
+                println!("  {}", regs.join(" "));
+            }
+            for line in emu.disassemble_around(cpu.pc, 12, 16) {
+                println!("  {line}");
+            }
+        }
+        println!("recent HLE calls:");
+        for line in emu.hle_trace() {
+            println!("  {line}");
+        }
+    }
+    for spec in
+        std::env::var("FLORA_DISASM").unwrap_or_default().split(';').filter(|s| !s.is_empty())
+    {
+        let (at, count) = spec.split_once(',').ok_or("FLORA_DISASM: expected addr,count")?;
+        let (at, count) = (u32::from_str_radix(at.trim_start_matches("0x"), 16)?, count.parse()?);
+        println!("listing {at:#010x}:");
+        for line in emu.disassemble_around(at, 0, count) {
+            println!("  {line}");
+        }
+    }
+    let stats = emu.stats();
+    println!("threads:");
+    for line in emu.thread_report() {
+        println!("  {line}");
+    }
+    println!("status: {:?}", emu.status());
+    println!(
+        "frames {} · {:.1} M instructions · {} HLE calls · {} PM4 packets · {} draws ({} skipped) · {} flips · {:.2?}",
+        stats.frames,
+        stats.instructions as f64 / 1e6,
+        stats.hle_calls,
+        stats.gpu.packets,
+        stats.gpu.draws,
+        stats.gpu.skipped_draws,
+        stats.gpu.flips,
+        start.elapsed()
+    );
+    Ok(())
+}

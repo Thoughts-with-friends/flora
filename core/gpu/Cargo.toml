@@ -1,0 +1,27 @@
+[package]
+name = "wiiu_gpu"
+description = "Latte GPU: PM4 command processor, register file, display scanout and API-neutral render commands"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+log = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+wiiu_interrupt = { workspace = true }
+wiiu_mem_addr = { workspace = true }
+wiiu_memory = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
+
+[lints]
+workspace = true
