@@ -21,6 +21,9 @@ pub struct AppConfig {
     pub pad_bindings: PadBindings,
     /// Screen post-processing.
     pub upscale: UpscaleConfig,
+    /// Vertical blanks per flip, whatever the title asks for. `1` is 60 fps, and
+    /// double speed in a title made for 30 whose logic counts frames.
+    pub swap_interval: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -33,6 +36,7 @@ impl Default for AppConfig {
             key_bindings: KeyBindings::default(),
             pad_bindings: PadBindings::default(),
             upscale: UpscaleConfig::default(),
+            swap_interval: None,
         }
     }
 }
@@ -65,6 +69,7 @@ impl AppConfig {
         wiiu_emu::Config {
             save_dir: self.save_dir.clone(),
             fonts_dir: self.fonts_dir.clone(),
+            swap_interval: self.swap_interval,
             ..wiiu_emu::Config::default()
         }
     }

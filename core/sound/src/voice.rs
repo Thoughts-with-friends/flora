@@ -32,8 +32,12 @@ pub struct Voice {
     pub volume_right: f32,
     pub adpcm_coefficients: [i16; 16],
     pub adpcm_state: AdpcmState,
-    /// Fractional part of the resampling position.
+    /// Decoder history at the loop start (`AXSetVoiceAdpcmLoop`).
+    pub adpcm_loop_state: Option<AdpcmState>,
+    /// Fractional part of the resampling position, between the two samples below.
     phase: f32,
+    previous: i16,
+    current: i16,
 }
 
 impl Voice {
@@ -51,7 +55,10 @@ impl Voice {
             volume_right: 1.0,
             adpcm_coefficients: [0; 16],
             adpcm_state: AdpcmState::default(),
+            adpcm_loop_state: None,
             phase: 0.0,
+            previous: 0,
+            current: 0,
         }
     }
 
@@ -88,6 +95,14 @@ impl Voice {
         if self.current_offset >= self.end_offset {
             if self.looping {
                 self.current_offset = self.loop_offset;
+                if self.format == SampleFormat::Adpcm {
+                    if let Some(state) = self.adpcm_loop_state {
+                        self.adpcm_state = state;
+                    }
+                    if self.current_offset.is_multiple_of(NIBBLES_PER_FRAME) {
+                        self.current_offset += 2;
+                    }
+                }
             } else {
                 self.playing = false;
             }
@@ -102,18 +117,20 @@ impl Voice {
         }
     }
 
-    /// Produces one output sample (mono, `-1.0..=1.0`) at the voice's ratio.
+    /// Produces one output sample (mono, `-1.0..=1.0`) at the voice's ratio,
+    /// interpolating between source samples.
     pub fn render(&mut self, memory: &dyn SampleMemory) -> f32 {
         if !self.playing {
             return 0.0;
         }
-        let mut last = 0;
         self.phase += self.ratio;
         while self.phase >= 1.0 && self.playing {
-            last = self.next_source_sample(memory);
+            self.previous = self.current;
+            self.current = self.next_source_sample(memory);
             self.phase -= 1.0;
         }
-        f32::from(last) / 32768.0
+        let (previous, current) = (f32::from(self.previous), f32::from(self.current));
+        (current - previous).mul_add(self.phase.min(1.0), previous) / 32768.0
     }
 }
 
@@ -133,24 +150,46 @@ mod tests {
     fn pcm16_one_shot_and_loop() {
         let memory = Bytes(vec![0x40, 0x00, 0xC0, 0x00]);
         let mut voice = Voice::new(SampleFormat::Pcm16, 0, 1);
+        // One sample of delay: interpolation needs the one after the output position.
+        assert_eq!(voice.render(&memory), 0.0);
         assert!((voice.render(&memory) - 0.5).abs() < 1e-6);
-        assert!((voice.render(&memory) + 0.5).abs() < 1e-6);
+        voice.render(&memory);
         voice.render(&memory);
         assert!(!voice.playing);
 
         let mut looping = Voice::new(SampleFormat::Pcm16, 0, 1);
         looping.looping = true;
-        let samples: Vec<f32> = (0..4).map(|_| looping.render(&memory)).collect();
-        assert!((samples[2] - 0.5).abs() < 1e-6 && looping.playing);
+        let samples: Vec<f32> = (0..5).map(|_| looping.render(&memory)).collect();
+        assert!((samples[3] - 0.5).abs() < 1e-6 && looping.playing);
     }
 
     #[test]
-    fn half_ratio_repeats_samples() {
-        let memory = Bytes(vec![0x7F, 0x80]);
-        let mut voice = Voice::new(SampleFormat::Pcm8, 0, 1);
-        voice.ratio = 0.5;
-        let out: Vec<f32> = (0..4).map(|_| voice.render(&memory)).collect();
-        assert_eq!(out[0], 0.0);
-        assert!(out[1] > 0.9 && out[3] < -0.9);
+    fn a_slower_voice_is_interpolated_and_never_drops_to_silence() {
+        // A rising ramp played at 2/3 of the output rate, as a 32 kHz sound is.
+        let bytes = (0..64_i16).flat_map(|i| (1000 + i * 300).to_be_bytes()).collect();
+        let memory = Bytes(bytes);
+        let mut voice = Voice::new(SampleFormat::Pcm16, 0, 63);
+        voice.ratio = 2.0 / 3.0;
+        let out: Vec<f32> = (0..60).map(|_| voice.render(&memory)).collect();
+        for pair in out[3..].windows(2) {
+            let step = (pair[1] - pair[0]) * 32768.0;
+            assert!((step - 200.0).abs() < 1.0, "step {step} in {pair:?}");
+        }
+    }
+
+    #[test]
+    fn looping_adpcm_restores_the_history_of_the_loop_start() {
+        let memory = Bytes(vec![0; 16]);
+        let mut voice = Voice::new(SampleFormat::Adpcm, 0, 4);
+        voice.looping = true;
+        voice.loop_offset = 2;
+        let start = AdpcmState { hist1: 11, hist2: 22 };
+        voice.adpcm_loop_state = Some(start);
+        voice.adpcm_state = AdpcmState { hist1: 500, hist2: 400 };
+        for _ in 0..3 {
+            voice.render(&memory);
+        }
+        assert_eq!(voice.adpcm_state, start);
+        assert_eq!(voice.current_offset, 2);
     }
 }

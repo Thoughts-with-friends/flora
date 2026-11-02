@@ -307,6 +307,11 @@ pub struct Latte {
     host_surfaces: HashMap<(u32, u32, u32), SurfaceKey>,
     textures: HashMap<SurfaceKey, KnownTexture>,
     programs: HashMap<u64, Arc<ProgramPair>>,
+    /// By program hash, uniform blocks in use, and pixel stage or not.
+    shader_uses: HashMap<(u64, bool, bool), ShaderUse>,
+    fetch_cache: HashMap<u64, Arc<Vec<shader::Attribute>>>,
+    /// Kept between draws: every draw builds a key in it.
+    key_buffer: Vec<u8>,
     /// Hash of a shader program, valid for a guest address.
     code_cache: HashMap<(u32, u32), (u64, Arc<[u8]>, u64)>,
     next_module_id: u64,
@@ -325,11 +330,29 @@ impl Default for Latte {
             host_surfaces: HashMap::new(),
             textures: HashMap::new(),
             programs: HashMap::new(),
+            shader_uses: HashMap::new(),
+            fetch_cache: HashMap::new(),
+            key_buffer: Vec::new(),
             code_cache: HashMap::new(),
             next_module_id: 1,
             skipped_draws: 0,
         }
     }
+}
+
+/// What a shader program reads and writes, whatever the state around it.
+#[derive(Debug, Clone, Copy)]
+struct ShaderUse {
+    /// Texture units accessed, as a bit mask.
+    textures: u32,
+    /// Vertex shaders: parameters exported, as a bit mask.
+    exports: u32,
+    /// Pixel shaders: color targets written, as a bit mask.
+    color_exports: u8,
+}
+
+fn unit_mask(units: &[u8]) -> u32 {
+    units.iter().fold(0, |mask, unit| mask | (1 << unit))
 }
 
 /// Swizzle bits never take part in a surface's identity.
@@ -593,49 +616,141 @@ impl Latte {
         ))
     }
 
-    /// Everything shader translation depends on, translated once.
+    /// What the vertex shader `code` uses, found out once.
+    fn vertex_use(&mut self, hash: u64, code: &[u8], uniform_blocks: bool) -> ShaderUse {
+        *self.shader_uses.entry((hash, uniform_blocks, false)).or_insert_with(|| {
+            let probe = shader::translate_vertex(
+                code,
+                &[],
+                &[],
+                uniform_blocks,
+                &[TextureSignature::default(); TEXTURE_UNITS],
+                0,
+            );
+            ShaderUse {
+                textures: unit_mask(&probe.textures),
+                exports: exported_params(&probe.wgsl),
+                color_exports: 0,
+            }
+        })
+    }
+
+    /// What the pixel shader `code` uses, found out once.
+    fn pixel_use(&mut self, hash: u64, code: &[u8], uniform_blocks: bool) -> ShaderUse {
+        *self.shader_uses.entry((hash, uniform_blocks, true)).or_insert_with(|| {
+            let inputs = PixelInputs {
+                control0: 0,
+                control1: 0,
+                input_controls: &[],
+                vs_out_semantics: &[],
+                vs_exports: 0,
+                alpha_function: None,
+                target_kinds: [TextureKind::Float; 8],
+            };
+            let (probe, _) = shader::translate_pixel(
+                code,
+                &inputs,
+                uniform_blocks,
+                &[TextureSignature::default(); TEXTURE_UNITS],
+            );
+            ShaderUse {
+                textures: unit_mask(&probe.textures),
+                exports: 0,
+                color_exports: probe.color_exports,
+            }
+        })
+    }
+
+    /// The attributes of a fetch shader, parsed once.
+    fn fetch_attributes(&mut self, hash: u64, code: &[u8]) -> Arc<Vec<shader::Attribute>> {
+        Arc::clone(
+            self.fetch_cache
+                .entry(hash)
+                .or_insert_with(|| Arc::new(shader::parse_fetch_shader(code))),
+        )
+    }
+
+    /// Signatures of the units in `used`. The others stay default: they hold whatever
+    /// an earlier draw left there, and telling those apart would translate the same
+    /// program over and over.
+    fn used_signatures(
+        &self,
+        regs: &RegisterFile,
+        stage_base: u32,
+        sampler_base: u32,
+        used: u32,
+    ) -> [TextureSignature; TEXTURE_UNITS] {
+        let mut signatures = [TextureSignature::default(); TEXTURE_UNITS];
+        for (unit, signature) in signatures.iter_mut().enumerate() {
+            if used & (1 << unit) != 0 {
+                if let Some((found, _)) =
+                    self.texture_signature(regs, stage_base, unit, sampler_base + unit as u32)
+                {
+                    *signature = found;
+                }
+            }
+        }
+        signatures
+    }
+
+    /// Everything shader translation depends on, translated once. Only registers
+    /// the shaders really read count, the same way: titles leave the rest as it was.
     fn program_pair(
         &mut self,
-        memory: &Memory,
         regs: &RegisterFile,
         vs: (u64, Arc<[u8]>),
         ps: (u64, Arc<[u8]>),
-        fetch: Arc<[u8]>,
+        fetch: (u64, Arc<[u8]>),
     ) -> Arc<ProgramPair> {
         const VS_STAGE: u32 = resource::VS_TEXTURE;
         const PS_STAGE: u32 = resource::PS_TEXTURE;
-        let _ = memory;
-        let vs_signatures: [TextureSignature; TEXTURE_UNITS] = std::array::from_fn(|unit| {
-            self.texture_signature(regs, VS_STAGE, unit, 18 + unit as u32)
-                .map_or_else(TextureSignature::default, |s| s.0)
+
+        let uniform_blocks = regs.get(config::SQ_CONFIG) & (1 << 8) == 0;
+        let vs_use = self.vertex_use(vs.0, &vs.1, uniform_blocks);
+        let ps_use = self.pixel_use(ps.0, &ps.1, uniform_blocks);
+        let attributes = self.fetch_attributes(fetch.0, &fetch.1);
+        let vs_signatures = self.used_signatures(regs, VS_STAGE, 18, vs_use.textures);
+        let ps_signatures = self.used_signatures(regs, PS_STAGE, 0, ps_use.textures);
+
+        let semantic_table: [u32; 32] =
+            std::array::from_fn(|i| regs.get(reg::SQ_VTX_SEMANTIC_0 + i as u32));
+        let vs_out_semantics: [u32; 40] = std::array::from_fn(|p| {
+            (regs.get(reg::SPI_VS_OUT_ID_0 + (p / 4) as u32) >> ((p % 4) * 8)) & 0xFF
         });
-        let ps_signatures: [TextureSignature; TEXTURE_UNITS] = std::array::from_fn(|unit| {
-            self.texture_signature(regs, PS_STAGE, unit, unit as u32)
-                .map_or_else(TextureSignature::default, |s| s.0)
-        });
-        let semantic_table: Vec<u32> =
-            (0..32).map(|i| regs.get(reg::SQ_VTX_SEMANTIC_0 + i)).collect();
-        let out_ids: Vec<u32> = (0..10).map(|i| regs.get(reg::SPI_VS_OUT_ID_0 + i)).collect();
-        let vs_out_semantics: Vec<u32> =
-            (0..40).map(|p: usize| (out_ids[p / 4] >> ((p % 4) * 8)) & 0xFF).collect();
         let control0 = regs.get(reg::SPI_PS_IN_CONTROL_0);
         let control1 = regs.get(reg::SPI_PS_IN_CONTROL_0 + 1);
-        let input_controls: Vec<u32> =
-            (0..32).map(|i| regs.get(reg::SPI_PS_INPUT_CNTL_0 + i)).collect();
+        let inputs_used = (control0 & 0x3F).min(32);
+        let input_controls: [u32; 32] = std::array::from_fn(|i| {
+            if (i as u32) < inputs_used { regs.get(reg::SPI_PS_INPUT_CNTL_0 + i as u32) } else { 0 }
+        });
         let alpha_control = regs.get(reg::SX_ALPHA_TEST_CONTROL);
         let alpha_function = (alpha_control & 8 != 0).then_some(alpha_control & 7);
-        let uniform_blocks = regs.get(config::SQ_CONFIG) & (1 << 8) == 0;
         let target_kinds: [TextureKind; 8] = std::array::from_fn(|i| {
             let w = &self.color_targets[i];
-            if w.is_valid() { host_format(w.format).kind() } else { TextureKind::Float }
+            if ps_use.color_exports & (1 << i) != 0 && w.is_valid() {
+                host_format(w.format).kind()
+            } else {
+                TextureKind::Float
+            }
         });
 
-        let mut key = Vec::with_capacity(512);
+        let mut key = std::mem::take(&mut self.key_buffer);
+        key.clear();
         key.extend_from_slice(&vs.0.to_le_bytes());
         key.extend_from_slice(&ps.0.to_le_bytes());
-        key.extend_from_slice(&xxh3_64(&fetch).to_le_bytes());
-        for word in semantic_table.iter().chain(&out_ids).chain(&input_controls) {
-            key.extend_from_slice(&word.to_le_bytes());
+        key.extend_from_slice(&fetch.0.to_le_bytes());
+        // Which register each attribute lands in.
+        for attribute in attributes.iter() {
+            let slot = semantic_table.iter().position(|id| id & 0xFF == attribute.semantic);
+            key.push(slot.map_or(0xFF, |slot| slot as u8));
+        }
+        // Which exported parameter each input reads.
+        for &control in &input_controls[..inputs_used as usize] {
+            key.extend_from_slice(&control.to_le_bytes());
+            let parameter = vs_out_semantics.iter().enumerate().find(|(index, id)| {
+                **id == control & 0xFF && vs_use.exports & (1 << (*index).min(31)) != 0
+            });
+            key.push(parameter.map_or(0xFF, |(index, _)| index as u8));
         }
         key.extend_from_slice(&control0.to_le_bytes());
         key.extend_from_slice(&control1.to_le_bytes());
@@ -651,33 +766,22 @@ impl Latte {
             key.push(u8::from(signature.comparison));
         }
         let hash = xxh3_64(&key);
+        self.key_buffer = key;
         if let Some(pair) = self.programs.get(&hash) {
             return Arc::clone(pair);
         }
 
-        // The vertex shader only needs to know which of its params the pixel
-        // shader reads flat; translate the export mask first.
-        let probe = shader::translate_vertex(
-            &vs.1,
-            &[],
-            &semantic_table,
-            uniform_blocks,
-            &vs_signatures,
-            0,
-        );
-        let vs_exports = exported_params(&probe.wgsl);
         let inputs = PixelInputs {
             control0,
             control1,
             input_controls: &input_controls,
             vs_out_semantics: &vs_out_semantics,
-            vs_exports,
+            vs_exports: vs_use.exports,
             alpha_function,
             target_kinds,
         };
         let (pixel, flat_params) =
             shader::translate_pixel(&ps.1, &inputs, uniform_blocks, &ps_signatures);
-        let attributes = shader::parse_fetch_shader(&fetch);
         let vertex = shader::translate_vertex(
             &vs.1,
             &attributes,
@@ -842,8 +946,7 @@ impl Latte {
         let Some(effective) = wiiu_mem_addr::physical_to_effective(physical) else { return 0 };
         let Ok(bytes) = memory.slice(effective, size) else { return 0 };
         // Titles endian-swap uniform blocks themselves (GX2EndianSwap): the GPU reads them as they are.
-        let owned = bytes.to_vec();
-        self.arena_store(&owned, 16)
+        self.arena_store(bytes, 16)
     }
 
     /// Executes a draw from the current registers.
@@ -869,7 +972,8 @@ impl Latte {
             self.skipped_draws += 1;
             return;
         };
-        let pair = self.program_pair(memory, regs, vs, ps, fetch.1);
+        let attributes = self.fetch_attributes(fetch.0, &fetch.1);
+        let pair = self.program_pair(regs, vs, ps, fetch);
 
         let mut textures = Vec::new();
         self.bind_textures(
@@ -998,11 +1102,10 @@ impl Latte {
         }
 
         // Attribute buffers are stored raw: the shader decodes them.
-        let attributes = shader::parse_fetch_shader(&code_of(self, regs).unwrap_or_default());
         let vertex_end = max_index.saturating_add(draw.base_vertex);
         let instance_end = draw.instances.max(1);
         let mut used_buffers = [false; 16];
-        for attribute in &attributes {
+        for attribute in attributes.iter() {
             used_buffers[attribute.buffer as usize] = true;
         }
         for (buffer, used) in used_buffers.iter().enumerate() {
@@ -1068,13 +1171,6 @@ impl Latte {
         let _ = restart;
         self.commands.push(RenderCommand::Draw(Box::new(command)));
     }
-}
-
-/// Fetch shader of the current state.
-fn code_of(latte: &mut Latte, regs: &RegisterFile) -> Option<Vec<u8>> {
-    let physical = regs.get(reg::SQ_PGM_START_FS) << 8;
-    let size = regs.get(reg::SQ_PGM_START_FS + 1) << 3;
-    latte.code_cache.get(&(physical, size)).map(|(_, code, _)| code.to_vec())
 }
 
 /// Indices of the draw being set up.
@@ -1426,4 +1522,37 @@ fn decode_mips(
         mips.push(MipData { width, height, layers, data });
     }
     mips
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_program_is_translated_once_whatever_earlier_draws_left_in_the_registers() {
+        let mut latte = Latte::default();
+        let mut regs = RegisterFile::default();
+        let code: Arc<[u8]> = Arc::from(vec![0_u8; 64]);
+        let program = |latte: &mut Latte, regs: &RegisterFile| {
+            latte.program_pair(
+                regs,
+                (1, Arc::clone(&code)),
+                (2, Arc::clone(&code)),
+                (3, Arc::clone(&code)),
+            )
+        };
+        let first = program(&mut latte, &regs);
+
+        // A texture unit, an input and a semantic these shaders do not use.
+        let unit = base::RESOURCE + resource::PS_TEXTURE;
+        regs.set(unit + 2, 0x100);
+        regs.set(unit + 4, u32::MAX);
+        regs.set(reg::SPI_PS_INPUT_CNTL_0 + 5, 0x1234);
+        regs.set(reg::SQ_VTX_SEMANTIC_0 + 7, 9);
+        assert!(Arc::ptr_eq(&first, &program(&mut latte, &regs)));
+
+        // An input in use does make another program.
+        regs.set(reg::SPI_PS_IN_CONTROL_0, 1);
+        assert!(!Arc::ptr_eq(&first, &program(&mut latte, &regs)));
+    }
 }

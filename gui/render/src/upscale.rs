@@ -1,23 +1,18 @@
-//! xBRZ post-processing of the finished screen images.
+//! xBRZ post-processing of the finished screen images, on the GPU.
 //!
 //! ```text
-//!  screen target ──copy──► readback buffer ──map──► worker thread (xBRZ bands)
-//!                                                        │
-//!  screen shown by the UI ◄── upscaled texture ◄─────────┘
+//!  screen target ──xBRZ fragment shader──► upscaled texture ──► screen shown by the UI
 //! ```
 //!
-//! xBRZ runs on the CPU, so nothing ever waits for it: a screen keeps one frame
-//! in the pipeline and flips arriving meanwhile are not upscaled. The guest and
-//! the renderer run at full speed; a slow host only sees the upscaled image
-//! update less often.
+//! A shader runs within the frame it belongs to, whatever the factor: on the CPU,
+//! xBRZ cannot keep up with 60 frames of 720p and takes the cores from the guest.
 #![allow(clippy::cast_possible_truncation)]
 
 use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -26,12 +21,8 @@ use wiiu_gpu::Screen;
 
 use crate::{ScreenImage, ScreenImages};
 
-/// Largest factor one xBRZ pass supports.
+/// Largest factor offered.
 pub const MAX_FACTOR: u8 = 6;
-/// Rows of real neighbours each band sees above and below: xBRZ looks two rows
-/// away, more keeps the seams identical to a whole-image pass.
-#[cfg(feature = "xbrz")]
-const BAND_OVERLAP: usize = 4;
 
 /// Which algorithm upscales the screens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -85,104 +76,45 @@ pub const fn available() -> bool {
 
 /// The factor in effect, changeable from any thread while the renderer runs.
 #[derive(Debug, Clone)]
-pub struct UpscaleSetting(Arc<AtomicU8>);
+pub struct UpscaleSetting {
+    factor: Arc<AtomicU8>,
+    shown: Arc<AtomicU64>,
+}
 
 impl Default for UpscaleSetting {
     fn default() -> Self {
-        Self(Arc::new(AtomicU8::new(1)))
+        Self { factor: Arc::new(AtomicU8::new(1)), shown: Arc::new(AtomicU64::new(0)) }
     }
 }
 
 impl UpscaleSetting {
     pub fn set(&self, config: UpscaleConfig) {
-        self.0.store(config.effective_factor(), Ordering::Relaxed);
+        self.factor.store(config.effective_factor(), Ordering::Relaxed);
     }
 
     fn factor(&self) -> u8 {
-        self.0.load(Ordering::Relaxed)
+        self.factor.load(Ordering::Relaxed)
+    }
+
+    /// Upscaled images made so far.
+    pub fn images_shown(&self) -> u64 {
+        self.shown.load(Ordering::Relaxed)
     }
 }
 
-/// Upscales tightly packed RGBA8 in parallel bands; the result is opaque.
 #[cfg(feature = "xbrz")]
-fn scale_image(rgba: &[u8], width: usize, height: usize, factor: usize) -> Vec<u8> {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).max(1);
-    let rows = height.div_ceil(threads).max(1);
-    let row_bytes = width * factor * 4;
-    let band = |y0: usize| {
-        let y1 = (y0 + rows).min(height);
-        let (p0, p1) = (y0.saturating_sub(BAND_OVERLAP), (y1 + BAND_OVERLAP).min(height));
-        let scaled =
-            xbrz::scale_rgba(&rgba[p0 * width * 4..p1 * width * 4], width, p1 - p0, factor);
-        scaled[(y0 - p0) * factor * row_bytes..(y1 - p0) * factor * row_bytes].to_vec()
-    };
-    let mut out = std::thread::scope(|scope| {
-        let bands: Vec<_> = (0..height)
-            .step_by(rows)
-            .map(|y0| {
-                let band = &band;
-                scope.spawn(move || band(y0))
-            })
-            .collect();
-        bands.into_iter().filter_map(|b| b.join().ok()).collect::<Vec<_>>().concat()
-    });
-    // Blending at the image border leaves partly transparent pixels behind.
-    for pixel in out.as_chunks_mut::<4>().0 {
-        pixel[3] = 0xFF;
-    }
-    out
-}
-
+const SHADER: &str = include_str!("xbrz.wgsl");
+// The feature decides whether this GPL code is part of the build at all.
 #[cfg(not(feature = "xbrz"))]
-fn scale_image(rgba: &[u8], _width: usize, _height: usize, _factor: usize) -> Vec<u8> {
-    rgba.to_vec()
-}
-
-struct Job {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
-    factor: u8,
-}
-
-struct Scaled {
-    screen: Screen,
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
-    factor: u8,
-}
-
-/// Where a screen's frame is in the pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    Idle,
-    /// The readback buffer is being mapped.
-    Mapping {
-        width: u32,
-        height: u32,
-        row: u32,
-        factor: u8,
-    },
-    /// A worker has the frame.
-    Scaling,
-}
-
-struct ScreenState {
-    stage: Stage,
-    readback: Option<(wgpu::Buffer, u64)>,
-    mapped: Option<Receiver<bool>>,
-    jobs: Sender<Job>,
-    /// The upscaled image being shown.
-    image: Option<ScreenImage>,
-}
+const SHADER: &str = "";
 
 /// xBRZ for the screens of one renderer.
+#[derive(Default)]
 pub struct Upscaler {
     setting: UpscaleSetting,
-    screens: HashMap<Screen, ScreenState>,
-    results: Receiver<Scaled>,
-    results_sender: Sender<Scaled>,
+    /// Made on first use: most sessions never upscale.
+    pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    images: HashMap<Screen, ScreenImage>,
 }
 
 impl std::fmt::Debug for Upscaler {
@@ -191,34 +123,51 @@ impl std::fmt::Debug for Upscaler {
     }
 }
 
-impl Default for Upscaler {
-    fn default() -> Self {
-        let (results_sender, results) = mpsc::channel();
-        Self {
-            setting: UpscaleSetting::default(),
-            screens: HashMap::new(),
-            results,
-            results_sender,
-        }
-    }
-}
-
-fn spawn_worker(screen: Screen, results: Sender<Scaled>) -> Sender<Job> {
-    let (jobs, receiver) = mpsc::channel::<Job>();
-    let spawned = std::thread::Builder::new().name("flora-xbrz".into()).spawn(move || {
-        while let Ok(job) = receiver.recv() {
-            let Job { rgba, width, height, factor } = job;
-            let rgba = scale_image(&rgba, width as usize, height as usize, usize::from(factor));
-            let (width, height) = (width * u32::from(factor), height * u32::from(factor));
-            if results.send(Scaled { screen, rgba, width, height, factor }).is_err() {
-                break;
-            }
-        }
+fn create_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("flora xBRZ"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
     });
-    if let Err(error) = spawned {
-        log::error!("cannot start the xBRZ thread: {error}");
-    }
-    jobs
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("flora xBRZ"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("flora xBRZ"),
+        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("flora xBRZ"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, layout)
 }
 
 impl Upscaler {
@@ -228,11 +177,11 @@ impl Upscaler {
 
     /// `true` while the UI should see the upscaled image of `screen`, not the native one.
     pub fn shows(&self, screen: Screen) -> bool {
-        self.setting.factor() > 1 && self.screens.get(&screen).is_some_and(|s| s.image.is_some())
+        self.setting.factor() > 1 && self.images.contains_key(&screen)
     }
 
-    /// Moves frames along the pipeline. Call after a flip's work was submitted;
-    /// `presented` lists the screens that have a new image.
+    /// Upscales the new images. Call after a flip's work was submitted; `presented`
+    /// lists the screens that have one.
     pub fn update(
         &mut self,
         device: &wgpu::Device,
@@ -247,82 +196,43 @@ impl Upscaler {
             self.switch_off(targets, shown);
             return;
         }
-        let _ = device.poll(wgpu::PollType::Poll);
-        for state in self.screens.values_mut() {
-            Self::hand_over(state);
+        if presented.is_empty() {
+            return;
         }
-        while let Ok(scaled) = self.results.try_recv() {
-            if let Some(state) = self.screens.get_mut(&scaled.screen) {
-                state.stage = Stage::Idle;
-                if scaled.factor == factor {
-                    Self::show(device, queue, state, &scaled, shown, generation);
-                }
-            }
-        }
+        let mut encoder = device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flora xBRZ") });
         for screen in presented {
             if let Some(target) = targets.get(screen) {
-                self.capture(device, queue, *screen, target, factor);
+                self.upscale(device, &mut encoder, *screen, target, factor, shown, generation);
             }
         }
+        queue.submit([encoder.finish()]);
     }
 
     /// Back to the native images as soon as the setting says so.
     fn switch_off(&mut self, targets: &HashMap<Screen, ScreenImage>, shown: &ScreenImages) {
-        for (screen, state) in &mut self.screens {
-            if state.image.take().is_some() {
-                if let Some(target) = targets.get(screen) {
-                    shown.set(*screen, target.clone());
-                }
-            }
-        }
-        while self.results.try_recv().is_ok() {}
-        for state in self.screens.values_mut() {
-            if state.stage == Stage::Scaling {
-                state.stage = Stage::Idle;
+        for (screen, _) in self.images.drain() {
+            if let Some(target) = targets.get(&screen) {
+                shown.set(screen, target.clone());
             }
         }
     }
 
-    /// A finished readback goes to the worker.
-    fn hand_over(state: &mut ScreenState) {
-        let Stage::Mapping { width, height, row, factor } = state.stage else { return };
-        let Some(mapped) = &state.mapped else { return };
-        let success = match mapped.try_recv() {
-            Ok(success) => success,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => false,
-        };
-        state.mapped = None;
-        state.stage = Stage::Idle;
-        let Some((buffer, _)) = &state.readback else { return };
-        if !success {
-            return;
-        }
-        let tight = (width * 4) as usize;
-        let rgba = {
-            let Ok(data) = buffer.slice(..).get_mapped_range() else { return };
-            let mut rgba = Vec::with_capacity(tight * height as usize);
-            for line in data.chunks_exact(row as usize) {
-                rgba.extend_from_slice(&line[..tight]);
-            }
-            rgba
-        };
-        buffer.unmap();
-        if state.jobs.send(Job { rgba, width, height, factor }).is_ok() {
-            state.stage = Stage::Scaling;
-        }
-    }
-
-    fn show(
+    #[allow(clippy::too_many_arguments)]
+    fn upscale(
+        &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        state: &mut ScreenState,
-        scaled: &Scaled,
+        encoder: &mut wgpu::CommandEncoder,
+        screen: Screen,
+        target: &ScreenImage,
+        factor: u8,
         shown: &ScreenImages,
         generation: &mut u64,
     ) {
-        let (width, height) = (scaled.width, scaled.height);
-        let stale = state.image.as_ref().is_none_or(|i| i.width != width || i.height != height);
+        let largest = device.limits().max_texture_dimension_2d;
+        let factor = u32::from(factor).min(largest / target.width.max(target.height).max(1)).max(1);
+        let (width, height) = (target.width * factor, target.height * factor);
+        let stale = self.images.get(&screen).is_none_or(|i| i.width != width || i.height != height);
         if stale {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("flora upscaled screen"),
@@ -332,86 +242,47 @@ impl Upscaler {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             *generation += 1;
-            state.image =
-                Some(ScreenImage { view, texture, width, height, generation: *generation });
+            let image = ScreenImage { view, texture, width, height, generation: *generation };
+            shown.set(screen, image.clone());
+            self.images.insert(screen, image);
         }
-        let Some(image) = &state.image else { return };
-        queue.write_texture(
-            image.texture.as_image_copy(),
-            &scaled.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        if stale {
-            shown.set(scaled.screen, image.clone());
-        }
-    }
-
-    /// Starts reading `target` back unless the screen still has a frame in the pipeline.
-    fn capture(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        screen: Screen,
-        target: &ScreenImage,
-        factor: u8,
-    ) {
-        let results = &self.results_sender;
-        let state = self.screens.entry(screen).or_insert_with(|| ScreenState {
-            stage: Stage::Idle,
-            readback: None,
-            mapped: None,
-            jobs: spawn_worker(screen, results.clone()),
-            image: None,
+        let Some(image) = self.images.get(&screen) else { return };
+        let (pipeline, layout) = self.pipeline.get_or_insert_with(|| create_pipeline(device));
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flora xBRZ"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&target.view),
+            }],
         });
-        if state.stage != Stage::Idle {
-            return;
-        }
-        let (width, height) = (target.width, target.height);
-        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let size = u64::from(row) * u64::from(height);
-        if state.readback.as_ref().is_none_or(|(_, existing)| *existing != size) {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("flora upscale readback"),
-                size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            state.readback = Some((buffer, size));
-        }
-        let Some((buffer, _)) = &state.readback else { return };
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("flora upscale readback"),
-        });
-        encoder.copy_texture_to_buffer(
-            target.texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: None,
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("flora xBRZ"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &image.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
                 },
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        queue.submit([encoder.finish()]);
-        let (sender, receiver) = mpsc::channel();
-        buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result.is_ok());
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
-        state.mapped = Some(receiver);
-        state.stage = Stage::Mapping { width, height, row, factor };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        self.setting.shown.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -420,7 +291,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn factors_stay_in_the_range_of_one_pass() {
+    fn factors_stay_in_the_range_offered() {
         let config = |method, factor| UpscaleConfig { method, factor }.effective_factor();
         assert_eq!(config(UpscaleMethod::None, 4), 1);
         if available() {
@@ -430,20 +301,137 @@ mod tests {
         }
     }
 
+    /// `None` on a machine without a usable GPU.
+    #[cfg(feature = "xbrz")]
+    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    #[cfg(feature = "xbrz")]
+    fn image(device: &wgpu::Device, queue: &wgpu::Queue, size: u32, rgba: &[u8]) -> ScreenImage {
+        let extent = wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 4),
+                rows_per_image: None,
+            },
+            extent,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        ScreenImage { view, texture, width: size, height: size, generation: 1 }
+    }
+
+    #[cfg(feature = "xbrz")]
+    fn read(device: &wgpu::Device, queue: &wgpu::Queue, image: &ScreenImage) -> Vec<u8> {
+        let row = (image.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row) * u64::from(image.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            image.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: image.width, height: image.height, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = buffer.slice(..).get_mapped_range().unwrap();
+        data.chunks_exact(row as usize)
+            .flat_map(|line| line[..(image.width * 4) as usize].iter().copied())
+            .collect()
+    }
+
     #[cfg(feature = "xbrz")]
     #[test]
-    fn bands_match_a_whole_image_pass() {
-        let (width, height) = (97, 61);
-        let rgba: Vec<u8> = (0..width * height)
-            .flat_map(|i| {
-                let v = (i * i % 251) as u8;
-                [v, v.wrapping_mul(3), 255 - v, 255]
+    fn smooths_a_diagonal_and_leaves_flat_areas_alone() {
+        const SIZE: u32 = 16;
+        const FACTOR: u32 = 4;
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: test skipped");
+            return;
+        };
+        // Black below the diagonal, white above it.
+        let source: Vec<u8> = (0..SIZE * SIZE)
+            .flat_map(|at| {
+                let value = if at % SIZE > at / SIZE { 255 } else { 0 };
+                [value, value, value, 255]
             })
             .collect();
-        let mut whole = xbrz::scale_rgba(&rgba, width, height, 2);
-        for pixel in whole.as_chunks_mut::<4>().0 {
-            pixel[3] = 0xFF;
-        }
-        assert!(scale_image(&rgba, width, height, 2) == whole);
+        let target = image(&device, &queue, SIZE, &source);
+        let targets = HashMap::from([(Screen::Tv, target)]);
+        let shown = ScreenImages::default();
+        let mut upscaler = Upscaler::default();
+        upscaler.setting().set(UpscaleConfig { method: UpscaleMethod::Xbrz, factor: FACTOR as u8 });
+        let mut generation = 1;
+        upscaler.update(&device, &queue, &[Screen::Tv], &targets, &shown, &mut generation);
+
+        let result = shown.get(Screen::Tv).unwrap();
+        assert_eq!((result.width, result.height), (SIZE * FACTOR, SIZE * FACTOR));
+        let pixels = read(&device, &queue, &result);
+        let value = |x: u32, y: u32| pixels[((y * SIZE * FACTOR + x) * 4) as usize];
+        // Flat areas keep their exact colours, and the image is opaque.
+        assert_eq!(value(SIZE * FACTOR - 2, 1), 255);
+        assert_eq!(value(1, SIZE * FACTOR - 2), 0);
+        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        // A plain enlargement would be a staircase of whole source pixels: here,
+        // inside the source pixels on the edge, some output pixels differ from E.
+        let source_at = |x: u32, y: u32| source[(((y / FACTOR) * SIZE + x / FACTOR) * 4) as usize];
+        let smoothed = (0..SIZE * FACTOR)
+            .flat_map(|y| (0..SIZE * FACTOR).map(move |x| (x, y)))
+            .filter(|&(x, y)| value(x, y) != source_at(x, y))
+            .count();
+        assert!(smoothed > (SIZE * FACTOR) as usize, "only {smoothed} output pixels changed");
+    }
+
+    #[cfg(feature = "xbrz")]
+    #[test]
+    fn switching_off_brings_back_the_native_image() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: test skipped");
+            return;
+        };
+        let target = image(&device, &queue, 8, &[128; 8 * 8 * 4]);
+        let targets = HashMap::from([(Screen::Drc, target)]);
+        let shown = ScreenImages::default();
+        let mut upscaler = Upscaler::default();
+        let mut generation = 1;
+        let config = UpscaleConfig { method: UpscaleMethod::Xbrz, factor: 2 };
+        upscaler.setting().set(config);
+        upscaler.update(&device, &queue, &[Screen::Drc], &targets, &shown, &mut generation);
+        assert!(upscaler.shows(Screen::Drc));
+        assert_eq!(shown.get(Screen::Drc).unwrap().width, 16);
+
+        upscaler.setting().set(UpscaleConfig { method: UpscaleMethod::None, factor: 2 });
+        upscaler.update(&device, &queue, &[], &targets, &shown, &mut generation);
+        assert!(!upscaler.shows(Screen::Drc));
+        assert_eq!(shown.get(Screen::Drc).unwrap().width, 8);
     }
 }

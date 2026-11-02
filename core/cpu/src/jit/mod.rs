@@ -1,11 +1,19 @@
 //! Block JIT on top of Cranelift.
 //!
 //! ```text
-//!  Jit::run ──► block at pc cached? ──no──► emit::compile (decode until a branch)
-//!      ▲                │ yes
-//!      │                ▼
-//!      └── next pc ◄── native code ──► interpreter::step (anything not translated)
+//!  Jit::run ──► block at pc translated? ──yes──► native code ──tail call──► next block
+//!      ▲                │ no                          │ budget used up, target
+//!      │                ▼                             ▼ not translated, or an event
+//!      │        queue it for a worker, interpret      │
+//!      └──────────────────┴───────────────────────────┘
 //! ```
+//!
+//! Like Cemu's recompiler thread, translation never stops the guest: workers
+//! compile in the background while the block runs on the interpreter, so new
+//! code costs speed for a moment instead of a stall on the frame.
+//!
+//! Blocks jump straight to each other: a single dispatch loop would funnel every
+//! guest branch through one host call site, which the host CPU cannot predict.
 //!
 //! Translated instructions operate on the [`CpuState`] directly and access
 //! guest memory through [`Bus::fast_memory`]. Every instruction `emit` does not
@@ -13,28 +21,49 @@
 //! is an optimisation only: both must behave identically.
 mod emit;
 
-use std::ffi::c_void;
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex, PoisonError,
+        mpsc::{self, Receiver, Sender},
+    },
+};
 
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::FunctionBuilderContext;
+use cranelift_codegen::{
+    ir::{AbiParam, InstBuilder, Signature, Type, types::I32},
+    isa::{CallConv, OwnedTargetIsa},
+    settings::{self, Configurable},
+};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::Module;
+use cranelift_module::{FuncId, Linkage, Module};
 
+use self::emit::{Job, Translated};
 use crate::{Bus, CpuError, CpuState, StepEvent, interpreter::step};
 
 /// Longest block; keeps time slices responsive in loop-free code.
 const MAX_BLOCK_INSTRUCTIONS: u32 = 64;
 const PAGE_BITS: u32 = 12;
 const PAGE_ENTRIES: usize = 1 << (PAGE_BITS - 2);
+/// Translation threads at most; the emulator and renderer need cores too.
+const MAX_WORKERS: usize = 6;
 
 /// What a block's helper calls need besides the registers.
 pub(crate) struct HelperContext {
     bus: *mut c_void,
     /// Why a block returned early.
     result: Option<Result<StepEvent, CpuError>>,
+    /// Instructions left to run; blocks subtract theirs and stop at zero.
+    remaining: i64,
 }
 
-type BlockFn = unsafe extern "C" fn(*mut CpuState, *mut u8, *mut HelperContext) -> u32;
+/// Calls the block at the last argument with the tail-calling convention.
+type EnterFn = unsafe extern "C" fn(*mut CpuState, *mut u8, *mut HelperContext, *const u8) -> u32;
+
+/// Translations of one guest page; null where there is none. Native code reads this.
+type Page = [*const u8; PAGE_ENTRIES];
 
 /// One instruction of the reference interpreter, called from native code.
 /// Returns non-zero when the block must stop.
@@ -55,19 +84,20 @@ unsafe extern "C" fn interpret_one<B: Bus>(
     }
 }
 
-#[derive(Clone, Copy)]
-struct Block {
-    code: BlockFn,
-    instructions: u32,
-}
-
 /// Translated code of one guest address space.
 pub struct Jit {
     module: JITModule,
-    context: cranelift_codegen::Context,
-    builder_context: FunctionBuilderContext,
+    enter: EnterFn,
     /// Two-level table: guest page, then instruction within the page.
-    pages: Vec<Option<Box<[Option<Block>; PAGE_ENTRIES]>>>,
+    pages: Vec<Option<Box<Page>>>,
+    /// Instruction count of blocks that are queued, or that failed to translate.
+    untranslated: HashMap<u32, u32>,
+    jobs: Sender<Job>,
+    finished: Receiver<Translated>,
+    /// Bumped on invalidation: translations of older code are dropped on arrival.
+    generation: u64,
+    /// Waits for each translation instead of interpreting meanwhile.
+    synchronous: bool,
     compiled_blocks: u64,
     compile_nanos: u64,
 }
@@ -83,6 +113,83 @@ impl std::fmt::Debug for Jit {
     }
 }
 
+/// The block's calling convention: every block ends in a jump to the next one.
+fn block_signature(pointer: Type) -> Signature {
+    let mut signature = Signature::new(CallConv::Tail);
+    signature.params.extend([AbiParam::new(pointer); 3]);
+    signature.returns.push(AbiParam::new(I32));
+    signature
+}
+
+/// The way from Rust into the tail-calling convention of the blocks.
+#[allow(clippy::expect_used, reason = "these few fixed instructions always compile")]
+fn compile_enter(module: &mut JITModule, isa: &OwnedTargetIsa) -> EnterFn {
+    let pointer = isa.pointer_type();
+    let mut signature = Signature::new(isa.default_call_conv());
+    signature.params.extend([AbiParam::new(pointer); 4]);
+    signature.returns.push(AbiParam::new(I32));
+    let id = module
+        .declare_function("flora_enter_block", Linkage::Local, &signature)
+        .expect("a fresh module has no such function");
+    let mut context = module.make_context();
+    context.func.signature = signature;
+    let mut builder_context = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let params = b.block_params(entry).to_vec();
+        let block = b.import_signature(block_signature(pointer));
+        let call = b.ins().call_indirect(block, params[3], &params[..3]);
+        let stop = b.inst_results(call)[0];
+        b.ins().return_(&[stop]);
+        b.finalize(isa.frontend_config());
+    }
+    module.define_function(id, &mut context).expect("valid function");
+    module.finalize_definitions().expect("memory for a few instructions");
+    let address = module.get_finalized_function(id);
+    // SAFETY: `address` was just generated with exactly this signature.
+    unsafe { std::mem::transmute::<*const u8, EnterFn>(address) }
+}
+
+/// Starts the threads translating blocks.
+fn spawn_workers(
+    isa: &OwnedTargetIsa,
+    pages: usize,
+    jobs: Receiver<Job>,
+    finished: &Sender<Translated>,
+) {
+    let count = std::thread::available_parallelism()
+        .map_or(1, |n| n.get().saturating_sub(4))
+        .clamp(1, MAX_WORKERS);
+    let jobs = Arc::new(Mutex::new(jobs));
+    for _ in 0..count {
+        let (isa, jobs, finished) = (Arc::clone(isa), Arc::clone(&jobs), finished.clone());
+        let spawned = std::thread::Builder::new().name("flora-jit".into()).spawn(move || {
+            let mut worker = emit::Worker::new(Arc::clone(&isa), pages);
+            loop {
+                let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                let Ok(job) = job else { break };
+                // A panic in the compiler must not lose the job: its block stays
+                // interpreted, and whoever waits for it hears about that.
+                let translated = catch_unwind(AssertUnwindSafe(|| worker.translate(&job)))
+                    .unwrap_or_else(|_| {
+                        worker = emit::Worker::new(Arc::clone(&isa), pages);
+                        job.failed()
+                    });
+                if finished.send(translated).is_err() {
+                    break;
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            log::error!("cannot start a JIT thread: {error}");
+        }
+    }
+}
+
 impl Jit {
     /// Creates an empty code cache for the host CPU.
     ///
@@ -94,26 +201,48 @@ impl Jit {
     )]
     pub fn new() -> Self {
         let mut flags = settings::builder();
-        flags.set("opt_level", if std::env::var_os("FLORA_JIT_NONE").is_some() { "none" } else { "speed" }).expect("known flag");
+        let level = if std::env::var_os("FLORA_JIT_NONE").is_some() { "none" } else { "speed" };
+        flags.set("opt_level", level).expect("known flag");
         flags.set("use_colocated_libcalls", "false").expect("known flag");
         flags.set("is_pic", "false").expect("known flag");
+        // Cranelift's tail calls rely on them.
+        flags.set("preserve_frame_pointers", "true").expect("known flag");
+        let verify = if cfg!(debug_assertions) { "true" } else { "false" };
+        flags.set("enable_verifier", verify).expect("known flag");
         let isa = cranelift_native::builder()
             .expect("host supported by Cranelift")
             .finish(settings::Flags::new(flags))
             .expect("valid flags");
-        let module =
-            JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
+        let mut module = JITModule::new(JITBuilder::with_isa(
+            Arc::clone(&isa),
+            cranelift_module::default_libcall_names(),
+        ));
+        let enter = compile_enter(&mut module, &isa);
+        let pages: Vec<Option<Box<Page>>> =
+            (0..1_usize << (32 - PAGE_BITS)).map(|_| None).collect();
+        let (jobs, job_receiver) = mpsc::channel();
+        let (finished_sender, finished) = mpsc::channel();
+        spawn_workers(&isa, pages.as_ptr() as usize, job_receiver, &finished_sender);
         Self {
-            context: module.make_context(),
             module,
-            builder_context: FunctionBuilderContext::new(),
-            pages: (0..1_usize << (32 - PAGE_BITS)).map(|_| None).collect(),
+            enter,
+            pages,
+            untranslated: HashMap::new(),
+            jobs,
+            finished,
+            generation: 0,
+            synchronous: std::env::var_os("FLORA_JIT_SYNC").is_some(),
             compiled_blocks: 0,
             compile_nanos: 0,
         }
     }
 
-    /// Host time spent translating so far.
+    /// Whether to wait for each translation instead of interpreting meanwhile.
+    pub const fn set_synchronous(&mut self, synchronous: bool) {
+        self.synchronous = synchronous;
+    }
+
+    /// Host time spent translating so far, summed over the workers.
     pub const fn compile_nanos(&self) -> u64 {
         self.compile_nanos
     }
@@ -126,11 +255,13 @@ impl Jit {
     /// Forgets translations of `[address, address + size)` (self-modifying code,
     /// `ICInvalidateRange`).
     pub fn invalidate(&mut self, address: u32, size: u32) {
+        self.generation += 1;
+        self.untranslated.clear();
         let end = address.saturating_add(size);
         let mut at = address & !3;
         while at < end {
             if let Some(page) = &mut self.pages[(at >> PAGE_BITS) as usize] {
-                page[((at >> 2) as usize) & (PAGE_ENTRIES - 1)] = None;
+                page[((at >> 2) as usize) & (PAGE_ENTRIES - 1)] = std::ptr::null();
             }
             at = at.saturating_add(4);
             if at == u32::MAX {
@@ -140,14 +271,79 @@ impl Jit {
     }
 
     #[inline]
-    fn lookup(&self, pc: u32) -> Option<Block> {
-        self.pages[(pc >> PAGE_BITS) as usize].as_ref()?[((pc >> 2) as usize) & (PAGE_ENTRIES - 1)]
+    fn lookup(&self, pc: u32) -> Option<*const u8> {
+        let code = self.pages[(pc >> PAGE_BITS) as usize].as_ref()?
+            [((pc >> 2) as usize) & (PAGE_ENTRIES - 1)];
+        (!code.is_null()).then_some(code)
     }
 
-    fn insert(&mut self, pc: u32, block: Block) {
+    fn insert(&mut self, pc: u32, code: *const u8) {
         let page = self.pages[(pc >> PAGE_BITS) as usize]
-            .get_or_insert_with(|| Box::new([None; PAGE_ENTRIES]));
-        page[((pc >> 2) as usize) & (PAGE_ENTRIES - 1)] = Some(block);
+            .get_or_insert_with(|| Box::new([std::ptr::null(); PAGE_ENTRIES]));
+        page[((pc >> 2) as usize) & (PAGE_ENTRIES - 1)] = code;
+    }
+
+    /// Hands the code of a finished translation to the module.
+    fn define(&mut self, translated: &Translated) -> Option<FuncId> {
+        self.compile_nanos += translated.nanos;
+        if translated.generation != self.generation {
+            return None;
+        }
+        let Some(code) = &translated.code else {
+            log::error!("JIT failed at {:#010x}, it stays interpreted", translated.pc);
+            return None;
+        };
+        let signature = block_signature(self.module.isa().pointer_type());
+        let id = self.module.declare_anonymous_function(&signature).ok()?;
+        self.module.define_function_bytes(id, translated.alignment, code, &[]).ok()?;
+        Some(id)
+    }
+
+    /// Takes in what the workers finished. Everything becomes executable at once:
+    /// changing page protection per block would be a large part of translating.
+    fn collect(&mut self, first: Option<Translated>) {
+        let batch: Vec<_> = first.into_iter().chain(self.finished.try_iter()).collect();
+        if batch.is_empty() {
+            return;
+        }
+        let defined: Vec<_> = batch.iter().filter_map(|t| Some((t.pc, self.define(t)?))).collect();
+        if let Err(error) = self.module.finalize_definitions() {
+            log::error!("JIT: cannot make code executable: {error}");
+            return;
+        }
+        for (pc, id) in defined {
+            let code = self.module.get_finalized_function(id);
+            self.insert(pc, code);
+            self.untranslated.remove(&pc);
+            self.compiled_blocks += 1;
+        }
+    }
+
+    /// Queues the block at `pc`, unless it is on its way. Returns how many
+    /// instructions to interpret meanwhile.
+    fn queue<B: Bus>(&mut self, pc: u32, bus: &mut B) -> Result<u32, CpuError> {
+        if let Some(count) = self.untranslated.get(&pc) {
+            return Ok(*count);
+        }
+        let job = emit::decode_block::<B>(pc, bus, self.generation)?;
+        let count = job.instructions.len() as u32;
+        self.untranslated.insert(pc, count);
+        if self.jobs.send(job).is_err() {
+            log::error!("the JIT threads are gone");
+        }
+        Ok(count)
+    }
+
+    /// Waits until the block at `pc` is translated, or known not to translate.
+    fn wait_for(&mut self, pc: u32) {
+        while self.lookup(pc).is_none() {
+            let Ok(translated) = self.finished.recv() else { return };
+            let failed = translated.pc == pc && translated.code.is_none();
+            self.collect(Some(translated));
+            if failed {
+                return;
+            }
+        }
     }
 
     /// Runs until an event other than [`StepEvent::Continue`] occurs or at
@@ -165,32 +361,62 @@ impl Jit {
         let Some(memory) = bus.fast_memory() else {
             return crate::interpreter::run(state, bus, budget);
         };
-        let mut context = HelperContext { bus: std::ptr::from_mut(bus).cast(), result: None };
-        let mut executed = 0;
-        while executed < budget {
+        self.collect(None);
+        let budget = budget as i64;
+        let mut context =
+            HelperContext { bus: std::ptr::from_mut(bus).cast(), result: None, remaining: budget };
+        while context.remaining > 0 {
             let pc = state.pc;
-            let block = match self.lookup(pc) {
-                Some(block) => block,
-                None => {
-                    // SAFETY: `context.bus` is the live `bus`; nothing else uses it meanwhile.
-                    let bus = unsafe { &mut *context.bus.cast::<B>() };
-                    let timer = std::time::Instant::now();
-                    let block = self.compile(pc, bus)?;
-                    self.compile_nanos += timer.elapsed().as_nanos() as u64;
-                    block
+            if let Some(code) = self.lookup(pc) {
+                // SAFETY: the code was generated for this `CpuState` layout, and
+                // `memory` is the base of the guest's flat address space.
+                let stop = unsafe {
+                    (self.enter)(std::ptr::from_mut(state), memory, &raw mut context, code)
+                };
+                if stop != 0 {
+                    if let Some(result) = context.result.take() {
+                        return result.map(|event| (event, (budget - context.remaining) as u64));
+                    }
                 }
-            };
-            // SAFETY: the code was generated for this `CpuState` layout, and
-            // `memory` is the base of the guest's flat address space.
-            let stop = unsafe { (block.code)(std::ptr::from_mut(state), memory, &raw mut context) };
-            executed += u64::from(block.instructions);
-            if stop != 0 {
-                if let Some(result) = context.result.take() {
-                    return result.map(|event| (event, executed));
+                continue;
+            }
+            // SAFETY: `context.bus` is the live `bus`; nothing else uses it meanwhile.
+            let bus = unsafe { &mut *context.bus.cast::<B>() };
+            let count = self.queue(pc, bus)?;
+            self.collect(None);
+            if self.synchronous {
+                self.wait_for(pc);
+                if self.lookup(pc).is_some() {
+                    continue;
                 }
             }
+            if let Some(event) = self.interpret(state, bus, count, &mut context)? {
+                return Ok((event, (budget - context.remaining) as u64));
+            }
         }
-        Ok((StepEvent::Continue, executed))
+        Ok((StepEvent::Continue, (budget - context.remaining) as u64))
+    }
+
+    /// Steps through an untranslated block until it ends or translated code is reached.
+    fn interpret<B: Bus>(
+        &self,
+        state: &mut CpuState,
+        bus: &mut B,
+        count: u32,
+        context: &mut HelperContext,
+    ) -> Result<Option<StepEvent>, CpuError> {
+        for _ in 0..count {
+            let next = state.pc.wrapping_add(4);
+            let event = step(state, bus)?;
+            context.remaining -= 1;
+            if event != StepEvent::Continue {
+                return Ok(Some(event));
+            }
+            if state.pc != next || self.lookup(state.pc).is_some() {
+                break;
+            }
+        }
+        Ok(None)
     }
 }
 

@@ -85,10 +85,19 @@ fn call(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
     if ctx.os.registry.is_traced(index) {
         let thread = ctx.os.coreinit.threads.current;
         let r = &ctx.cpu.gpr;
+        // The callers above `lr`, along the stack's back chain.
+        let mut callers = Vec::new();
+        let mut frame = ctx.memory.read_u32(r[1]).unwrap_or(0);
+        while callers.len() < TRACED_CALLERS && frame != 0 {
+            let Ok(caller) = ctx.memory.read_u32(frame + 4) else { break };
+            callers.push(format!("{caller:#010x}"));
+            frame = ctx.memory.read_u32(frame).unwrap_or(0);
+        }
         log::info!(
-            "{} thread {thread:#x} lr {:#010x} ({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
+            "{} thread {thread:#x} lr {:#010x} < {} ({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
             ctx.os.registry.name_of(index),
             ctx.cpu.lr,
+            callers.join(" < "),
             r[3],
             r[4],
             r[5],
@@ -102,6 +111,9 @@ fn call(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
     ctx.os.registry.record_trace(index, lr, arg, ctx.cpu.gpr[3]);
     result
 }
+
+/// Callers listed per call of a function in `FLORA_TRACE_HLE`.
+const TRACED_CALLERS: usize = 10;
 
 fn call_entry(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
     if let Some(function) = ctx.os.registry.function(index) {

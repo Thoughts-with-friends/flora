@@ -23,6 +23,14 @@ bitflags::bitflags! {
         const TV = 0x0001_0000;
         const STICK_R = 0x0002_0000;
         const STICK_L = 0x0004_0000;
+        const STICK_R_DOWN = 0x0080_0000;
+        const STICK_R_UP = 0x0100_0000;
+        const STICK_R_RIGHT = 0x0200_0000;
+        const STICK_R_LEFT = 0x0400_0000;
+        const STICK_L_DOWN = 0x0800_0000;
+        const STICK_L_UP = 0x1000_0000;
+        const STICK_L_RIGHT = 0x2000_0000;
+        const STICK_L_LEFT = 0x4000_0000;
     }
 }
 
@@ -33,7 +41,42 @@ pub struct Stick {
     pub y: f32,
 }
 
+/// Stick travel at which the OS reports a direction as pressed.
+const STICK_DIRECTION_THRESHOLD: f32 = 0.5;
+
 impl GamePadState {
+    /// `held` plus the button bits the OS derives from the sticks, which is how
+    /// titles usually read a stick in their menus.
+    pub fn held_with_stick_directions(&self) -> VpadButtons {
+        let directions = |stick: Stick, [left, right, up, down]: [VpadButtons; 4]| {
+            let mut held = VpadButtons::empty();
+            held.set(left, stick.x <= -STICK_DIRECTION_THRESHOLD);
+            held.set(right, stick.x >= STICK_DIRECTION_THRESHOLD);
+            held.set(up, stick.y >= STICK_DIRECTION_THRESHOLD);
+            held.set(down, stick.y <= -STICK_DIRECTION_THRESHOLD);
+            held
+        };
+        self.held
+            | directions(
+                self.left_stick,
+                [
+                    VpadButtons::STICK_L_LEFT,
+                    VpadButtons::STICK_L_RIGHT,
+                    VpadButtons::STICK_L_UP,
+                    VpadButtons::STICK_L_DOWN,
+                ],
+            )
+            | directions(
+                self.right_stick,
+                [
+                    VpadButtons::STICK_R_LEFT,
+                    VpadButtons::STICK_R_RIGHT,
+                    VpadButtons::STICK_R_UP,
+                    VpadButtons::STICK_R_DOWN,
+                ],
+            )
+    }
+
     /// A sample with only VPAD_BUTTON_* bits set (scripts, tests).
     pub const fn from_button_bits(bits: u32) -> Self {
         Self {
@@ -74,6 +117,20 @@ impl ButtonEdges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pushed_sticks_count_as_buttons() {
+        let pad = GamePadState {
+            held: VpadButtons::A,
+            left_stick: Stick { x: -0.8, y: 0.2 },
+            right_stick: Stick { x: 0.0, y: -1.0 },
+            touch: None,
+        };
+        assert_eq!(
+            pad.held_with_stick_directions(),
+            VpadButtons::A | VpadButtons::STICK_L_LEFT | VpadButtons::STICK_R_DOWN
+        );
+    }
 
     #[test]
     fn edges() {

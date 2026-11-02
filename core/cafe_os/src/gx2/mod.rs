@@ -54,6 +54,8 @@ pub struct Gx2State {
     pub flip_requests: u32,
     pub flips_executed: u32,
     pub swap_interval: u32,
+    /// Replaces the interval the title asks for (`Config::swap_interval`).
+    pub forced_swap_interval: Option<u32>,
     /// Timebase value of the last flip shown.
     pub last_flip_time: u64,
     /// Timebase value of the last vertical blank.
@@ -82,6 +84,7 @@ impl Default for Gx2State {
             flip_requests: 0,
             flips_executed: 0,
             swap_interval: 1,
+            forced_swap_interval: None,
             last_flip_time: 0,
             last_vsync_time: 0,
             vsync_count: 0,

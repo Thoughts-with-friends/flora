@@ -40,6 +40,11 @@ impl Callbacks {
         !self.queue.is_empty()
     }
 
+    /// Calls waiting to run.
+    pub fn pending(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Starts the next queued call on `cpu`; `return_stub` becomes its `lr`.
     pub fn begin(&mut self, cpu: &mut CpuState, return_stub: u32) -> bool {
         if self.saved.is_some() || self.stack_top == 0 {

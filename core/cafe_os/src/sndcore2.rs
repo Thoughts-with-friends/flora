@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 
 use wiiu_hle_macros::hle_export;
 use wiiu_memory::Memory;
+use wiiu_peripherals::timebase::FREQUENCY;
 use wiiu_sound::{SampleFormat, SampleMemory, Voice};
 
 use crate::{
@@ -23,10 +24,13 @@ const VPB_SIZE: u32 = 0x60;
 pub const OUTPUT_RATE: u32 = 48_000;
 /// Samples rendered per AX frame at 48 kHz.
 const SAMPLES_PER_FRAME: u32 = 144;
-/// Timebase ticks per AX frame (248.625 MHz / 333.33).
-const TICKS_PER_FRAME: u64 = 745_875;
+/// Length of an AX frame in milliseconds.
+const FRAME_MILLISECONDS: u64 = 3;
+/// A guest with this many callbacks waiting is not keeping up: frame callbacks
+/// wait for it to catch up, instead of piling up without end.
+const MAX_PENDING_CALLBACKS: usize = 32;
 /// Frames made up for at most when the guest fell behind real time.
-const MAX_CATCH_UP: u64 = 8;
+const MAX_CATCH_UP: u64 = 16;
 /// Interleaved stereo samples kept for the host (about 200 ms).
 const MAX_QUEUED_OUTPUT: usize = 2 * 9600;
 
@@ -45,6 +49,10 @@ const STATE_RUNNING: u32 = 1;
 
 /// `AX_DEV_TV`.
 const DEVICE_TV: u32 = 0;
+/// Bytes of one channel in `AXSetVoiceDeviceMix`'s array: four buses.
+const MIX_CHANNEL_SIZE: u32 = 0x10;
+/// Largest value of the 1.15 fixed-point volume.
+const MAX_VOLUME: f32 = 2.0;
 
 /// `AXFINALMIXCBPARAM` and the planar 32-bit samples it points to: titles that
 /// mix in software (every voice of theirs ends up here) overwrite the samples.
@@ -53,6 +61,11 @@ mod final_mix {
     pub const SAMPLES: u32 = 0x40;
     /// Bytes of one device's block: pointers and samples for the most channels.
     pub const SIZE: u32 = SAMPLES + 8 * super::SAMPLES_PER_FRAME * 4;
+    /// Blocks per device: frames made up for at once all get a block of their own.
+    pub const BLOCKS: u32 = 2 * PLAY_DELAY;
+    /// Frames between a block's callback being queued and the block being played:
+    /// callbacks run later, when the guest gets to them, but always in order.
+    pub const PLAY_DELAY: u32 = super::MAX_CATCH_UP as u32;
 
     /// `(channels, devices)` of the callback's view of `device`.
     pub const fn layout(device: u32) -> (u32, u32) {
@@ -66,8 +79,13 @@ struct AxVoice {
     voice: Voice,
     running: bool,
     volume: f32,
+    /// Change of `volume` per output sample.
+    volume_delta: f32,
     tv_left: f32,
     tv_right: f32,
+    /// Left and right gain at the end of the last frame: they ramp to new values
+    /// over a frame, as a jump would be heard as a click.
+    gains: [f32; 2],
     loop_count: u32,
 }
 
@@ -77,8 +95,11 @@ impl AxVoice {
             voice: Voice::new(SampleFormat::Pcm16, 0, 0),
             running: false,
             volume: 1.0,
-            tv_left: 1.0,
-            tv_right: 1.0,
+            volume_delta: 0.0,
+            // Silent until the title says where the voice goes.
+            tv_left: 0.0,
+            tv_right: 0.0,
+            gains: [0.0; 2],
             loop_count: 0,
         }
     }
@@ -95,10 +116,15 @@ pub struct AxState {
     frame_callback: u32,
     aux_callbacks: HashMap<u32, (u32, u32)>,
     final_mix_callbacks: HashMap<u32, u32>,
-    /// Guest block of each device with a final mix callback (see [`final_mix`]).
+    /// First guest block of each device with a final mix callback (see [`final_mix`]).
     final_mix_blocks: HashMap<u32, u32>,
+    /// AX frames mixed so far.
+    frames_mixed: u32,
     fx_hooks: (u32, u32),
-    last_tick: u64,
+    /// Timebase value when AX started.
+    first_tick: u64,
+    /// AX frames accounted for since then, whether they were made up for or not.
+    frames_due: u64,
     user_protection: u32,
     /// Interleaved stereo for the host.
     pub output: VecDeque<i16>,
@@ -112,6 +138,11 @@ impl SampleMemory for GuestSamples<'_> {
     }
 }
 
+/// AX frames in `ticks` of the timebase.
+const fn frames_after(ticks: u64) -> u64 {
+    ticks * 1000 / (FRAME_MILLISECONDS * FREQUENCY)
+}
+
 impl CafeOs {
     /// Runs every AX frame that became due: guest callbacks, then the mixer.
     pub fn sound_tick(&mut self, memory: &mut Memory) {
@@ -119,19 +150,22 @@ impl CafeOs {
             return;
         }
         let now = self.timebase.ticks_since_boot();
-        let due = now.saturating_sub(self.ax.last_tick) / TICKS_PER_FRAME;
+        let frames_due = frames_after(now.saturating_sub(self.ax.first_tick));
+        let due = frames_due - self.ax.frames_due;
         if due == 0 {
             return;
         }
-        self.ax.last_tick += due * TICKS_PER_FRAME;
+        self.ax.frames_due = frames_due;
         for _ in 0..due.min(MAX_CATCH_UP) {
-            if self.ax.frame_callback != 0 {
-                self.callbacks
-                    .push(GuestCall { function: self.ax.frame_callback, args: Vec::new() });
-            }
-            for index in 0..self.ax.app_frame_callbacks.len() {
-                let function = self.ax.app_frame_callbacks[index];
-                self.callbacks.push(GuestCall { function, args: Vec::new() });
+            if self.callbacks.pending() < MAX_PENDING_CALLBACKS {
+                if self.ax.frame_callback != 0 {
+                    self.callbacks
+                        .push(GuestCall { function: self.ax.frame_callback, args: Vec::new() });
+                }
+                for index in 0..self.ax.app_frame_callbacks.len() {
+                    let function = self.ax.app_frame_callbacks[index];
+                    self.callbacks.push(GuestCall { function, args: Vec::new() });
+                }
             }
             self.mix_frame(memory);
         }
@@ -147,11 +181,23 @@ impl CafeOs {
                 continue;
             }
             let before = voice.voice.current_offset;
+            voice.volume = voice
+                .volume_delta
+                .mul_add(SAMPLES_PER_FRAME as f32, voice.volume)
+                .clamp(0.0, MAX_VOLUME);
+            let target = [voice.volume * voice.tv_left, voice.volume * voice.tv_right];
+            let step = [
+                (target[0] - voice.gains[0]) / SAMPLES_PER_FRAME as f32,
+                (target[1] - voice.gains[1]) / SAMPLES_PER_FRAME as f32,
+            ];
+            let mut gains = voice.gains;
             for frame in mix.as_chunks_mut::<2>().0 {
                 let sample = voice.voice.render(&source);
-                frame[0] = f32::mul_add(sample * voice.volume, voice.tv_left, frame[0]);
-                frame[1] = f32::mul_add(sample * voice.volume, voice.tv_right, frame[1]);
+                gains = [gains[0] + step[0], gains[1] + step[1]];
+                frame[0] = f32::mul_add(sample, gains[0], frame[0]);
+                frame[1] = f32::mul_add(sample, gains[1], frame[1]);
             }
+            voice.gains = target;
             if voice.voice.looping && voice.voice.current_offset < before {
                 voice.loop_count += 1;
             }
@@ -166,6 +212,7 @@ impl CafeOs {
         let samples = mix.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect::<Vec<_>>();
         self.play_frame(memory, &samples);
         self.run_final_mix(memory, &samples);
+        self.ax.frames_mixed = self.ax.frames_mixed.wrapping_add(1);
         let output = &mut self.ax.output;
         let excess = output.len().saturating_sub(MAX_QUEUED_OUTPUT);
         output.drain(..excess);
@@ -173,12 +220,22 @@ impl CafeOs {
 }
 
 impl CafeOs {
-    /// Queues what the TV hears: with a final mix callback, its previous result.
+    /// The block of AX frame `frame`, of the blocks starting at `first`.
+    const fn final_mix_block(first: u32, frame: u32) -> u32 {
+        first + (frame % final_mix::BLOCKS) * final_mix::SIZE
+    }
+
+    /// Queues what the TV hears: with a final mix callback, what it made of an earlier frame.
     fn play_frame(&mut self, memory: &Memory, mixed: &[i16]) {
-        let Some(block) = self.ax.final_mix_blocks.get(&DEVICE_TV).copied() else {
+        let Some(first) = self.ax.final_mix_blocks.get(&DEVICE_TV).copied() else {
             self.ax.output.extend(mixed);
             return;
         };
+        let Some(frame) = self.ax.frames_mixed.checked_sub(final_mix::PLAY_DELAY) else {
+            self.ax.output.extend(std::iter::repeat_n(0, mixed.len()));
+            return;
+        };
+        let block = Self::final_mix_block(first, frame);
         let channel = |channel: u32, sample: u32| {
             let at = block + final_mix::SAMPLES + (channel * SAMPLES_PER_FRAME + sample) * 4;
             memory.read_u32(at).unwrap_or(0).cast_signed().clamp(-32768, 32767) as i16
@@ -193,7 +250,8 @@ impl CafeOs {
     fn run_final_mix(&mut self, memory: &mut Memory, mixed: &[i16]) {
         let callbacks: Vec<_> = self.ax.final_mix_callbacks.iter().map(|(d, f)| (*d, *f)).collect();
         for (device, function) in callbacks {
-            let Some(block) = self.ax.final_mix_blocks.get(&device).copied() else { continue };
+            let Some(first) = self.ax.final_mix_blocks.get(&device).copied() else { continue };
+            let block = Self::final_mix_block(first, self.ax.frames_mixed);
             let (channels, devices) = final_mix::layout(device);
             let total = channels * devices;
             let samples = block + final_mix::SAMPLES;
@@ -223,7 +281,7 @@ fn initialize(ctx: &mut HleContext<'_>) {
         return;
     }
     ctx.os.ax.initialized = true;
-    ctx.os.ax.last_tick = ctx.os.timebase.ticks_since_boot();
+    ctx.os.ax.first_tick = ctx.os.timebase.ticks_since_boot();
     let base = ctx.os.registry.allocate_data(MAX_VOICES * VPB_SIZE, 64);
     ctx.os.ax.voice_base = base;
     ctx.os.ax.free = (0..MAX_VOICES).rev().map(|i| base + i * VPB_SIZE).collect();
@@ -332,7 +390,7 @@ fn ax_register_device_final_mix_callback(
     }
     ctx.os.ax.final_mix_callbacks.insert(device, function);
     if !ctx.os.ax.final_mix_blocks.contains_key(&device) {
-        let block = ctx.os.registry.allocate_data(final_mix::SIZE, 64);
+        let block = ctx.os.registry.allocate_data(final_mix::BLOCKS * final_mix::SIZE, 64);
         ctx.os.ax.final_mix_blocks.insert(device, block);
     }
     0
@@ -588,8 +646,23 @@ fn ax_set_voice_adpcm(ctx: &mut HleContext<'_>, voice: u32, adpcm: u32) -> Resul
     Ok(())
 }
 
+/// `AXPBADPCMLOOP`: predictor/scale and the history at the loop start.
 #[hle_export(lib = "sndcore2", name = "AXSetVoiceAdpcmLoop")]
-fn ax_set_voice_adpcm_loop(_ctx: &mut HleContext<'_>, _voice: u32, _adpcm_loop: u32) {}
+fn ax_set_voice_adpcm_loop(
+    ctx: &mut HleContext<'_>,
+    voice: u32,
+    adpcm_loop: u32,
+) -> Result<(), HleError> {
+    let history = [
+        ctx.memory.read_u16(adpcm_loop + 2)?.cast_signed(),
+        ctx.memory.read_u16(adpcm_loop + 4)?.cast_signed(),
+    ];
+    if let Some(entry) = ctx.os.ax.voices.get_mut(&voice) {
+        entry.voice.adpcm_loop_state =
+            Some(wiiu_sound::adpcm::AdpcmState { hist1: history[0], hist2: history[1] });
+    }
+    Ok(())
+}
 
 /// `AXPBSRC`: 16.16 fixed-point ratio.
 #[hle_export(lib = "sndcore2", name = "AXSetVoiceSrc")]
@@ -612,17 +685,27 @@ fn ax_set_voice_src_ratio(ctx: &mut HleContext<'_>, voice: u32, ratio: f32) -> i
     0
 }
 
-/// `AXPBVE`: current volume in 1.15 fixed point.
+/// `AXPBVE`: current volume in 1.15 fixed point, and its change per sample.
 #[hle_export(lib = "sndcore2", name = "AXSetVoiceVe")]
 fn ax_set_voice_ve(ctx: &mut HleContext<'_>, voice: u32, ve: u32) -> Result<(), HleError> {
     let volume = f32::from(ctx.memory.read_u16(ve)?) / 32768.0;
+    let delta = f32::from(ctx.memory.read_u16(ve + 2)?.cast_signed()) / 32768.0;
     if let Some(entry) = ctx.os.ax.voices.get_mut(&voice) {
         entry.volume = volume;
+        entry.volume_delta = delta;
     }
     Ok(())
 }
 
-/// `AXCHMIX` array, `{volume, delta}` per channel: only the main bus of the TV is mixed.
+#[hle_export(lib = "sndcore2", name = "AXSetVoiceVeDelta")]
+fn ax_set_voice_ve_delta(ctx: &mut HleContext<'_>, voice: u32, delta: u32) {
+    if let Some(entry) = ctx.os.ax.voices.get_mut(&voice) {
+        entry.volume_delta = f32::from((delta as u16).cast_signed()) / 32768.0;
+    }
+}
+
+/// Four `{volume, delta}` buses per channel. Only the main bus of the TV is mixed,
+/// and of its channels the front left and right.
 #[hle_export(lib = "sndcore2", name = "AXSetVoiceDeviceMix")]
 fn ax_set_voice_device_mix(
     ctx: &mut HleContext<'_>,
@@ -635,7 +718,7 @@ fn ax_set_voice_device_mix(
         return Ok(0);
     }
     let left = f32::from(ctx.memory.read_u16(mix)?) / 32768.0;
-    let right = f32::from(ctx.memory.read_u16(mix + 4)?) / 32768.0;
+    let right = f32::from(ctx.memory.read_u16(mix + MIX_CHANNEL_SIZE)?) / 32768.0;
     if let Some(entry) = ctx.os.ax.voices.get_mut(&voice) {
         entry.tv_left = left;
         entry.tv_right = right;
@@ -747,6 +830,7 @@ pub const EXPORTS: &[HleExport] = &[
     AX_SET_VOICE_SRC,
     AX_SET_VOICE_SRC_RATIO,
     AX_SET_VOICE_VE,
+    AX_SET_VOICE_VE_DELTA,
     AX_SET_VOICE_DEVICE_MIX,
     AXFX_SET_HOOKS,
     AXFX_GET_HOOKS,
@@ -775,10 +859,89 @@ mod tests {
         env.memory.write_u32(offsets + 8, 1).unwrap(); // end
         env.memory.write_u32(offsets + 16, samples).unwrap();
         env.call("sndcore2", "AXSetVoiceOffsets", &[voice, offsets]);
+        let mix = SCRATCH + 0x200;
+        env.memory.write_u16(mix, 0x8000).unwrap();
+        env.call("sndcore2", "AXSetVoiceDeviceMix", &[voice, 0, 0, mix]);
         env.call("sndcore2", "AXSetVoiceState", &[voice, 1]);
         assert_eq!(env.call("sndcore2", "AXIsVoiceRunning", &[voice]), 1);
         env.os.mix_frame(&mut env.memory);
         assert_eq!(env.call("sndcore2", "AXIsVoiceRunning", &[voice]), 0);
         assert!(env.os.ax.output.iter().any(|s| *s != 0));
+    }
+
+    /// A PCM16 voice holding `value`, running with its mix at `mix`.
+    fn constant_voice(env: &mut TestEnv, value: u16, mix: u32) -> u32 {
+        let voice = env.call("sndcore2", "AXAcquireVoiceEx", &[1, 0, 0]);
+        let (offsets, samples) = (SCRATCH, SCRATCH + 0x1000);
+        for i in 0..0x400 {
+            env.memory.write_u16(samples + i * 2, value).unwrap();
+        }
+        env.memory.write_u16(offsets, 0xA).unwrap();
+        env.memory.write_u16(offsets + 2, 1).unwrap(); // looping
+        env.memory.write_u32(offsets + 8, 0x3FF).unwrap();
+        env.memory.write_u32(offsets + 16, samples).unwrap();
+        env.call("sndcore2", "AXSetVoiceOffsets", &[voice, offsets]);
+        env.call("sndcore2", "AXSetVoiceDeviceMix", &[voice, 0, 0, mix]);
+        env.call("sndcore2", "AXSetVoiceState", &[voice, 1]);
+        voice
+    }
+
+    #[test]
+    fn ax_makes_its_frames_in_real_time() {
+        // 333 frames of 144 samples: the 48 kHz the library promises.
+        assert_eq!(super::frames_after(wiiu_peripherals::timebase::FREQUENCY), 333);
+        assert_eq!(super::frames_after(wiiu_peripherals::timebase::FREQUENCY * 3), 1000);
+    }
+
+    #[test]
+    fn channels_of_the_device_mix_are_four_buses_apart() {
+        let mut env = TestEnv::new();
+        let mix = SCRATCH + 0x200;
+        // Left: main bus only. The second bus of the left channel must not reach the right.
+        env.memory.write_u16(mix, 0x8000).unwrap();
+        env.memory.write_u16(mix + 4, 0x8000).unwrap();
+        env.memory.write_u16(mix + super::MIX_CHANNEL_SIZE, 0).unwrap();
+        constant_voice(&mut env, 0x4000, mix);
+        for _ in 0..2 {
+            env.os.mix_frame(&mut env.memory);
+        }
+        let last: Vec<i16> = env.os.ax.output.iter().rev().take(2).copied().collect();
+        assert_eq!(last[0], 0, "right");
+        assert!(last[1] > 16000, "left {}", last[1]);
+    }
+
+    #[test]
+    fn a_new_voice_ramps_up_instead_of_clicking() {
+        let mut env = TestEnv::new();
+        let mix = SCRATCH + 0x200;
+        env.memory.write_u16(mix, 0x8000).unwrap();
+        env.memory.write_u16(mix + super::MIX_CHANNEL_SIZE, 0x8000).unwrap();
+        constant_voice(&mut env, 0x4000, mix);
+        env.os.mix_frame(&mut env.memory);
+        let left: Vec<i16> = env.os.ax.output.iter().step_by(2).copied().collect();
+        let largest = left.windows(2).map(|w| (w[1] - w[0]).abs()).max().unwrap();
+        assert!(largest < 1000, "jump of {largest}");
+    }
+
+    #[test]
+    fn final_mix_results_play_in_order_even_when_callbacks_lag() {
+        let mut env = TestEnv::new();
+        env.call("sndcore2", "AXInit", &[]);
+        env.call("sndcore2", "AXRegisterDeviceFinalMixCallback", &[0, 0x1000]);
+        let first = env.os.ax.final_mix_blocks[&0];
+        // Every frame's block gets a value of its own, as a late callback would write.
+        let delay = super::final_mix::PLAY_DELAY;
+        for frame in 0..delay + 4 {
+            env.os.mix_frame(&mut env.memory);
+            let block = crate::CafeOs::final_mix_block(first, frame);
+            let samples = block + super::final_mix::SAMPLES;
+            for sample in 0..super::SAMPLES_PER_FRAME {
+                env.memory.write_u32(samples + sample * 4, frame + 100).unwrap();
+            }
+        }
+        assert_eq!(env.os.ax.output[0], 0, "nothing to play before the delay has passed");
+        // The frame played last is the one `delay` frames before it, callback result included.
+        let left = env.os.ax.output.iter().rev().nth(1).unwrap();
+        assert_eq!(i32::from(*left), 100 + 3);
     }
 }

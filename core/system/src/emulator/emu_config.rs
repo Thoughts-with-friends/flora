@@ -18,6 +18,9 @@ pub struct Config {
     pub paced: bool,
     /// Directory holding the system fonts (CafeStd.ttf, ...), if not found automatically.
     pub fonts_dir: Option<PathBuf>,
+    /// Vertical blanks per flip, whatever the title asks for. A title whose logic
+    /// counts frames runs faster with less than it was made for.
+    pub swap_interval: Option<u32>,
 }
 
 impl Default for Config {
@@ -30,6 +33,7 @@ impl Default for Config {
             profile: std::env::var_os("FLORA_PROFILE").is_some(),
             paced: true,
             fonts_dir: None,
+            swap_interval: None,
         }
     }
 }

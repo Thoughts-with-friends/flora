@@ -20,15 +20,46 @@ struct Aperture {
     slice: u32,
 }
 
-/// The last level retiled. Titles reading a render target through an aperture
+/// Levels recently retiled. Titles reading a render target through an aperture
 /// every frame find it unchanged, as the host renders outside guest memory:
-/// comparing bytes is far cheaper than walking the tiles again.
+/// comparing bytes is far cheaper than walking the tiles again. Several are kept
+/// because titles go round their swap chain, a different surface every frame.
 #[derive(Debug, Default)]
 struct RetileCache {
+    /// Most recently used last.
+    levels: Vec<CachedLevel>,
+}
+
+#[derive(Debug)]
+struct CachedLevel {
     /// `(image, level, slice)`.
-    level: (u32, u32, u32),
+    key: (u32, u32, u32),
     tiled: Vec<u8>,
     linear: Vec<u8>,
+}
+
+/// Levels kept: more than the longest swap chain (three buffers, TV and GamePad).
+const CACHED_LEVELS: usize = 6;
+
+impl RetileCache {
+    fn position(&self, key: (u32, u32, u32)) -> Option<usize> {
+        self.levels.iter().position(|level| level.key == key)
+    }
+
+    fn remember(&mut self, level: CachedLevel) {
+        if let Some(index) = self.position(level.key) {
+            self.levels.remove(index);
+        } else if self.levels.len() >= CACHED_LEVELS {
+            self.levels.remove(0);
+        }
+        self.levels.push(level);
+    }
+
+    /// Moves the level to the most recently used place.
+    fn touch(&mut self, index: usize) {
+        let level = self.levels.remove(index);
+        self.levels.push(level);
+    }
 }
 
 /// Open apertures of the process.
@@ -117,7 +148,8 @@ fn retile(
     let key = (image, level, aperture.slice);
     if write_back {
         let linear = memory.slice(aperture.address, aperture.size)?;
-        if cache.level == key && cache.linear == linear {
+        let index = cache.position(key);
+        if index.is_some_and(|index| cache.levels[index].linear == linear) {
             return Ok(());
         }
         let linear = linear.to_vec();
@@ -136,13 +168,18 @@ fn retile(
             8 => store!(8),
             _ => store!(16),
         }
-        cache.level = (0, 0, 0);
+        if let Some(index) = index {
+            cache.levels.remove(index);
+        }
     } else {
         let tiled = memory.slice(image, tiled_size)?;
-        let known = cache.level == key
-            && cache.tiled == tiled
-            && cache.linear.len() == aperture.size as usize;
-        if !known {
+        let known = cache.position(key).filter(|index| {
+            let level = &cache.levels[*index];
+            level.tiled == tiled && level.linear.len() == aperture.size as usize
+        });
+        if let Some(index) = known {
+            cache.touch(index);
+        } else {
             let mut linear = vec![0; aperture.size as usize];
             macro_rules! load {
                 ($n:literal) => {
@@ -158,11 +195,11 @@ fn retile(
                 8 => load!(8),
                 _ => load!(16),
             }
-            cache.tiled = tiled.to_vec();
-            cache.linear = linear;
-            cache.level = key;
+            cache.remember(CachedLevel { key, tiled: tiled.to_vec(), linear });
         }
-        memory.write_bytes(aperture.address, &cache.linear)?;
+        if let Some(level) = cache.levels.last() {
+            memory.write_bytes(aperture.address, &level.linear)?;
+        }
     }
     Ok(())
 }
@@ -261,6 +298,38 @@ mod tests {
         assert_eq!(env.memory.read_u32(image).unwrap(), 0x5566_7788);
         let (_, linear) = open(&mut env);
         assert_eq!(env.memory.read_u32(linear).unwrap(), 0x5566_7788);
+    }
+
+    #[test]
+    fn surfaces_taking_turns_each_stay_correct() {
+        let mut env = TestEnv::new();
+        let (handle, address) = (SCRATCH + 0x100, SCRATCH + 0x104);
+        let surfaces =
+            [(SCRATCH, SCRATCH + 0x1_0000, 0x11), (SCRATCH + 0x200, SCRATCH + 0x2_0000, 0x22)];
+        for (at, image, value) in surfaces {
+            let mut surface = Gx2Surface {
+                dim: dim::D2,
+                width: 64,
+                height: 64,
+                depth: 1,
+                num_levels: 1,
+                format: 0x1A,
+                tile_mode: tile_mode::TM_1D_TILED_THIN1,
+                ..Gx2Surface::default()
+            };
+            surface.calc_size_and_alignment();
+            surface.image = image;
+            surface.write(&mut env.memory, at).unwrap();
+            env.memory.write_u32(image, value).unwrap();
+        }
+        for (at, _, value) in surfaces.iter().chain(&surfaces).chain(&surfaces) {
+            env.call("gx2", "GX2AllocateTilingApertureEx", &[*at, 0, 0, 0, handle, address]);
+            let linear = env.memory.read_u32(address).unwrap();
+            assert_eq!(env.memory.read_u32(linear).unwrap(), *value);
+            let id = env.memory.read_u32(handle).unwrap();
+            env.call("gx2", "GX2FreeTilingAperture", &[id]);
+        }
+        assert_eq!(env.os.gx2.apertures.cache.levels.len(), 2);
     }
 
     #[test]

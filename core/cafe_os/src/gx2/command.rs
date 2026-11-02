@@ -60,6 +60,13 @@ fn notify_event(os: &mut crate::CafeOs, kind: u32) {
     }
 }
 
+impl super::Gx2State {
+    /// Vertical blanks per flip.
+    pub(crate) fn effective_swap_interval(&self) -> u32 {
+        self.forced_swap_interval.unwrap_or(self.swap_interval)
+    }
+}
+
 impl crate::CafeOs {
     /// The display's vertical blank: wakes waiters and raises events. One pending
     /// flip is shown once the swap interval has passed: a title swapping faster
@@ -70,7 +77,7 @@ impl crate::CafeOs {
         self.gx2.last_vsync_time = now;
         notify_event(self, event::VSYNC);
         wake(self, VSYNC_QUEUE);
-        let interval = u64::from(self.gx2.swap_interval.max(1));
+        let interval = u64::from(self.gx2.effective_swap_interval().max(1));
         if self.gx2.flip_requests != self.gx2.flips_executed
             && self.gx2.vsync_count - self.gx2.last_flip_vsync >= interval
         {
@@ -162,7 +169,7 @@ fn gx2_set_swap_interval(ctx: &mut HleContext<'_>, interval: u32) {
 
 #[hle_export(lib = "gx2", name = "GX2GetSwapInterval")]
 fn gx2_get_swap_interval(ctx: &mut HleContext<'_>) -> u32 {
-    ctx.os.gx2.swap_interval
+    ctx.os.gx2.effective_swap_interval()
 }
 
 #[hle_export(lib = "gx2", name = "GX2SetEventCallback")]

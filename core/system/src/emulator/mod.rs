@@ -64,6 +64,9 @@ pub struct Emulator {
     stats: EmuStats,
     /// When the next vertical blank is due.
     next_vsync: Option<std::time::Instant>,
+    /// Where time slices ran out, when profiling: a guest spinning on something
+    /// shows up as one address taking many.
+    slice_ends: std::collections::HashMap<u32, u64>,
 }
 
 impl std::fmt::Debug for Emulator {
@@ -93,6 +96,7 @@ impl Emulator {
             status: Status::Idle,
             stats: EmuStats::default(),
             next_vsync: None,
+            slice_ends: std::collections::HashMap::new(),
         })
     }
 
@@ -160,6 +164,14 @@ impl Emulator {
     /// The most frequently called HLE functions (for profiling).
     pub fn hle_profile(&self, limit: usize) -> Vec<(String, u64)> {
         self.os.registry.hottest(limit)
+    }
+
+    /// Where time slices ran out most often, when profiling: `(address, slices)`.
+    pub fn slice_end_profile(&self, limit: usize) -> Vec<(u32, u64)> {
+        let mut ends: Vec<_> = self.slice_ends.iter().map(|(pc, n)| (*pc, *n)).collect();
+        ends.sort_by_key(|(_, slices)| std::cmp::Reverse(*slices));
+        ends.truncate(limit);
+        ends
     }
 
     /// The HLE functions that took longest, when profiling.

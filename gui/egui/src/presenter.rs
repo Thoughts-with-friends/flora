@@ -1,11 +1,14 @@
 //! Bridges the render thread's screen images to egui textures.
-use std::{collections::HashMap, sync::mpsc::SyncSender};
+use std::{collections::HashMap, path::Path, sync::mpsc::SyncSender};
 
 use eframe::{egui, egui_wgpu};
 use flora_render::{
     LatteRenderer, RenderCommand, RenderThread, Screen, ScreenImages, UpscaleConfig,
     UpscaleSetting, wgpu,
 };
+
+/// Where the driver's compiled shaders stay between runs.
+const PIPELINE_CACHE_DIR: &str = "shader_cache";
 
 /// A screen ready to draw: egui texture plus its pixel size.
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +39,8 @@ impl Presenter {
         };
         let info = state.adapter.get_info();
         log::info!("wgpu adapter: {} ({:?})", info.name, info.backend);
-        let renderer = LatteRenderer::new(state.device.clone(), state.queue.clone());
+        let mut renderer = LatteRenderer::new(state.device.clone(), state.queue.clone());
+        renderer.use_pipeline_cache(Path::new(PIPELINE_CACHE_DIR), &info);
         let upscale = renderer.upscale_setting();
         let render_thread = RenderThread::spawn(renderer).map_err(|e| e.to_string())?;
         Ok(Self {

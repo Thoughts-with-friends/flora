@@ -50,7 +50,8 @@ mod tests {
         b.volume_left = 4.0;
         let mut out = [0.0; 4];
         Mixer::default().mix(&mut [a, b], &Constant, &mut out);
-        assert_eq!(out[0], 1.0); // 0.5 + 2.0 clamped
-        assert!((out[1] - 0.5).abs() < 1e-6);
+        // The first frame is the voices' delay of one sample.
+        assert_eq!(out[2], 1.0); // 0.5 + 2.0 clamped
+        assert!((out[3] - 0.5).abs() < 1e-6);
     }
 }

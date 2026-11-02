@@ -74,5 +74,5 @@ GX2ClearColor / GX2CopyColorBufferToScanBuffer / GX2SwapScanBuffers
 | proc_ui                      | always-foreground stub                           |
 | GX2 / Latte                  | clears, scan-buffer copies, flips; no draws yet  |
 | Shaders, textures, tiling    | not yet                                          |
-| Audio (AX)                   | voice/mixer DSP only, not wired to sndcore2      |
-| JIT                          | not yet                                          |
+| Audio (AX)                   | voices, final mix callbacks; effects stay dry    |
+| JIT                          | Cranelift, linked blocks, translated in background |

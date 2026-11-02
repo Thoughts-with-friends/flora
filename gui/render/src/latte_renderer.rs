@@ -14,7 +14,11 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex, PoisonError},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use egui_wgpu::wgpu;
@@ -46,6 +50,7 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::RG11B10UFLOAT_RENDERABLE
             | wgpu::Features::DEPTH_CLIP_CONTROL
+            | wgpu::Features::PIPELINE_CACHE
             // Latte renders to formats WebGPU keeps read-only, such as RGBA8 SNORM.
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
 }
@@ -211,6 +216,178 @@ fn view_dimension(dim: TextureDim) -> wgpu::TextureViewDimension {
     }
 }
 
+/// Identifies a host pipeline: both shaders and the fixed-function state.
+type PipelineKey = (u64, u64, u64);
+
+fn pipeline_key(draw: &DrawCommand) -> PipelineKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    draw.state.hash(&mut hasher);
+    (draw.vertex.id, draw.pixel.id, hasher.finish())
+}
+
+/// The resources both shaders of a draw use, in binding order.
+fn sorted_bindings(draw: &DrawCommand) -> Vec<(u32, BindingKind)> {
+    let mut bindings: Vec<(u32, BindingKind)> =
+        draw.vertex.bindings.iter().chain(&draw.pixel.bindings).copied().collect();
+    bindings.sort_by_key(|(binding, _)| *binding);
+    bindings
+}
+
+/// What compiling a pipeline needs; shared by the threads doing it.
+struct PipelineContext<'a> {
+    device: &'a wgpu::Device,
+    modules: &'a Mutex<HashMap<u64, wgpu::ShaderModule>>,
+    cache: Option<&'a wgpu::PipelineCache>,
+}
+
+impl PipelineContext<'_> {
+    fn module(&self, shader: &ShaderModule) -> wgpu::ShaderModule {
+        let known =
+            self.modules.lock().unwrap_or_else(PoisonError::into_inner).get(&shader.id).cloned();
+        if let Some(module) = known {
+            return module;
+        }
+        // Parsed outside the lock: this is the slow part. Another thread doing the
+        // same module at the same time only wastes a little work.
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("flora shader"),
+            source: wgpu::ShaderSource::Wgsl(if std::env::var_os("FLORA_DEBUG_RED").is_some() {
+                shader
+                    .wgsl
+                    .replace(
+                        "return out;",
+                        "if (true) { out.c0 = vec4<f32>(1.0, 0.0, 0.0, 1.0); }\nreturn out;",
+                    )
+                    .into()
+            } else {
+                shader.wgsl.as_str().into()
+            }),
+        });
+        self.modules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shader.id, module.clone());
+        module
+    }
+
+    fn build(&self, draw: &DrawCommand, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+        let vs = self.module(&draw.vertex);
+        let fs = self.module(&draw.pixel);
+        let state = &draw.state;
+        let targets: Vec<Option<wgpu::ColorTargetState>> = (0..8)
+            .map(|i| {
+                state.color_formats[i].map(|format| {
+                    let wgpu_format = wgpu_format(format);
+                    let integer = matches!(format.kind(), TextureKind::Uint | TextureKind::Sint);
+                    let blend = state.blend[i];
+                    wgpu::ColorTargetState {
+                        format: wgpu_format,
+                        blend: (blend.enabled && !integer).then_some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: blend_factor(blend.color_src),
+                                dst_factor: blend_factor(blend.color_dst),
+                                operation: blend_operation(blend.color_op),
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: blend_factor(blend.alpha_src),
+                                dst_factor: blend_factor(blend.alpha_dst),
+                                operation: blend_operation(blend.alpha_op),
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(
+                            state.color_masks[i] & 0xF,
+                        )),
+                    }
+                })
+            })
+            .collect();
+        let last = targets.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        let depth_stencil = state.depth_format.map(|format| {
+            let face = |f: wiiu_gpu::render::StencilFace| wgpu::StencilFaceState {
+                compare: compare_function(f.compare),
+                fail_op: stencil_op(f.fail),
+                depth_fail_op: stencil_op(f.depth_fail),
+                pass_op: stencil_op(f.pass),
+            };
+            let has_stencil = format.has_stencil() && state.stencil_test;
+            wgpu::DepthStencilState {
+                format: wgpu_format(format),
+                depth_write_enabled: Some(state.depth_write),
+                depth_compare: Some(if state.depth_test {
+                    compare_function(state.depth_compare)
+                } else {
+                    wgpu::CompareFunction::Always
+                }),
+                stencil: if has_stencil {
+                    wgpu::StencilState {
+                        front: face(state.stencil_front),
+                        back: face(state.stencil_back),
+                        read_mask: u32::from(state.stencil_read_mask),
+                        write_mask: u32::from(state.stencil_write_mask),
+                    }
+                } else {
+                    wgpu::StencilState::default()
+                },
+                bias: wgpu::DepthBiasState {
+                    constant: f32::from_bits(state.depth_bias[1]) as i32,
+                    slope_scale: f32::from_bits(state.depth_bias[0]) / 16.0,
+                    clamp: f32::from_bits(state.depth_bias[2]),
+                },
+            }
+        });
+        let topology = match state.topology {
+            Topology::Points => wgpu::PrimitiveTopology::PointList,
+            Topology::Lines => wgpu::PrimitiveTopology::LineList,
+            Topology::LineStrip => wgpu::PrimitiveTopology::LineStrip,
+            Topology::Triangles | Topology::Rects => wgpu::PrimitiveTopology::TriangleList,
+            Topology::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
+        };
+        let strip = matches!(state.topology, Topology::LineStrip | Topology::TriangleStrip);
+        let cull_mode = match (state.cull_front, state.cull_back) {
+            (true, false) => Some(wgpu::Face::Front),
+            (false, true) => Some(wgpu::Face::Back),
+            _ => None,
+        };
+        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("flora pipeline"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some(if state.topology == Topology::Rects {
+                    wiiu_gpu::shader::RECT_ENTRY_POINT
+                } else {
+                    "main"
+                }),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
+                front_face: if state.front_face_cw {
+                    wgpu::FrontFace::Cw
+                } else {
+                    wgpu::FrontFace::Ccw
+                },
+                cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                targets: &targets[..last],
+            }),
+            multiview_mask: None,
+            cache: self.cache,
+        })
+    }
+}
+
 const BLIT_SHADER: &str = "
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
@@ -305,7 +482,10 @@ pub struct LatteRenderer {
     arena_group: wgpu::BindGroup,
     surfaces: HashMap<SurfaceKey, HostSurface>,
     next_surface_id: u64,
-    modules: HashMap<u64, wgpu::ShaderModule>,
+    /// Filled from several threads at once when pipelines are compiled.
+    modules: Mutex<HashMap<u64, wgpu::ShaderModule>>,
+    /// The driver's compiled shaders, kept between runs when the backend can.
+    pipeline_cache: Option<(wgpu::PipelineCache, PathBuf)>,
     pipelines: HashMap<(u64, u64, u64), Option<Arc<wgpu::RenderPipeline>>>,
     resource_layouts: HashMap<Vec<(u32, BindingKind)>, wgpu::BindGroupLayout>,
     pipeline_layouts: HashMap<Vec<(u32, BindingKind)>, wgpu::PipelineLayout>,
@@ -463,7 +643,8 @@ impl LatteRenderer {
             arena_group,
             surfaces: HashMap::new(),
             next_surface_id: 1,
-            modules: HashMap::new(),
+            modules: Mutex::new(HashMap::new()),
+            pipeline_cache: None,
             pipelines: HashMap::new(),
             resource_layouts: HashMap::new(),
             pipeline_layouts: HashMap::new(),
@@ -680,17 +861,75 @@ impl LatteRenderer {
         }));
     }
 
-    fn module(&mut self, shader: &ShaderModule) -> wgpu::ShaderModule {
-        let device = &self.device;
-        self.modules
-            .entry(shader.id)
-            .or_insert_with(|| {
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("flora shader"),
-                    source: wgpu::ShaderSource::Wgsl(if std::env::var_os("FLORA_DEBUG_RED").is_some() { shader.wgsl.replace("return out;", "if (true) { out.c0 = vec4<f32>(1.0, 0.0, 0.0, 1.0); }\nreturn out;").into() } else { shader.wgsl.as_str().into() }),
-                })
+    /// Keeps the driver's compiled shaders in `dir` from now on, for the next run too.
+    /// Without support in the backend this does nothing.
+    pub fn use_pipeline_cache(&mut self, dir: &Path, adapter: &wgpu::AdapterInfo) {
+        if !self.device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            return;
+        }
+        let Some(name) = wgpu::util::pipeline_cache_key(adapter) else { return };
+        let path = dir.join(name);
+        let data = std::fs::read(&path).ok();
+        // SAFETY: the file is named after this adapter and driver, as wgpu asks, and
+        // `fallback` makes a file that does not match mean an empty cache.
+        let cache = unsafe {
+            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("flora pipelines"),
+                data: data.as_deref(),
+                fallback: true,
             })
-            .clone()
+        };
+        self.pipeline_cache = Some((cache, path));
+    }
+
+    fn save_pipeline_cache(&self) {
+        let Some((cache, path)) = &self.pipeline_cache else { return };
+        let Some(data) = cache.get_data() else { return };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, data));
+        if let Err(error) = written {
+            log::warn!("{}: {error}", path.display());
+        }
+    }
+
+    /// Compiles the pipelines of `draws`, as many at a time as there are cores to spare.
+    fn compile_pipelines(&mut self, draws: &[&DrawCommand]) {
+        let mut jobs: HashMap<PipelineKey, (&DrawCommand, wgpu::PipelineLayout)> = HashMap::new();
+        for draw in draws {
+            let key = pipeline_key(draw);
+            if !self.pipelines.contains_key(&key) && !jobs.contains_key(&key) {
+                jobs.insert(key, (draw, self.pipeline_layout(&sorted_bindings(draw))));
+            }
+        }
+        let jobs: Vec<_> = jobs.into_iter().collect();
+        let next = AtomicUsize::new(0);
+        let context = PipelineContext {
+            device: &self.device,
+            modules: &self.modules,
+            cache: self.pipeline_cache.as_ref().map(|(cache, _)| cache),
+        };
+        let compile = || {
+            let mut done = Vec::new();
+            while let Some((key, (draw, layout))) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                done.push((*key, Arc::new(context.build(draw, layout))));
+            }
+            done
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
+        let threads = threads.min(jobs.len());
+        let compiled: Vec<_> = if threads <= 1 {
+            compile()
+        } else {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(&compile)).collect();
+                workers.into_iter().filter_map(|w| w.join().ok()).flatten().collect()
+            })
+        };
+        for (key, pipeline) in compiled {
+            self.pipelines.insert(key, Some(pipeline));
+        }
     }
 
     fn resource_layout(&mut self, bindings: &[(u32, BindingKind)]) -> wgpu::BindGroupLayout {
@@ -745,148 +984,28 @@ impl LatteRenderer {
             .clone()
     }
 
-    fn pipeline(
-        &mut self,
-        draw: &DrawCommand,
-        bindings: &[(u32, BindingKind)],
-    ) -> Option<Arc<wgpu::RenderPipeline>> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        draw.state.hash(&mut hasher);
-        let key = (draw.vertex.id, draw.pixel.id, hasher.finish());
-        if let Some(existing) = self.pipelines.get(&key) {
-            return existing.clone();
-        }
-        let vs = self.module(&draw.vertex);
-        let fs = self.module(&draw.pixel);
+    fn pipeline_layout(&mut self, bindings: &[(u32, BindingKind)]) -> wgpu::PipelineLayout {
         let resources = self.resource_layout(bindings);
-        let device = self.device.clone();
-        let arena_layout = self.arena_layout.clone();
-        let layout = self
-            .pipeline_layouts
+        let device = &self.device;
+        let arena_layout = &self.arena_layout;
+        self.pipeline_layouts
             .entry(bindings.to_vec())
             .or_insert_with(|| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("flora pipeline"),
-                    bind_group_layouts: &[Some(&arena_layout), Some(&resources)],
+                    bind_group_layouts: &[Some(arena_layout), Some(&resources)],
                     immediate_size: 0,
                 })
             })
-            .clone();
-        let state = &draw.state;
-        let targets: Vec<Option<wgpu::ColorTargetState>> = (0..8)
-            .map(|i| {
-                state.color_formats[i].map(|format| {
-                    let wgpu_format = wgpu_format(format);
-                    let integer = matches!(format.kind(), TextureKind::Uint | TextureKind::Sint);
-                    let blend = state.blend[i];
-                    wgpu::ColorTargetState {
-                        format: wgpu_format,
-                        blend: (blend.enabled && !integer).then_some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: blend_factor(blend.color_src),
-                                dst_factor: blend_factor(blend.color_dst),
-                                operation: blend_operation(blend.color_op),
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: blend_factor(blend.alpha_src),
-                                dst_factor: blend_factor(blend.alpha_dst),
-                                operation: blend_operation(blend.alpha_op),
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(
-                            state.color_masks[i] & 0xF,
-                        )),
-                    }
-                })
-            })
-            .collect();
-        let last = targets.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
-        let depth_stencil = state.depth_format.map(|format| {
-            let face = |f: wiiu_gpu::render::StencilFace| wgpu::StencilFaceState {
-                compare: compare_function(f.compare),
-                fail_op: stencil_op(f.fail),
-                depth_fail_op: stencil_op(f.depth_fail),
-                pass_op: stencil_op(f.pass),
-            };
-            let has_stencil = format.has_stencil() && state.stencil_test;
-            wgpu::DepthStencilState {
-                format: wgpu_format(format),
-                depth_write_enabled: Some(state.depth_write),
-                depth_compare: Some(if state.depth_test {
-                    compare_function(state.depth_compare)
-                } else {
-                    wgpu::CompareFunction::Always
-                }),
-                stencil: if has_stencil {
-                    wgpu::StencilState {
-                        front: face(state.stencil_front),
-                        back: face(state.stencil_back),
-                        read_mask: u32::from(state.stencil_read_mask),
-                        write_mask: u32::from(state.stencil_write_mask),
-                    }
-                } else {
-                    wgpu::StencilState::default()
-                },
-                bias: wgpu::DepthBiasState {
-                    constant: f32::from_bits(state.depth_bias[1]) as i32,
-                    slope_scale: f32::from_bits(state.depth_bias[0]) / 16.0,
-                    clamp: f32::from_bits(state.depth_bias[2]),
-                },
-            }
-        });
-        let topology = match state.topology {
-            Topology::Points => wgpu::PrimitiveTopology::PointList,
-            Topology::Lines => wgpu::PrimitiveTopology::LineList,
-            Topology::LineStrip => wgpu::PrimitiveTopology::LineStrip,
-            Topology::Triangles | Topology::Rects => wgpu::PrimitiveTopology::TriangleList,
-            Topology::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
-        };
-        let strip = matches!(state.topology, Topology::LineStrip | Topology::TriangleStrip);
-        let cull_mode = match (state.cull_front, state.cull_back) {
-            (true, false) => Some(wgpu::Face::Front),
-            (false, true) => Some(wgpu::Face::Back),
-            _ => None,
-        };
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("flora pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &vs,
-                entry_point: Some(if state.topology == Topology::Rects {
-                    wiiu_gpu::shader::RECT_ENTRY_POINT
-                } else {
-                    "main"
-                }),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology,
-                strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
-                front_face: if state.front_face_cw {
-                    wgpu::FrontFace::Cw
-                } else {
-                    wgpu::FrontFace::Ccw
-                },
-                cull_mode,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &fs,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &targets[..last],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let pipeline = Some(Arc::new(pipeline));
-        self.pipelines.insert(key, pipeline.clone());
-        pipeline
+            .clone()
+    }
+
+    fn pipeline(&mut self, draw: &DrawCommand) -> Option<Arc<wgpu::RenderPipeline>> {
+        let key = pipeline_key(draw);
+        if !self.pipelines.contains_key(&key) {
+            self.compile_pipelines(&[draw]);
+        }
+        self.pipelines.get(&key).cloned().flatten()
     }
 
     fn sampler(&mut self, desc: SamplerDesc) -> wgpu::Sampler {
@@ -1209,10 +1328,8 @@ impl LatteRenderer {
     }
 
     fn draw(&mut self, draw: &DrawCommand) {
-        let mut bindings: Vec<(u32, BindingKind)> =
-            draw.vertex.bindings.iter().chain(&draw.pixel.bindings).copied().collect();
-        bindings.sort_by_key(|(binding, _)| *binding);
-        let Some(pipeline) = self.pipeline(draw, &bindings) else { return };
+        let bindings = sorted_bindings(draw);
+        let Some(pipeline) = self.pipeline(draw) else { return };
         let group = self.resource_group(draw, &bindings);
         self.open_pass(draw);
         let extent = draw
@@ -1520,8 +1637,28 @@ fn clear_color(key: SurfaceKey, rgba: [f32; 4]) -> wgpu::Color {
     }
 }
 
+impl Drop for LatteRenderer {
+    fn drop(&mut self) {
+        self.save_pipeline_cache();
+    }
+}
+
 impl RenderBackend for LatteRenderer {
     fn execute(&mut self, commands: &[RenderCommand]) {
+        // New pipelines stall the host's draw thread: compiled together up front,
+        // their cost does not add up.
+        let new: Vec<&DrawCommand> = commands
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::Draw(draw) if !self.pipelines.contains_key(&pipeline_key(draw)) => {
+                    Some(draw.as_ref())
+                }
+                _ => None,
+            })
+            .collect();
+        if !new.is_empty() {
+            self.compile_pipelines(&new);
+        }
         for command in commands {
             match command {
                 RenderCommand::ClearScreen { screen, color } => self.clear_screen(*screen, *color),

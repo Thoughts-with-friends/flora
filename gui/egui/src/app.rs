@@ -51,6 +51,8 @@ impl FloraApp {
         let presenter = Presenter::new(cc)?;
         presenter.set_upscale(config.upscale);
         let ctx = cc.egui_ctx.clone();
+
+        crate::fonts::setup_custom_fonts(&ctx, None::<std::path::PathBuf>);
         let render = presenter.sender().ok_or("the render thread is not running")?;
         let console =
             Console::spawn(config.emulator_config(), render, move || ctx.request_repaint())?;
@@ -207,6 +209,8 @@ impl FloraApp {
                 ui.separator();
                 self.upscale_menu(ui);
                 ui.separator();
+                self.frame_rate_menu(ui);
+                ui.separator();
                 if ui.button("System fonts folder…").clicked() {
                     ui.close();
                     self.pick_fonts_dir();
@@ -231,6 +235,26 @@ impl FloraApp {
             self.log.push(format!("system fonts: {} (applies on the next boot)", dir.display()));
             self.console.send(ConsoleCommand::FontsDir(Some(dir.clone())));
             self.config.fonts_dir = Some(dir);
+            self.save_config();
+        }
+    }
+
+    fn frame_rate_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label("Frame rate (applies on the next boot)");
+        let mut chosen = self.config.swap_interval;
+        if ui.radio(chosen.is_none(), "As the title asks").clicked() {
+            chosen = None;
+        }
+        let forced = ui.radio(chosen == Some(1), "Force 60 fps").on_hover_text(
+            "A title made for 30 fps whose logic counts frames, such as Twilight Princess HD, \
+             then runs at up to double speed.",
+        );
+        if forced.clicked() {
+            chosen = Some(1);
+        }
+        if chosen != self.config.swap_interval {
+            self.config.swap_interval = chosen;
+            self.console.send(ConsoleCommand::SwapInterval(chosen));
             self.save_config();
         }
     }

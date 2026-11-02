@@ -96,6 +96,9 @@ impl Emulator {
                     if slice == 0 {
                         // Time slice used up: let threads of equal priority run.
                         slice = TIME_SLICE;
+                        if self.config.profile {
+                            *self.slice_ends.entry(self.cores[MAIN_CORE].pc).or_insert(0) += 1;
+                        }
                         if let Err(error) =
                             self.os.end_time_slice(&mut self.cores[MAIN_CORE], &mut self.memory)
                         {

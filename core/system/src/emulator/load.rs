@@ -64,6 +64,7 @@ impl Emulator {
         self.jit = wiiu_cpu::Jit::new();
         self.os = CafeOs::new();
         self.os.gamepad = gamepad;
+        self.os.gx2.forced_swap_interval = self.config.swap_interval;
         self.os.coreinit.shared_data.fonts_dir.clone_from(&self.config.fonts_dir);
         self.gpu = Gpu::new();
         self.iosu = iosu;

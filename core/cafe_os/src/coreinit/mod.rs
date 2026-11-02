@@ -5,6 +5,7 @@ pub mod core;
 pub mod dynload;
 pub mod exit;
 pub mod fs;
+pub mod hw_interface;
 pub mod lc;
 pub mod mem;
 pub mod memory;
@@ -56,6 +57,7 @@ pub struct CoreinitState {
     pub errno: u32,
     /// Stack pointer and return address under each thread's running fibers.
     pub fibers: std::collections::HashMap<u32, Vec<(u32, u32)>>,
+    pub serial_interface: hw_interface::SerialInterface,
 }
 
 pub const EXPORTS: &[HleExport] = &[
@@ -125,6 +127,9 @@ pub const EXPORTS: &[HleExport] = &[
     alarm::OS_SET_ALARM_TAG,
     alarm::OS_SET_ALARM_USER_DATA,
     alarm::OS_GET_ALARM_USER_DATA,
+    hw_interface::OS_READ_REGISTER_32_EX,
+    hw_interface::OS_WRITE_REGISTER_32_EX,
+    hw_interface::OS_READ_REGISTER_16,
     cache::DC_FLUSH_RANGE,
     cache::DC_FLUSH_RANGE_NO_SYNC,
     cache::DC_STORE_RANGE,

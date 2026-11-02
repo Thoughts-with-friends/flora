@@ -34,6 +34,8 @@ pub enum ConsoleCommand {
     GamePad(GamePadState),
     /// Where to find the system fonts from the next boot on.
     FontsDir(Option<PathBuf>),
+    /// Vertical blanks per flip from the next boot on, whatever the title asks for.
+    SwapInterval(Option<u32>),
 }
 
 /// State published by the emulation thread.
@@ -162,17 +164,19 @@ impl EmuThread {
             }
             ConsoleCommand::GamePad(state) => self.emulator.set_gamepad(state),
             ConsoleCommand::FontsDir(dir) => self.emulator.config.fonts_dir = dir,
+            ConsoleCommand::SwapInterval(interval) => self.emulator.config.swap_interval = interval,
         }
     }
 
     fn publish(&mut self, fps: f32) {
+        // Before the renderer, which may take a while: sound must not run out meanwhile.
+        self.audio.push(&self.emulator.take_audio());
         let commands = self.emulator.take_render_commands();
         // Waits while the renderer is behind: frames must not be dropped, they
         // carry uploads and draws later frames build on.
         if !commands.is_empty() && self.render.send(commands).is_err() {
             log::warn!("render thread stopped");
         }
-        self.audio.push(&self.emulator.take_audio());
         let lines = self.emulator.take_console();
         let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         shared.console_lines.extend(lines);

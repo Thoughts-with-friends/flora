@@ -34,10 +34,11 @@ fn vpad_read(
         return Ok(0);
     }
     let pad = ctx.os.gamepad;
-    let (trigger, release) = ctx.os.gamepad_edges.update(pad.held);
+    let held = pad.held_with_stick_directions();
+    let (trigger, release) = ctx.os.gamepad_edges.update(held);
     let base = buffers.address();
     ctx.memory.fill(base, VPAD_STATUS_SIZE, 0)?;
-    ctx.memory.write_u32(base + offset::HOLD, pad.held.bits())?;
+    ctx.memory.write_u32(base + offset::HOLD, held.bits())?;
     ctx.memory.write_u32(base + offset::TRIGGER, trigger.bits())?;
     ctx.memory.write_u32(base + offset::RELEASE, release.bits())?;
     for (at, stick) in

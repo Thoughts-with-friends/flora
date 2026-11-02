@@ -50,10 +50,12 @@ guest_value! {
 impl GuestValue for f32 {
     const SIZE: u32 = 4;
 
+    #[inline]
     fn read(memory: &Memory, address: u32) -> Result<Self, MemoryError> {
         memory.read_f32(address)
     }
 
+    #[inline]
     fn write(self, memory: &mut Memory, address: u32) -> Result<(), MemoryError> {
         memory.write_f32(address, self)
     }
@@ -62,10 +64,12 @@ impl GuestValue for f32 {
 impl GuestValue for f64 {
     const SIZE: u32 = 8;
 
+    #[inline]
     fn read(memory: &Memory, address: u32) -> Result<Self, MemoryError> {
         memory.read_f64(address)
     }
 
+    #[inline]
     fn write(self, memory: &mut Memory, address: u32) -> Result<(), MemoryError> {
         memory.write_f64(address, self)
     }

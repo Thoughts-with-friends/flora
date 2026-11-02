@@ -11,9 +11,13 @@
 //!   every `every` flips. Files stay outside the repository unless you say otherwise.
 //! * `FLORA_PRESS="frame,button,frames;..."`: scripted GamePad input.
 //! * `FLORA_UNPACED`: do not wait for real time between frames.
-//! * `FLORA_PROFILE`: flips per second and where the host time goes.
+//! * `FLORA_PROFILE`: flips per second and where the host time goes. `FLORA_PROFILE=flips`
+//!   leaves out the timers around every HLE call, which cost time themselves.
 //! * `FLORA_XBRZ=factor`: upscale the screens (with `FLORA_SHOTS`).
 //! * `FLORA_RENDER_THREAD`: render on a thread of its own, as the GUI does (no screenshots).
+//! * `FLORA_SWAP_INTERVAL=n`: vertical blanks per flip, whatever the title asks for.
+//! * `FLORA_BACKEND=auto|vulkan|dx12|gl`: host API; `auto` chooses like the GUI (default `vulkan`).
+//! * `FLORA_WAV=file`: saves what the TV plays. Stays outside the repository unless you say otherwise.
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -47,8 +51,14 @@ fn parse_presses(text: &str) -> Vec<Press> {
 }
 
 fn create_renderer() -> Result<LatteRenderer, Box<dyn std::error::Error>> {
+    let backends = match std::env::var("FLORA_BACKEND").as_deref() {
+        Ok("auto") => wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+        Ok("dx12") => wgpu::Backends::DX12,
+        Ok("gl") => wgpu::Backends::GL,
+        _ => wgpu::Backends::VULKAN,
+    };
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
+        backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -59,7 +69,9 @@ fn create_renderer() -> Result<LatteRenderer, Box<dyn std::error::Error>> {
     }))?;
     println!("adapter: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
     let (device, queue) = pollster::block_on(request_device(&adapter))?;
-    Ok(LatteRenderer::new(device, queue))
+    let mut renderer = LatteRenderer::new(device, queue);
+    renderer.use_pipeline_cache(Path::new("shader_cache"), &adapter.get_info());
+    Ok(renderer)
 }
 
 fn save_png(
@@ -77,6 +89,27 @@ fn save_png(
     Ok(())
 }
 
+/// Writes interleaved stereo samples as a 16-bit WAV file.
+fn save_wav(path: &Path, samples: &[i16]) -> Result<(), Box<dyn std::error::Error>> {
+    let data = u32::try_from(samples.len() * 2)?;
+    let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&192_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&4_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let mut args = std::env::args_os().skip(1);
@@ -86,6 +119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         jit: std::env::var_os("FLORA_INTERP").is_none(),
         paced: std::env::var_os("FLORA_UNPACED").is_none(),
+        swap_interval: std::env::var("FLORA_SWAP_INTERVAL").ok().and_then(|n| n.parse().ok()),
+        profile: std::env::var("FLORA_PROFILE").is_ok_and(|value| value != "flips"),
         ..Config::default()
     };
     let mut emu = Emulator::new(config)?;
@@ -108,9 +143,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = &shot_dir {
         std::fs::create_dir_all(dir)?;
     }
-    let render_thread = std::env::var_os("FLORA_RENDER_THREAD")
-        .map(|_| flora_render::RenderThread::spawn(create_renderer()?))
-        .transpose()?;
+    let (render_thread, upscale) = match std::env::var_os("FLORA_RENDER_THREAD") {
+        Some(_) => {
+            let renderer = create_renderer()?;
+            let upscale = renderer.upscale_setting();
+            if let Some(factor) = std::env::var("FLORA_XBRZ").ok().and_then(|f| f.parse().ok()) {
+                upscale.set(UpscaleConfig { method: UpscaleMethod::Xbrz, factor });
+            }
+            (Some(flora_render::RenderThread::spawn(renderer)?), Some(upscale))
+        }
+        None => (None, None),
+    };
     let render_sender = render_thread.as_ref().and_then(|thread| thread.sender());
     let presses = parse_presses(&std::env::var("FLORA_PRESS").unwrap_or_default());
 
@@ -122,6 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut run_time, mut render_time) = (Duration::ZERO, Duration::ZERO);
     let (mut second_start, mut second_flips) = (Instant::now(), 0_u64);
     let mut flip_rates = Vec::new();
+    // Host time between flips, with what the frame before each one was doing.
+    let mut flip_gaps: Vec<(Duration, u64, Duration, Duration)> = Vec::new();
+    let mut last_flip = Instant::now();
+    let mut upscaled_rates = Vec::new();
+    let mut upscaled_before = 0;
+    let wav = std::env::var_os("FLORA_WAV").map(PathBuf::from);
+    let mut sound = Vec::new();
     for frame in 0..frames {
         let held = presses
             .iter()
@@ -131,13 +181,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frame_start = Instant::now();
         emu.run_frame();
         run_time += frame_start.elapsed();
+        let run_elapsed = frame_start.elapsed();
+        if wav.is_some() {
+            sound.extend(emu.take_audio());
+        }
         let commands = emu.take_render_commands();
         let new_flips = commands.iter().filter(|c| matches!(c, RenderCommand::Flip)).count() as u64;
+        let mut send_elapsed = Duration::ZERO;
         let commands = match &render_sender {
             Some(sender) => {
                 let wait = Instant::now();
                 sender.send(commands)?;
-                render_time += wait.elapsed();
+                send_elapsed = wait.elapsed();
+                render_time += send_elapsed;
                 Vec::new()
             }
             None => commands,
@@ -360,8 +416,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         flips += new_flips;
         second_flips += new_flips;
+        if new_flips > 0 {
+            flip_gaps.push((last_flip.elapsed(), frame, run_elapsed, send_elapsed));
+            last_flip = Instant::now();
+        }
         if profile && second_start.elapsed() >= Duration::from_secs(1) {
             flip_rates.push(second_flips);
+            if let Some(upscale) = &upscale {
+                upscaled_rates.push(upscale.images_shown() - upscaled_before);
+                upscaled_before = upscale.images_shown();
+            }
             (second_start, second_flips) = (Instant::now(), 0);
         }
         for line in emu.take_console() {
@@ -384,6 +448,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if profile {
         println!("flips per second: {flip_rates:?}");
+        if upscale.is_some() {
+            println!("upscaled images per second: {upscaled_rates:?}");
+        }
+        // The first flips come while everything is loaded for the first time.
+        let settled = flip_gaps.len() / 4;
+        let mut gaps: Vec<_> = flip_gaps[settled..].to_vec();
+        gaps.sort_by_key(|gap| gap.0);
+        if let (Some(median), Some(p99), Some(worst)) =
+            (gaps.get(gaps.len() / 2), gaps.get(gaps.len() * 99 / 100), gaps.last())
+        {
+            println!(
+                "time between flips (last 3/4 of the run): median {:.2?}, 99% {:.2?}, worst {:.2?}",
+                median.0, p99.0, worst.0
+            );
+        }
+        for (gap, frame, run, send) in gaps.iter().rev().take(6) {
+            println!("  {gap:>10.2?} before frame {frame}: run_frame {run:.2?}, waiting for the renderer {send:.2?}");
+        }
         let stats = emu.stats();
         println!(
             "run_frame {run_time:.2?} (guest code {:.2?}, of it translating {} blocks {:.2?}; HLE {:.2?}) · render {render_time:.2?}",
@@ -394,6 +476,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         for (name, calls, nanos) in emu.hle_slowest(16) {
             println!("  {:>10.2?} {calls:>10}  {name}", Duration::from_nanos(nanos));
+        }
+        println!("time slices ran out at:");
+        for (address, slices) in emu.slice_end_profile(8) {
+            println!("  {slices:>8}  {}", emu.disassemble_around(address, 0, 1).join(""));
         }
     }
     for (name, calls) in emu.hle_profile(8) {
@@ -429,6 +515,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for line in emu.disassemble_around(at, 0, count) {
             println!("  {line}");
         }
+    }
+    if let Some(path) = &wav {
+        save_wav(path, &sound)?;
     }
     let stats = emu.stats();
     println!("threads:");
