@@ -16,6 +16,12 @@ egui-wgpu = "0.37"
 log = { workspace = true }
 serde = { workspace = true }
 wiiu_gpu = { workspace = true }
+xbrz-rs = { version = "0.1", optional = true }
+
+[features]
+default = ["xbrz"]
+# GPL-3.0-only: a binary built with this feature must be distributed under the GPL.
+xbrz = ["dep:xbrz-rs"]
 
 [lints]
 workspace = true

@@ -2,14 +2,14 @@
 //!
 //! ```text
 //!  UI thread ──ConsoleCommand──► emulation thread (Emulator::run_frame @ 60 Hz)
-//!      ▲                                   │
+//!      ▲                                   │ (run_frame keeps real time)
 //!      └──────── Shared (Mutex) ◄──────────┘ render commands, console, status
 //! ```
 use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -19,8 +19,8 @@ use wiiu_emu::{EmuStats, Emulator, GamePadState, RenderCommand, Status};
 
 use crate::audio::AudioOutput;
 
-/// Target frame time (59.94 Hz).
-const FRAME: Duration = Duration::from_micros(16_683);
+/// How often a stopped emulator looks for commands.
+const IDLE_POLL: Duration = Duration::from_millis(66);
 /// Rate of the samples the emulator produces.
 const AUDIO_RATE: u32 = 48_000;
 
@@ -32,6 +32,8 @@ pub enum ConsoleCommand {
     Resume,
     Stop,
     GamePad(GamePadState),
+    /// Where to find the system fonts from the next boot on.
+    FontsDir(Option<PathBuf>),
 }
 
 /// State published by the emulation thread.
@@ -42,7 +44,7 @@ pub struct Snapshot {
     pub paused: bool,
     pub title: Option<String>,
     pub stats: EmuStats,
-    /// Emulated frames per second.
+    /// Frames the guest flips to the screen per second.
     pub fps: f32,
     /// Error from the last `Load`.
     pub load_error: Option<String>,
@@ -159,6 +161,7 @@ impl EmuThread {
                 self.shared.lock().unwrap_or_else(PoisonError::into_inner).title = None;
             }
             ConsoleCommand::GamePad(state) => self.emulator.set_gamepad(state),
+            ConsoleCommand::FontsDir(dir) => self.emulator.config.fonts_dir = dir,
         }
     }
 
@@ -180,16 +183,18 @@ impl EmuThread {
     }
 
     fn run(mut self, repaint: &dyn Fn()) {
-        let mut next_frame = Instant::now();
-        let (mut fps_frames, mut fps_start, mut fps) = (0_u32, Instant::now(), 0.0_f32);
+        let (mut fps_flips, mut fps_start, mut fps) = (0_u64, Instant::now(), 0.0_f32);
         loop {
-            // Block while idle; otherwise wait at most until the next frame.
-            let timeout = if self.running() {
-                next_frame.saturating_duration_since(Instant::now())
+            // `run_frame` paces a running guest; otherwise wait for something to do.
+            let command = if self.running() {
+                self.rx.try_recv().map_err(|error| match error {
+                    TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                })
             } else {
-                FRAME * 4
+                self.rx.recv_timeout(IDLE_POLL)
             };
-            match self.rx.recv_timeout(timeout) {
+            match command {
                 Ok(command) => {
                     self.handle(command);
                     while let Ok(command) = self.rx.try_recv() {
@@ -200,18 +205,17 @@ impl EmuThread {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
 
-            if self.running() && Instant::now() >= next_frame {
+            if self.running() {
                 self.emulator.run_frame();
-                next_frame = (next_frame + FRAME).max(Instant::now());
-                fps_frames += 1;
             }
             let elapsed = fps_start.elapsed();
             if elapsed >= Duration::from_secs(1) {
+                let flips = self.emulator.stats().gpu.flips;
                 #[allow(clippy::cast_precision_loss)]
                 {
-                    fps = fps_frames as f32 / elapsed.as_secs_f32();
+                    fps = flips.saturating_sub(fps_flips) as f32 / elapsed.as_secs_f32();
                 }
-                (fps_frames, fps_start) = (0, Instant::now());
+                (fps_flips, fps_start) = (flips, Instant::now());
             }
             self.publish(fps);
             repaint();

@@ -169,9 +169,14 @@ impl CommandProcessor {
                 }
                 if let [address_lo, _address_hi, size, ..] = body {
                     let start = translate(*address_lo & !3)?;
-                    let words = (0..*size)
-                        .map(|i| ctx.memory.read_u32(start + 4 * i))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let words: Vec<u32> = ctx
+                        .memory
+                        .slice(start, size.saturating_mul(4))?
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| u32::from_be_bytes(*b))
+                        .collect();
                     self.execute_nested(&words, ctx, depth + 1)?;
                 }
             }

@@ -54,8 +54,13 @@ pub struct Gx2State {
     pub flip_requests: u32,
     pub flips_executed: u32,
     pub swap_interval: u32,
-    pub last_swap_time: u64,
+    /// Timebase value of the last flip shown.
+    pub last_flip_time: u64,
+    /// Timebase value of the last vertical blank.
+    pub last_vsync_time: u64,
     pub vsync_count: u64,
+    /// sync_count at the last flip shown.
+    pub last_flip_vsync: u64,
     /// Number of command buffers submitted so far.
     pub timestamp: u64,
     /// `(function, user data)` per `GX2CallbackEventType`.
@@ -77,8 +82,10 @@ impl Default for Gx2State {
             flip_requests: 0,
             flips_executed: 0,
             swap_interval: 1,
-            last_swap_time: 0,
+            last_flip_time: 0,
+            last_vsync_time: 0,
             vsync_count: 0,
+            last_flip_vsync: 0,
             timestamp: 0,
             event_callbacks: [(0, 0); command::event::COUNT],
             apertures: aperture::Apertures::default(),

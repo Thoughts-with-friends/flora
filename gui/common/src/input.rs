@@ -1,7 +1,8 @@
-//! Keyboard → GamePad mapping. Keys are identified by name (`"X"`,
+//! Keyboard and controller → GamePad mapping. Keys are identified by name (`"X"`,
 //! `"ArrowUp"`, ...) so this crate stays independent of the GUI toolkit.
 use std::collections::BTreeMap;
 
+use gilrs::{Axis, Button, EventType, Gilrs};
 use wiiu_peripherals::{GamePadState, VpadButtons, controller::Stick};
 
 /// Directions of the left stick.
@@ -40,7 +41,7 @@ impl Default for KeyBindings {
 }
 
 /// Button action names and their VPAD bits.
-const BUTTONS: [(&str, VpadButtons); 15] = [
+const BUTTONS: [(&str, VpadButtons); 17] = [
     ("a", VpadButtons::A),
     ("b", VpadButtons::B),
     ("x", VpadButtons::X),
@@ -56,6 +57,8 @@ const BUTTONS: [(&str, VpadButtons); 15] = [
     ("down", VpadButtons::DOWN),
     ("left", VpadButtons::LEFT),
     ("right", VpadButtons::RIGHT),
+    ("stick_l", VpadButtons::STICK_L),
+    ("stick_r", VpadButtons::STICK_R),
 ];
 
 impl KeyBindings {
@@ -76,6 +79,171 @@ impl KeyBindings {
     }
 }
 
+/// Stick movement below this is noise of a worn stick.
+const DEAD_ZONE: f32 = 0.15;
+
+/// Action name → controller button name (`gilrs::Button` variants).
+///
+/// The defaults go by position: `East` is the Wii U's A wherever a pad prints its
+/// labels, as on Nintendo's own controllers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct PadBindings(pub BTreeMap<String, String>);
+
+impl Default for PadBindings {
+    fn default() -> Self {
+        let pairs = [
+            ("a", "East"),
+            ("b", "South"),
+            ("x", "North"),
+            ("y", "West"),
+            ("l", "LeftTrigger"),
+            ("r", "RightTrigger"),
+            ("zl", "LeftTrigger2"),
+            ("zr", "RightTrigger2"),
+            ("plus", "Start"),
+            ("minus", "Select"),
+            ("home", "Mode"),
+            ("up", "DPadUp"),
+            ("down", "DPadDown"),
+            ("left", "DPadLeft"),
+            ("right", "DPadRight"),
+            ("stick_l", "LeftThumb"),
+            ("stick_r", "RightThumb"),
+        ];
+        Self(pairs.into_iter().map(|(a, b)| (a.to_owned(), b.to_owned())).collect())
+    }
+}
+
+fn button_from_name(name: &str) -> Option<Button> {
+    Some(match name {
+        "South" => Button::South,
+        "East" => Button::East,
+        "North" => Button::North,
+        "West" => Button::West,
+        "C" => Button::C,
+        "Z" => Button::Z,
+        "LeftTrigger" => Button::LeftTrigger,
+        "LeftTrigger2" => Button::LeftTrigger2,
+        "RightTrigger" => Button::RightTrigger,
+        "RightTrigger2" => Button::RightTrigger2,
+        "Select" => Button::Select,
+        "Start" => Button::Start,
+        "Mode" => Button::Mode,
+        "LeftThumb" => Button::LeftThumb,
+        "RightThumb" => Button::RightThumb,
+        "DPadUp" => Button::DPadUp,
+        "DPadDown" => Button::DPadDown,
+        "DPadLeft" => Button::DPadLeft,
+        "DPadRight" => Button::DPadRight,
+        _ => return None,
+    })
+}
+
+/// A stick position with the dead zone removed and the rest rescaled to full range.
+fn apply_dead_zone(x: f32, y: f32) -> Stick {
+    let length = x.hypot(y);
+    if length <= DEAD_ZONE {
+        return Stick::default();
+    }
+    let scale = ((length - DEAD_ZONE) / (1.0 - DEAD_ZONE)).min(1.0) / length;
+    Stick { x: x * scale, y: y * scale }
+}
+
+impl PadBindings {
+    /// Builds a GamePad sample from a controller's state.
+    pub fn gamepad(
+        &self,
+        is_pressed: impl Fn(Button) -> bool,
+        axis: impl Fn(Axis) -> f32,
+    ) -> GamePadState {
+        let down = |action: &str| {
+            self.0.get(action).and_then(|name| button_from_name(name)).is_some_and(&is_pressed)
+        };
+        let held = BUTTONS
+            .iter()
+            .filter(|(action, _)| down(action))
+            .fold(VpadButtons::empty(), |acc, (_, b)| acc | *b);
+        GamePadState {
+            held,
+            left_stick: apply_dead_zone(axis(Axis::LeftStickX), axis(Axis::LeftStickY)),
+            right_stick: apply_dead_zone(axis(Axis::RightStickX), axis(Axis::RightStickY)),
+            touch: None,
+        }
+    }
+}
+
+/// The stick pushed further of two sources.
+fn stronger(a: Stick, b: Stick) -> Stick {
+    if b.x.hypot(b.y) > a.x.hypot(a.y) { b } else { a }
+}
+
+/// Several input devices driving one GamePad: buttons add up, the stronger stick wins.
+pub fn merge(a: GamePadState, b: GamePadState) -> GamePadState {
+    GamePadState {
+        held: a.held | b.held,
+        left_stick: stronger(a.left_stick, b.left_stick),
+        right_stick: stronger(a.right_stick, b.right_stick),
+        touch: a.touch.or(b.touch),
+    }
+}
+
+/// Physical controllers, read through gilrs.
+pub struct Controllers {
+    /// `None` when the platform's gamepad backend is unavailable.
+    gilrs: Option<Gilrs>,
+}
+
+impl std::fmt::Debug for Controllers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Controllers").field("available", &self.gilrs.is_some()).finish()
+    }
+}
+
+impl Controllers {
+    pub fn new() -> Self {
+        let gilrs = match Gilrs::new() {
+            Ok(gilrs) => Some(gilrs),
+            Err(error) => {
+                log::warn!("controllers are unavailable: {error}");
+                None
+            }
+        };
+        Self { gilrs }
+    }
+
+    /// Takes in new input. Returns a line per controller that came or went.
+    pub fn poll(&mut self) -> Vec<String> {
+        let Some(gilrs) = &mut self.gilrs else { return Vec::new() };
+        let mut changes = Vec::new();
+        while let Some(event) = gilrs.next_event() {
+            let name = gilrs.gamepad(event.id).name().to_owned();
+            match event.event {
+                EventType::Connected => changes.push(format!("controller connected: {name}")),
+                EventType::Disconnected => {
+                    changes.push(format!("controller disconnected: {name}"));
+                }
+                _ => {}
+            }
+        }
+        changes
+    }
+
+    /// The combined state of every connected controller.
+    pub fn gamepad(&self, bindings: &PadBindings) -> GamePadState {
+        let Some(gilrs) = &self.gilrs else { return GamePadState::default() };
+        gilrs.gamepads().fold(GamePadState::default(), |state, (_, pad)| {
+            merge(state, bindings.gamepad(|button| pad.is_pressed(button), |axis| pad.value(axis)))
+        })
+    }
+}
+
+impl Default for Controllers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +254,43 @@ mod tests {
         let pad = bindings.gamepad(|key| matches!(key, "X" | "ArrowUp" | "L"));
         assert_eq!(pad.held, VpadButtons::A | VpadButtons::UP);
         assert_eq!((pad.left_stick.x, pad.left_stick.y), (1.0, 0.0));
+    }
+
+    #[test]
+    fn maps_controller_buttons_by_position() {
+        let pad = PadBindings::default().gamepad(
+            |button| matches!(button, Button::East | Button::DPadUp | Button::LeftTrigger2),
+            |_| 0.0,
+        );
+        assert_eq!(pad.held, VpadButtons::A | VpadButtons::UP | VpadButtons::ZL);
+    }
+
+    #[test]
+    fn sticks_have_a_dead_zone_and_reach_full_range() {
+        let pad = |x, y| {
+            PadBindings::default().gamepad(
+                |_| false,
+                move |axis| match axis {
+                    Axis::LeftStickX => x,
+                    Axis::LeftStickY => y,
+                    _ => 0.0,
+                },
+            )
+        };
+        assert_eq!(pad(0.1, -0.1).left_stick, Stick::default());
+        assert_eq!(pad(0.0, 1.0).left_stick, Stick { x: 0.0, y: 1.0 });
+        assert!(pad(1.0, 0.0).left_stick.x <= 1.0);
+    }
+
+    #[test]
+    fn keyboard_and_controller_add_up() {
+        let keyboard = KeyBindings::default().gamepad(|key| key == "X");
+        let controller = PadBindings::default().gamepad(
+            |button| button == Button::South,
+            |axis| if axis == Axis::RightStickX { 1.0 } else { 0.0 },
+        );
+        let both = merge(keyboard, controller);
+        assert_eq!(both.held, VpadButtons::A | VpadButtons::B);
+        assert_eq!(both.right_stick.x, 1.0);
     }
 }

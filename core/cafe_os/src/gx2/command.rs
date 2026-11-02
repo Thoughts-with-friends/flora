@@ -61,13 +61,22 @@ fn notify_event(os: &mut crate::CafeOs, kind: u32) {
 }
 
 impl crate::CafeOs {
-    /// The display's vertical blank: wakes waiters, retires flips and raises events.
+    /// The display's vertical blank: wakes waiters and raises events. One pending
+    /// flip is shown once the swap interval has passed: a title swapping faster
+    /// fills the queue and blocks in `GX2SwapScanBuffers`, which is what paces it.
     pub fn vsync(&mut self) {
+        let now = self.timebase.ticks_since_epoch();
         self.gx2.vsync_count += 1;
+        self.gx2.last_vsync_time = now;
         notify_event(self, event::VSYNC);
         wake(self, VSYNC_QUEUE);
-        if self.gx2.flip_requests != self.gx2.flips_executed {
-            self.gx2.flips_executed = self.gx2.flip_requests;
+        let interval = u64::from(self.gx2.swap_interval.max(1));
+        if self.gx2.flip_requests != self.gx2.flips_executed
+            && self.gx2.vsync_count - self.gx2.last_flip_vsync >= interval
+        {
+            self.gx2.flips_executed = self.gx2.flips_executed.wrapping_add(1);
+            self.gx2.last_flip_vsync = self.gx2.vsync_count;
+            self.gx2.last_flip_time = now;
             notify_event(self, event::FLIP);
             wake(self, FLIP_QUEUE);
         }
@@ -120,7 +129,6 @@ fn gx2_swap_scan_buffers(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
         }
     } else {
         ctx.os.gx2.flip_requests += 1;
-        ctx.os.gx2.last_swap_time = ctx.os.timebase.ticks_since_epoch();
         ctx.os.gx2.emit(opcode::HLE_SWAP_SCAN_BUFFERS, &[]);
         flush(ctx)?;
     }
@@ -140,9 +148,8 @@ fn gx2_get_swap_status(
 ) -> Result<(), HleError> {
     ctx.memory.write_u32(requests, ctx.os.gx2.flip_requests)?;
     ctx.memory.write_u32(executed, ctx.os.gx2.flips_executed)?;
-    let time = ctx.os.gx2.last_swap_time;
-    ctx.memory.write_u64(last_flip, time)?;
-    ctx.memory.write_u64(last_vsync, time)?;
+    ctx.memory.write_u64(last_flip, ctx.os.gx2.last_flip_time)?;
+    ctx.memory.write_u64(last_vsync, ctx.os.gx2.last_vsync_time)?;
     Ok(())
 }
 
@@ -428,5 +435,21 @@ mod tests {
         env.os.vsync();
         env.call("gx2", "GX2GetSwapStatus", &[requests, executed, SCRATCH + 8, SCRATCH + 16]);
         assert_eq!(env.memory.read_u32(executed).unwrap(), 1);
+    }
+
+    #[test]
+    fn one_flip_per_swap_interval() {
+        let mut env = TestEnv::new();
+        env.call("gx2", "GX2SetSwapInterval", &[2]);
+        for _ in 0..3 {
+            env.call("gx2", "GX2SwapScanBuffers", &[]);
+        }
+        let executed: Vec<u32> = (0..6)
+            .map(|_| {
+                env.os.vsync();
+                env.os.gx2.flips_executed
+            })
+            .collect();
+        assert_eq!(executed, [0, 1, 1, 2, 2, 3]);
     }
 }

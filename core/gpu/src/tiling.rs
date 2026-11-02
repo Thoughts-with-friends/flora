@@ -146,6 +146,36 @@ impl Layout {
     }
 }
 
+impl Layout {
+    /// Calls `visit(x, y, byte offset)` for every pixel, one micro tile at a time.
+    ///
+    /// Only the tile's first pixel needs the full address calculation: within a
+    /// tile the offsets depend on the low coordinate bits alone.
+    pub fn for_each_pixel(
+        &self,
+        width: u32,
+        height: u32,
+        slice: u32,
+        mut visit: impl FnMut(u32, u32, u32),
+    ) {
+        let origin = self.address(0, 0, slice);
+        let pattern: [u32; 64] = std::array::from_fn(|i| {
+            self.address(i as u32 % 8, i as u32 / 8, slice).wrapping_sub(origin)
+        });
+        for tile_y in (0..height).step_by(8) {
+            for tile_x in (0..width).step_by(8) {
+                let base = self.address(tile_x, tile_y, slice);
+                for y in 0..(height - tile_y).min(8) {
+                    for x in 0..(width - tile_x).min(8) {
+                        let offset = base.wrapping_add(pattern[(y * 8 + x) as usize]);
+                        visit(tile_x + x, tile_y + y, offset);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Splits the low address bits Latte uses as pipe/bank swizzle.
 pub const fn swizzle_from_address(address: u32) -> (u32, u32) {
     ((address >> 8) & 1, (address >> 9) & 3)
@@ -176,17 +206,13 @@ pub fn detile(
         }
         return;
     }
-    for y in 0..height {
-        for x in 0..width {
-            let offset = layout.address(x, y, slice) as usize;
-            let out_offset = (y as usize * width as usize + x as usize) * bytes;
-            if let Some(pixel) = source.get(offset..offset + bytes) {
-                target[out_offset..out_offset + bytes].copy_from_slice(pixel);
-            }
+    layout.for_each_pixel(width, height, slice, |x, y, offset| {
+        let out_offset = (y as usize * width as usize + x as usize) * bytes;
+        if let Some(pixel) = source.get(offset as usize..offset as usize + bytes) {
+            target[out_offset..out_offset + bytes].copy_from_slice(pixel);
         }
-    }
+    });
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +250,48 @@ mod tests {
         assert_eq!(layout.address(4, 0, 0), 8 * 4);
         // Second tile of the row.
         assert_eq!(layout.address(8, 0, 0), 64 * 4);
+    }
+
+    #[test]
+    fn tile_walk_matches_the_address_of_every_pixel() {
+        let modes = [
+            TM_1D_TILED_THIN1,
+            TM_1D_TILED_THICK,
+            TM_2D_TILED_THIN1,
+            TM_2D_TILED_THIN2,
+            TM_2D_TILED_THIN4,
+            TM_2B_TILED_THIN1,
+            TM_2B_TILED_THIN2,
+            TM_2D_TILED_THICK,
+            TM_3D_TILED_THIN1,
+            TM_3B_TILED_THICK,
+        ];
+        for tile_mode in modes {
+            for bpp in [8, 16, 32, 64, 128] {
+                for (pipe_swizzle, bank_swizzle, slice) in [(0, 0, 0), (1, 2, 0), (1, 3, 5)] {
+                    let layout = Layout {
+                        tile_mode,
+                        bpp,
+                        pitch: 256,
+                        height: 128,
+                        samples: 1,
+                        is_depth: false,
+                        pipe_swizzle,
+                        bank_swizzle,
+                    };
+                    let mut visited = 0;
+                    layout.for_each_pixel(250, 120, slice, |x, y, offset| {
+                        assert_eq!(
+                            offset,
+                            layout.address(x, y, slice),
+                            "mode {tile_mode} bpp {bpp} ({x},{y}) slice {slice}"
+                        );
+                        visited += 1;
+                    });
+                    assert_eq!(visited, 250 * 120);
+                }
+            }
+        }
     }
 
     #[test]

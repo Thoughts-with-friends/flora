@@ -11,12 +11,18 @@
 //!   every `every` flips. Files stay outside the repository unless you say otherwise.
 //! * `FLORA_PRESS="frame,button,frames;..."`: scripted GamePad input.
 //! * `FLORA_UNPACED`: do not wait for real time between frames.
+//! * `FLORA_PROFILE`: flips per second and where the host time goes.
+//! * `FLORA_XBRZ=factor`: upscale the screens (with `FLORA_SHOTS`).
+//! * `FLORA_RENDER_THREAD`: render on a thread of its own, as the GUI does (no screenshots).
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use flora_render::{LatteRenderer, RenderBackend, RenderCommand, Screen, request_device, wgpu};
+use flora_render::{
+    LatteRenderer, RenderBackend, RenderCommand, Screen, UpscaleConfig, UpscaleMethod,
+    request_device, wgpu,
+};
 use wiiu_emu::{Config, Emulator, GamePadState, Status};
 
 /// One scripted button press.
@@ -77,8 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = PathBuf::from(args.next().ok_or("usage: headless <TITLE_DIR | FILE.rpx> [FRAMES]")?);
     let frames: u64 = args.next().and_then(|f| f.to_str()?.parse().ok()).unwrap_or(60);
 
-    let config = Config { jit: std::env::var_os("FLORA_INTERP").is_none(), ..Config::default() };
-    let frame_time = config.frame_time;
+    let config = Config {
+        jit: std::env::var_os("FLORA_INTERP").is_none(),
+        paced: std::env::var_os("FLORA_UNPACED").is_none(),
+        ..Config::default()
+    };
     let mut emu = Emulator::new(config)?;
     emu.load_title(&path)?;
     if let Some(title) = emu.title() {
@@ -92,16 +101,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.split_once(','))
         .map_or((None, 60), |(dir, every)| (Some(PathBuf::from(dir)), every.parse().unwrap_or(60)));
     let mut renderer = shot_dir.as_ref().map(|_| create_renderer()).transpose()?;
+    if let (Some(renderer), Some(factor)) = (&renderer, std::env::var("FLORA_XBRZ").ok()) {
+        let factor = factor.parse().unwrap_or(2);
+        renderer.upscale_setting().set(UpscaleConfig { method: UpscaleMethod::Xbrz, factor });
+    }
     if let Some(dir) = &shot_dir {
         std::fs::create_dir_all(dir)?;
     }
+    let render_thread = std::env::var_os("FLORA_RENDER_THREAD")
+        .map(|_| flora_render::RenderThread::spawn(create_renderer()?))
+        .transpose()?;
+    let render_sender = render_thread.as_ref().and_then(|thread| thread.sender());
     let presses = parse_presses(&std::env::var("FLORA_PRESS").unwrap_or_default());
-    let unpaced = std::env::var_os("FLORA_UNPACED").is_some();
 
     let start = Instant::now();
     let mut flips = 0_u64;
     let mut last_report = Instant::now();
     let mut arena = std::collections::HashMap::new();
+    let profile = std::env::var_os("FLORA_PROFILE").is_some();
+    let (mut run_time, mut render_time) = (Duration::ZERO, Duration::ZERO);
+    let (mut second_start, mut second_flips) = (Instant::now(), 0_u64);
+    let mut flip_rates = Vec::new();
     for frame in 0..frames {
         let held = presses
             .iter()
@@ -110,8 +130,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         emu.set_gamepad(GamePadState::from_button_bits(held));
         let frame_start = Instant::now();
         emu.run_frame();
+        run_time += frame_start.elapsed();
         let commands = emu.take_render_commands();
         let new_flips = commands.iter().filter(|c| matches!(c, RenderCommand::Flip)).count() as u64;
+        let commands = match &render_sender {
+            Some(sender) => {
+                let wait = Instant::now();
+                sender.send(commands)?;
+                render_time += wait.elapsed();
+                Vec::new()
+            }
+            None => commands,
+        };
         if std::env::var_os("FLORA_TRACE_DRAWS").is_some() {
             for command in &commands {
                 if let RenderCommand::ArenaWrite { offset, bytes } = command {
@@ -287,8 +317,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if let Some(renderer) = &mut renderer {
+            let render_start = Instant::now();
             renderer.execute(&commands);
             renderer.submit();
+            render_time += render_start.elapsed();
             // FLORA_SHOTS_FROM: first flip worth a screenshot.
             let shots_from = std::env::var("FLORA_SHOTS_FROM")
                 .ok()
@@ -327,6 +359,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         flips += new_flips;
+        second_flips += new_flips;
+        if profile && second_start.elapsed() >= Duration::from_secs(1) {
+            flip_rates.push(second_flips);
+            (second_start, second_flips) = (Instant::now(), 0);
+        }
         for line in emu.take_console() {
             println!("[guest] {}", line.trim_end());
         }
@@ -344,8 +381,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stats.gpu.skipped_draws
             );
         }
-        if !unpaced {
-            std::thread::sleep(frame_time.saturating_sub(frame_start.elapsed()));
+    }
+    if profile {
+        println!("flips per second: {flip_rates:?}");
+        let stats = emu.stats();
+        println!(
+            "run_frame {run_time:.2?} (guest code {:.2?}, of it translating {} blocks {:.2?}; HLE {:.2?}) · render {render_time:.2?}",
+            Duration::from_nanos(stats.guest_nanos),
+            stats.compiled_blocks,
+            Duration::from_nanos(stats.compile_nanos),
+            Duration::from_nanos(stats.hle_nanos),
+        );
+        for (name, calls, nanos) in emu.hle_slowest(16) {
+            println!("  {:>10.2?} {calls:>10}  {name}", Duration::from_nanos(nanos));
         }
     }
     for (name, calls) in emu.hle_profile(8) {

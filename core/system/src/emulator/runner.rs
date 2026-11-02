@@ -1,17 +1,47 @@
 //! The frame loop: run the main core, dispatch HLE calls, stop on events.
+use std::time::{Duration, Instant};
+
 use wiiu_cafe_os::{HleContext, coreinit::thread::TIME_SLICE, dispatch};
 use wiiu_cpu::{CpuError, StepEvent, disassemble::disassemble};
 
 use super::{Emulator, MAIN_CORE, Status, bus::CoreBus};
 
+/// A blocked guest is checked this often for expired sleeps, alarms and the like.
+const IDLE_POLL: Duration = Duration::from_millis(1);
+/// The last part of a wait spins: sleeping can overshoot by this much.
+const SPIN_MARGIN: Duration = Duration::from_micros(1500);
+/// Further behind the display than this, real time is given up and re-based.
+const MAX_LAG_FRAMES: u32 = 4;
+
+/// Waits for `deadline` without oversleeping it.
+fn wait_until(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining > SPIN_MARGIN {
+        std::thread::sleep(remaining - SPIN_MARGIN);
+    }
+    while Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+}
+
 impl Emulator {
-    /// Runs until the guest finishes a frame (vsync wait, flip, yield), exits,
-    /// crashes, or the per-frame instruction budget is used up.
+    /// Runs the guest up to the next vertical blank, which it then raises.
+    ///
+    /// Time keeps passing like on the console: a guest with nothing to do waits for
+    /// its sleeps and alarms, and one that is still busy gets the blank regardless.
+    /// Without [`Config::paced`](super::Config::paced) the blank comes as soon as
+    /// the guest idles, or when the budget of instructions runs out.
     pub fn run_frame(&mut self) {
         if self.status != Status::Running {
             return;
         }
-        let started = std::time::Instant::now();
+        let frame_time = self.config.frame_time;
+        let now = Instant::now();
+        let deadline = match self.next_vsync {
+            Some(vsync) if now < vsync + frame_time * MAX_LAG_FRAMES => vsync,
+            _ => now + frame_time,
+        };
+        self.next_vsync = Some(deadline + frame_time);
         let mut budget = self.config.instructions_per_frame;
         let mut slice = TIME_SLICE;
 
@@ -21,7 +51,24 @@ impl Emulator {
             return;
         }
 
-        while budget > 0 && !self.os.frame_done {
+        while budget > 0 {
+            if self.os.exit_code.is_some() {
+                break;
+            }
+            if self.os.frame_done {
+                if !self.config.paced || Instant::now() >= deadline {
+                    break;
+                }
+                wait_until(deadline.min(Instant::now() + IDLE_POLL));
+                if let Err(error) =
+                    self.os.begin_frame(&mut self.cores[MAIN_CORE], &mut self.memory)
+                {
+                    self.crash(error.to_string());
+                    return;
+                }
+                continue;
+            }
+            let timer = self.config.profile.then(Instant::now);
             let result = {
                 let mut bus = CoreBus {
                     memory: &mut self.memory,
@@ -30,6 +77,9 @@ impl Emulator {
                 };
                 self.jit.run(&mut self.cores[MAIN_CORE], &mut bus, budget.min(slice))
             };
+            if let Some(timer) = timer {
+                self.stats.guest_nanos += timer.elapsed().as_nanos() as u64;
+            }
             let (event, executed) = match result {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -56,6 +106,7 @@ impl Emulator {
                 }
                 StepEvent::HleCall(index) => {
                     self.stats.hle_calls += 1;
+                    let timer = self.config.profile.then(Instant::now);
                     let mut ctx = HleContext {
                         cpu: &mut self.cores[MAIN_CORE],
                         memory: &mut self.memory,
@@ -66,6 +117,11 @@ impl Emulator {
                     if let Err(error) = dispatch(&mut ctx, index) {
                         self.crash(format!("{error} (lr {:#010x})", self.cores[MAIN_CORE].lr));
                         return;
+                    }
+                    if let Some(timer) = timer {
+                        let nanos = timer.elapsed().as_nanos() as u64;
+                        self.stats.hle_nanos += nanos;
+                        self.os.registry.note_time(index, nanos);
                     }
                 }
                 StepEvent::SystemCall => {
@@ -84,13 +140,14 @@ impl Emulator {
                 }
             }
 
-            if let Some(code) = self.os.exit_code {
-                self.status = Status::Exited(code);
+            if Instant::now() >= deadline {
                 break;
             }
-            if self.os.frame_done || started.elapsed() >= self.config.frame_time {
-                break;
-            }
+        }
+        if let Some(code) = self.os.exit_code {
+            self.status = Status::Exited(code);
+        } else if self.config.paced {
+            wait_until(deadline);
         }
         self.finish_gx2_frame();
         self.stats.frames += 1;
@@ -100,7 +157,6 @@ impl Emulator {
     fn finish_gx2_frame(&mut self) {
         self.os.vsync();
     }
-
     fn crash_on_cpu_error(&mut self, error: &CpuError) {
         let pc = self.cores[MAIN_CORE].pc;
         let context = self

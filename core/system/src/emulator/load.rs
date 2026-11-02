@@ -64,9 +64,11 @@ impl Emulator {
         self.jit = wiiu_cpu::Jit::new();
         self.os = CafeOs::new();
         self.os.gamepad = gamepad;
+        self.os.coreinit.shared_data.fonts_dir.clone_from(&self.config.fonts_dir);
         self.gpu = Gpu::new();
         self.iosu = iosu;
         self.stats = EmuStats::default();
+        self.next_vsync = None;
 
         let boot = self.os.boot(&mut self.memory, name, rpx)?;
         start_main_thread(&mut self.cores[MAIN_CORE], &boot);

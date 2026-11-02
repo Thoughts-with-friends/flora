@@ -11,7 +11,7 @@ use crate::hle::{HleContext, HleError};
 
 /// An open aperture.
 #[derive(Debug, Clone, Copy)]
-pub struct Aperture {
+struct Aperture {
     address: u32,
     size: u32,
     handle: u32,
@@ -20,11 +20,23 @@ pub struct Aperture {
     slice: u32,
 }
 
+/// The last level retiled. Titles reading a render target through an aperture
+/// every frame find it unchanged, as the host renders outside guest memory:
+/// comparing bytes is far cheaper than walking the tiles again.
+#[derive(Debug, Default)]
+struct RetileCache {
+    /// `(image, level, slice)`.
+    level: (u32, u32, u32),
+    tiled: Vec<u8>,
+    linear: Vec<u8>,
+}
+
 /// Open apertures of the process.
 #[derive(Debug, Default)]
 pub struct Apertures {
     open: Vec<Aperture>,
     last_handle: u32,
+    cache: RetileCache,
 }
 
 impl Apertures {
@@ -49,8 +61,23 @@ impl Apertures {
     }
 }
 
+/// Copies a pixel when both ranges exist. The const length lets the copy compile
+/// to a single move, which a loop over millions of pixels needs.
+#[inline]
+fn copy_pixel<const BYTES: usize>(from: &[u8], at: usize, to: &mut [u8], into: usize) {
+    if let (Some(source), Some(target)) = (from.get(at..at + BYTES), to.get_mut(into..into + BYTES))
+    {
+        target.copy_from_slice(source);
+    }
+}
+
 /// Copies the level's texels between the aperture and the surface.
-fn retile(memory: &mut Memory, aperture: &Aperture, write_back: bool) -> Result<(), MemoryError> {
+fn retile(
+    memory: &mut Memory,
+    cache: &mut RetileCache,
+    aperture: &Aperture,
+    write_back: bool,
+) -> Result<(), MemoryError> {
     let surface = &aperture.surface;
     let level = aperture.level;
     let image = match level {
@@ -77,20 +104,68 @@ fn retile(memory: &mut Memory, aperture: &Aperture, write_back: bool) -> Result<
     let step = if addrlib::is_compressed(surface.format) { 4 } else { 1 };
     let width = (surface.width >> level).max(1).div_ceil(step);
     let height = (surface.height >> level).max(1).div_ceil(step);
-    let bytes = info.bpp / 8;
-    for y in 0..height {
-        for x in 0..width {
-            // 8-bit apertures are addressed with the swap of the hardware's endian mode.
-            let (column, row) = if bytes == 1 { (x ^ 8, y ^ 2) } else { (x, y) };
-            let linear = aperture.address + (column + row * info.pitch) * bytes;
-            let tiled = image.wrapping_add(layout.address(x, y, aperture.slice));
-            let (from, to) = if write_back { (linear, tiled) } else { (tiled, linear) };
-            memory.copy_within(to, from, bytes)?;
+    let bytes = (info.bpp / 8) as usize;
+    let pitch = info.pitch;
+    let linear_at = move |x: u32, y: u32| {
+        // 8-bit apertures are addressed with the swap of the hardware's endian mode.
+        let (column, row) = if bytes == 1 { (x ^ 8, y ^ 2) } else { (x, y) };
+        (column + row * pitch) as usize * bytes
+    };
+    // Tiling scatters pixels over the level, so the view spans all of it. The low bits of a slice's
+    // first address are swizzle, which stays inside the level.
+    let tiled_size = (layout.address(0, 0, aperture.slice) & !0x7FF) + info.surf_size as u32;
+    let key = (image, level, aperture.slice);
+    if write_back {
+        let linear = memory.slice(aperture.address, aperture.size)?;
+        if cache.level == key && cache.linear == linear {
+            return Ok(());
         }
+        let linear = linear.to_vec();
+        let tiled = memory.slice_mut(image, tiled_size)?;
+        macro_rules! store {
+            ($n:literal) => {
+                layout.for_each_pixel(width, height, aperture.slice, |x, y, offset| {
+                    copy_pixel::<$n>(&linear, linear_at(x, y), tiled, offset as usize);
+                })
+            };
+        }
+        match bytes {
+            1 => store!(1),
+            2 => store!(2),
+            4 => store!(4),
+            8 => store!(8),
+            _ => store!(16),
+        }
+        cache.level = (0, 0, 0);
+    } else {
+        let tiled = memory.slice(image, tiled_size)?;
+        let known = cache.level == key
+            && cache.tiled == tiled
+            && cache.linear.len() == aperture.size as usize;
+        if !known {
+            let mut linear = vec![0; aperture.size as usize];
+            macro_rules! load {
+                ($n:literal) => {
+                    layout.for_each_pixel(width, height, aperture.slice, |x, y, offset| {
+                        copy_pixel::<$n>(tiled, offset as usize, &mut linear, linear_at(x, y));
+                    })
+                };
+            }
+            match bytes {
+                1 => load!(1),
+                2 => load!(2),
+                4 => load!(4),
+                8 => load!(8),
+                _ => load!(16),
+            }
+            cache.tiled = tiled.to_vec();
+            cache.linear = linear;
+            cache.level = key;
+        }
+        memory.write_bytes(aperture.address, &cache.linear)?;
     }
     Ok(())
 }
-
 #[hle_export(lib = "gx2", name = "GX2AllocateTilingApertureEx")]
 fn gx2_allocate_tiling_aperture_ex(
     ctx: &mut HleContext<'_>,
@@ -125,16 +200,16 @@ fn gx2_allocate_tiling_aperture_ex(
     ctx.os.gx2.apertures.open.push(aperture);
     handle.write(ctx.memory, aperture.handle)?;
     address.write(ctx.memory, start)?;
-    retile(ctx.memory, &aperture, false)?;
+    retile(ctx.memory, &mut ctx.os.gx2.apertures.cache, &aperture, false)?;
     Ok(())
 }
 
 #[hle_export(lib = "gx2", name = "GX2FreeTilingAperture")]
 fn gx2_free_tiling_aperture(ctx: &mut HleContext<'_>, handle: u32) -> Result<(), HleError> {
-    let open = &mut ctx.os.gx2.apertures.open;
-    if let Some(index) = open.iter().position(|a| a.handle == handle) {
-        let aperture = open.swap_remove(index);
-        retile(ctx.memory, &aperture, true)?;
+    let apertures = &mut ctx.os.gx2.apertures;
+    if let Some(index) = apertures.open.iter().position(|a| a.handle == handle) {
+        let aperture = apertures.open.swap_remove(index);
+        retile(ctx.memory, &mut apertures.cache, &aperture, true)?;
     }
     Ok(())
 }
@@ -145,6 +220,48 @@ mod tests {
 
     use super::*;
     use crate::hle::test_env::{SCRATCH, TestEnv};
+
+    #[test]
+    fn an_unchanged_level_is_served_again_and_later_writes_still_land() {
+        let mut env = TestEnv::new();
+        let image = SCRATCH + 0x1_0000;
+        let mut surface = Gx2Surface {
+            dim: dim::D2,
+            width: 64,
+            height: 64,
+            depth: 1,
+            num_levels: 1,
+            format: 0x1A,
+            tile_mode: tile_mode::TM_1D_TILED_THIN1,
+            ..Gx2Surface::default()
+        };
+        surface.calc_size_and_alignment();
+        surface.image = image;
+        surface.write(&mut env.memory, SCRATCH).unwrap();
+        env.memory.write_u32(image, 0xAABB_CCDD).unwrap();
+        let (handle, address) = (SCRATCH + 0x100, SCRATCH + 0x104);
+        let open = |env: &mut TestEnv| {
+            env.call("gx2", "GX2AllocateTilingApertureEx", &[SCRATCH, 0, 0, 0, handle, address]);
+            (env.memory.read_u32(handle).unwrap(), env.memory.read_u32(address).unwrap())
+        };
+
+        // Unchanged twice: the first pixel reads back both times.
+        for _ in 0..2 {
+            let (id, linear) = open(&mut env);
+            assert_eq!(env.memory.read_u32(linear).unwrap(), 0xAABB_CCDD);
+            env.call("gx2", "GX2FreeTilingAperture", &[id]);
+        }
+        // The guest changes the surface directly: the copy must not be stale.
+        env.memory.write_u32(image, 0x1122_3344).unwrap();
+        let (id, linear) = open(&mut env);
+        assert_eq!(env.memory.read_u32(linear).unwrap(), 0x1122_3344);
+        // A write through the aperture reaches the surface and is seen on reopening.
+        env.memory.write_u32(linear, 0x5566_7788).unwrap();
+        env.call("gx2", "GX2FreeTilingAperture", &[id]);
+        assert_eq!(env.memory.read_u32(image).unwrap(), 0x5566_7788);
+        let (_, linear) = open(&mut env);
+        assert_eq!(env.memory.read_u32(linear).unwrap(), 0x5566_7788);
+    }
 
     #[test]
     fn writes_through_the_aperture_reach_the_tiled_surface() {

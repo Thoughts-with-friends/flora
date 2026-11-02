@@ -2,7 +2,10 @@
 use std::{collections::HashMap, sync::mpsc::SyncSender};
 
 use eframe::{egui, egui_wgpu};
-use flora_render::{LatteRenderer, RenderCommand, RenderThread, Screen, ScreenImages, wgpu};
+use flora_render::{
+    LatteRenderer, RenderCommand, RenderThread, Screen, ScreenImages, UpscaleConfig,
+    UpscaleSetting, wgpu,
+};
 
 /// A screen ready to draw: egui texture plus its pixel size.
 #[derive(Debug, Clone, Copy)]
@@ -15,6 +18,7 @@ pub struct ScreenView {
 pub struct Presenter {
     render_thread: RenderThread,
     screens: ScreenImages,
+    upscale: UpscaleSetting,
     device: wgpu::Device,
     egui_renderer: std::sync::Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
     /// Registered texture, the generation it shows and the image size.
@@ -33,14 +37,21 @@ impl Presenter {
         let info = state.adapter.get_info();
         log::info!("wgpu adapter: {} ({:?})", info.name, info.backend);
         let renderer = LatteRenderer::new(state.device.clone(), state.queue.clone());
+        let upscale = renderer.upscale_setting();
         let render_thread = RenderThread::spawn(renderer).map_err(|e| e.to_string())?;
         Ok(Self {
             screens: render_thread.screens(),
+            upscale,
             render_thread,
             device: state.device.clone(),
             egui_renderer: std::sync::Arc::clone(&state.renderer),
             textures: HashMap::new(),
         })
+    }
+
+    /// Applies from the next flip on.
+    pub fn set_upscale(&self, config: UpscaleConfig) {
+        self.upscale.set(config);
     }
 
     /// Where the emulator sends its work.

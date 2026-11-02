@@ -72,6 +72,8 @@ pub struct HleRegistry {
     missing_called: Vec<bool>,
     /// Calls per entry, for profiling.
     call_counts: Vec<u64>,
+    /// Host time per entry (only measured when profiling).
+    call_nanos: Vec<u64>,
     traced: Vec<bool>,
     /// Most recent calls: (entry, caller lr, r3 in, r3 out).
     trace: std::collections::VecDeque<(u32, u32, u32, u32)>,
@@ -97,6 +99,7 @@ impl HleRegistry {
             libraries: Vec::new(),
             missing_called: Vec::new(),
             call_counts: Vec::new(),
+            call_nanos: Vec::new(),
             traced: Vec::new(),
             trace: std::collections::VecDeque::new(),
             pending: Vec::new(),
@@ -118,6 +121,7 @@ impl HleRegistry {
         self.entries.push(entry);
         self.missing_called.push(false);
         self.call_counts.push(0);
+        self.call_nanos.push(0);
         self.entries.len() as u32 - 1
     }
 
@@ -218,6 +222,24 @@ impl HleRegistry {
         calls.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         calls.truncate(limit);
         calls
+    }
+
+    /// Adds host time spent in entry `index`.
+    pub fn note_time(&mut self, index: u32, nanos: u64) {
+        if let Some(total) = self.call_nanos.get_mut(index as usize) {
+            *total += nanos;
+        }
+    }
+
+    /// The `limit` entries that took longest as `(library::name, calls, nanos)`.
+    pub fn slowest(&self, limit: usize) -> Vec<(String, u64, u64)> {
+        let mut list: Vec<_> = (0..self.entries.len())
+            .filter(|i| self.call_nanos[*i] > 0)
+            .map(|i| (self.name_of(i as u32), self.call_counts[i], self.call_nanos[i]))
+            .collect();
+        list.sort_by_key(|(_, _, nanos)| std::cmp::Reverse(*nanos));
+        list.truncate(limit);
+        list
     }
 
     /// Returns `true` the first time a missing entry is called.

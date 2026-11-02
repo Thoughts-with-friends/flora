@@ -6,12 +6,14 @@
 //! | `Vulkan`        | Vulkan only                                 |
 //! | `OpenGl`        | OpenGL only (wgpu's GL backend)             |
 mod latte_renderer;
+pub mod upscale;
 
 pub use egui_wgpu::wgpu;
 pub use latte_renderer::{
     LatteRenderer, RenderThread, ScreenImage, ScreenImages, request_device, wanted_features,
     wgpu_format,
 };
+pub use upscale::{UpscaleConfig, UpscaleMethod, UpscaleSetting};
 pub use wiiu_gpu::{RenderBackend, RenderCommand, Screen};
 
 /// Graphics API selection.

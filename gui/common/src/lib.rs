@@ -1,6 +1,6 @@
 //! What every flora front end shares on top of the core crates:
 //! [`console::Console`] (the emulator running on its own thread), the
-//! persisted [`config::AppConfig`] and keyboard → GamePad [`input`] mapping.
+//! persisted [`config::AppConfig`] and keyboard/controller → GamePad [`input`] mapping.
 pub mod audio;
 pub mod config;
 pub mod console;

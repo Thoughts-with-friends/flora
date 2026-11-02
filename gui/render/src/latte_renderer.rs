@@ -29,6 +29,8 @@ use wiiu_gpu::{
     shader::{TextureDim, TextureKind},
 };
 
+use crate::upscale::{UpscaleSetting, Upscaler};
+
 /// Size the shader prelude reads through the dynamic binding.
 const PARAMS_BINDING_SIZE: u64 = 288;
 
@@ -68,7 +70,7 @@ impl ScreenImages {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).get(&screen).cloned()
     }
 
-    fn set(&self, screen: Screen, image: ScreenImage) {
+    pub(crate) fn set(&self, screen: Screen, image: ScreenImage) {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(screen, image);
     }
 }
@@ -321,6 +323,9 @@ pub struct LatteRenderer {
     screen_targets: HashMap<Screen, ScreenImage>,
     screens: ScreenImages,
     generation: u64,
+    upscaler: Upscaler,
+    /// Screens with a new image since the last flip.
+    presented: Vec<Screen>,
     logged: std::collections::HashSet<String>,
     /// Debugging aid: only the first draws of each frame execute (FLORA_MAX_DRAWS).
     max_draws: Option<u32>,
@@ -476,6 +481,8 @@ impl LatteRenderer {
             screen_targets: HashMap::new(),
             screens: ScreenImages::default(),
             generation: 0,
+            upscaler: Upscaler::default(),
+            presented: Vec::new(),
             logged: std::collections::HashSet::new(),
             max_draws: std::env::var("FLORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
             frame_draws: 0,
@@ -487,6 +494,11 @@ impl LatteRenderer {
 
     pub fn screens(&self) -> ScreenImages {
         self.screens.clone()
+    }
+
+    /// Handle to change the screens' upscaling while the renderer runs.
+    pub fn upscale_setting(&self) -> UpscaleSetting {
+        self.upscaler.setting()
     }
 
     pub const fn device(&self) -> &wgpu::Device {
@@ -1366,7 +1378,10 @@ impl LatteRenderer {
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
-        self.screens.set(screen, target);
+        self.presented.push(screen);
+        if !self.upscaler.shows(screen) {
+            self.screens.set(screen, target);
+        }
     }
 
     fn flip(&mut self) {
@@ -1375,6 +1390,15 @@ impl LatteRenderer {
             self.present(screen, key, slice);
         }
         self.submit();
+        self.upscaler.update(
+            &self.device,
+            &self.queue,
+            &self.presented,
+            &self.screen_targets,
+            &self.screens,
+            &mut self.generation,
+        );
+        self.presented.clear();
         self.flips += 1;
         self.frame_draws = 0;
         // Bind groups keep textures alive; the set is rebuilt cheaply.

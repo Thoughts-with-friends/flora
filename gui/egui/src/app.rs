@@ -6,8 +6,9 @@ use flora_game_library::{GameLibrary, RomPaths};
 use flora_gui_common::{
     config::AppConfig,
     console::{Console, ConsoleCommand},
+    input::{Controllers, merge},
 };
-use flora_render::{GraphicsApi, Screen};
+use flora_render::{GraphicsApi, Screen, UpscaleMethod, upscale};
 use wiiu_emu::{GamePadState, Status};
 
 use crate::presenter::Presenter;
@@ -30,6 +31,7 @@ pub struct FloraApp {
     log: Vec<String>,
     show_log: bool,
     last_gamepad: GamePadState,
+    controllers: Controllers,
     /// Titles found in the directories listed in `roms.json`.
     library: GameLibrary,
     library_error: Option<String>,
@@ -47,6 +49,7 @@ impl FloraApp {
         boot: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let presenter = Presenter::new(cc)?;
+        presenter.set_upscale(config.upscale);
         let ctx = cc.egui_ctx.clone();
         let render = presenter.sender().ok_or("the render thread is not running")?;
         let console =
@@ -65,6 +68,7 @@ impl FloraApp {
             log: Vec::new(),
             show_log: true,
             last_gamepad: GamePadState::default(),
+            controllers: Controllers::new(),
             library: GameLibrary::default(),
             library_error: None,
             show_library: true,
@@ -141,11 +145,14 @@ impl FloraApp {
     }
 
     fn poll_input(&mut self, ctx: &egui::Context) {
-        let pad = ctx.input(|input| {
+        let changes = self.controllers.poll();
+        self.log.extend(changes);
+        let keyboard = ctx.input(|input| {
             self.config
                 .key_bindings
                 .gamepad(|name| egui::Key::from_name(name).is_some_and(|key| input.key_down(key)))
         });
+        let pad = merge(keyboard, self.controllers.gamepad(&self.config.pad_bindings));
         if pad != self.last_gamepad {
             self.last_gamepad = pad;
             self.console.send(ConsoleCommand::GamePad(pad));
@@ -198,6 +205,13 @@ impl FloraApp {
                 ui.checkbox(&mut self.show_library, "Game library");
                 ui.checkbox(&mut self.show_log, "Guest log");
                 ui.separator();
+                self.upscale_menu(ui);
+                ui.separator();
+                if ui.button("System fonts folder…").clicked() {
+                    ui.close();
+                    self.pick_fonts_dir();
+                }
+                ui.separator();
                 ui.label("Graphics API (applies on restart)");
                 for api in GraphicsApi::ALL {
                     if ui.radio(self.config.graphics_api == api, api.label()).clicked() {
@@ -206,6 +220,42 @@ impl FloraApp {
                     }
                 }
             });
+        });
+    }
+
+    /// Asks for the folder with `CafeStd.ttf`; titles booted from now on use it.
+    fn pick_fonts_dir(&mut self) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Folder with CafeStd.ttf (Cemu: resources/sharedFonts)");
+        if let Some(dir) = dialog.pick_folder() {
+            self.log.push(format!("system fonts: {} (applies on the next boot)", dir.display()));
+            self.console.send(ConsoleCommand::FontsDir(Some(dir.clone())));
+            self.config.fonts_dir = Some(dir);
+            self.save_config();
+        }
+    }
+
+    fn upscale_menu(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(upscale::available(), |ui| {
+            ui.label("Screen upscaling (xBRZ)");
+            let mut changed = false;
+            if ui.radio(self.config.upscale.method == UpscaleMethod::None, "Off").clicked() {
+                self.config.upscale.method = UpscaleMethod::None;
+                changed = true;
+            }
+            for factor in 2..=upscale::MAX_FACTOR {
+                let selected = self.config.upscale.method == UpscaleMethod::Xbrz
+                    && self.config.upscale.factor == factor;
+                if ui.radio(selected, format!("{factor}x")).clicked() {
+                    self.config.upscale.method = UpscaleMethod::Xbrz;
+                    self.config.upscale.factor = factor;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.presenter.set_upscale(self.config.upscale);
+                self.save_config();
+            }
         });
     }
 

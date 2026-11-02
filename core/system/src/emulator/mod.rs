@@ -39,6 +39,14 @@ pub struct EmuStats {
     pub frames: u64,
     pub instructions: u64,
     pub hle_calls: u64,
+    /// Host time in translated guest code, when profiling.
+    pub guest_nanos: u64,
+    /// Host time in HLE functions, when profiling.
+    pub hle_nanos: u64,
+    /// Host time translating guest code.
+    pub compile_nanos: u64,
+    /// Blocks of guest code translated.
+    pub compiled_blocks: u64,
     pub gpu: GpuStats,
 }
 
@@ -54,6 +62,8 @@ pub struct Emulator {
     title: Option<TitleInfo>,
     status: Status,
     stats: EmuStats,
+    /// When the next vertical blank is due.
+    next_vsync: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for Emulator {
@@ -82,6 +92,7 @@ impl Emulator {
             title: None,
             status: Status::Idle,
             stats: EmuStats::default(),
+            next_vsync: None,
         })
     }
 
@@ -94,7 +105,12 @@ impl Emulator {
     }
 
     pub fn stats(&self) -> EmuStats {
-        EmuStats { gpu: self.gpu.stats(), ..self.stats }
+        EmuStats {
+            gpu: self.gpu.stats(),
+            compile_nanos: self.jit.compile_nanos(),
+            compiled_blocks: self.jit.compiled_blocks(),
+            ..self.stats
+        }
     }
 
     /// Register state of core `index` (for the debugger).
@@ -144,6 +160,11 @@ impl Emulator {
     /// The most frequently called HLE functions (for profiling).
     pub fn hle_profile(&self, limit: usize) -> Vec<(String, u64)> {
         self.os.registry.hottest(limit)
+    }
+
+    /// The HLE functions that took longest, when profiling.
+    pub fn hle_slowest(&self, limit: usize) -> Vec<(String, u64, u64)> {
+        self.os.registry.slowest(limit)
     }
 
     /// Drains mixed audio: interleaved stereo at [`wiiu_cafe_os::sndcore2::OUTPUT_RATE`].

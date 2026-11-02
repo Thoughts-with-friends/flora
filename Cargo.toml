@@ -22,9 +22,11 @@ resolver = "3"
 
 [profile.release]
 debug = true
+lto = "thin"
 
-# The interpreter is unusably slow without optimisation.
-[profile.dev.package."*"]
+# The emulator cannot keep real time without optimisation. "*" alone would not cover
+# the workspace's own crates, where nearly all the time goes.
+[profile.dev]
 opt-level = 2
 
 [workspace.dependencies]

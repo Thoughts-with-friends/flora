@@ -5,12 +5,19 @@ use std::{path::PathBuf, time::Duration};
 pub struct Config {
     /// Upper bound of guest instructions executed per [`Emulator::run_frame`](crate::Emulator::run_frame).
     pub instructions_per_frame: u64,
-    /// Wall-clock length of a frame: at most this much guest code runs between vertical blanks.
+    /// Time between vertical blanks.
     pub frame_time: Duration,
     /// Host directory holding per-title save data (`<dir>/<title id>/`).
     pub save_dir: PathBuf,
     /// Translate guest code; off means the (slow, precise-fault) interpreter only.
     pub jit: bool,
+    /// Measure host time per HLE function (`FLORA_PROFILE`).
+    pub profile: bool,
+    /// Keep real time: [Emulator::run_frame](crate::Emulator::run_frame) returns at the next
+    /// vertical blank. Off, it returns as soon as no guest thread can run.
+    pub paced: bool,
+    /// Directory holding the system fonts (CafeStd.ttf, ...), if not found automatically.
+    pub fonts_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -20,6 +27,9 @@ impl Default for Config {
             frame_time: Duration::from_micros(16_683),
             save_dir: PathBuf::from("save"),
             jit: true,
+            profile: std::env::var_os("FLORA_PROFILE").is_some(),
+            paced: true,
+            fonts_dir: None,
         }
     }
 }

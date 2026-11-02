@@ -1,9 +1,9 @@
 //! Front-end settings, stored as TOML.
 use std::path::{Path, PathBuf};
 
-use flora_render::GraphicsApi;
+use flora_render::{GraphicsApi, UpscaleConfig};
 
-use crate::input::KeyBindings;
+use crate::input::{KeyBindings, PadBindings};
 
 /// Persisted front-end settings.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -15,7 +15,12 @@ pub struct AppConfig {
     pub last_title: Option<PathBuf>,
     /// Root of per-title save data.
     pub save_dir: PathBuf,
+    /// Folder holding the system fonts (CafeStd.ttf, ...), when not found automatically.
+    pub fonts_dir: Option<PathBuf>,
     pub key_bindings: KeyBindings,
+    pub pad_bindings: PadBindings,
+    /// Screen post-processing.
+    pub upscale: UpscaleConfig,
 }
 
 impl Default for AppConfig {
@@ -24,7 +29,10 @@ impl Default for AppConfig {
             graphics_api: GraphicsApi::default(),
             last_title: None,
             save_dir: PathBuf::from("save"),
+            fonts_dir: None,
             key_bindings: KeyBindings::default(),
+            pad_bindings: PadBindings::default(),
+            upscale: UpscaleConfig::default(),
         }
     }
 }
@@ -54,7 +62,11 @@ impl AppConfig {
     }
 
     pub fn emulator_config(&self) -> wiiu_emu::Config {
-        wiiu_emu::Config { save_dir: self.save_dir.clone(), ..wiiu_emu::Config::default() }
+        wiiu_emu::Config {
+            save_dir: self.save_dir.clone(),
+            fonts_dir: self.fonts_dir.clone(),
+            ..wiiu_emu::Config::default()
+        }
     }
 }
 

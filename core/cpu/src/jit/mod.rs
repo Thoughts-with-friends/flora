@@ -69,6 +69,7 @@ pub struct Jit {
     /// Two-level table: guest page, then instruction within the page.
     pages: Vec<Option<Box<[Option<Block>; PAGE_ENTRIES]>>>,
     compiled_blocks: u64,
+    compile_nanos: u64,
 }
 
 // SAFETY: the module's raw code pointers are only used by the thread owning the `Jit`.
@@ -93,7 +94,7 @@ impl Jit {
     )]
     pub fn new() -> Self {
         let mut flags = settings::builder();
-        flags.set("opt_level", "speed").expect("known flag");
+        flags.set("opt_level", if std::env::var_os("FLORA_JIT_NONE").is_some() { "none" } else { "speed" }).expect("known flag");
         flags.set("use_colocated_libcalls", "false").expect("known flag");
         flags.set("is_pic", "false").expect("known flag");
         let isa = cranelift_native::builder()
@@ -108,7 +109,13 @@ impl Jit {
             builder_context: FunctionBuilderContext::new(),
             pages: (0..1_usize << (32 - PAGE_BITS)).map(|_| None).collect(),
             compiled_blocks: 0,
+            compile_nanos: 0,
         }
+    }
+
+    /// Host time spent translating so far.
+    pub const fn compile_nanos(&self) -> u64 {
+        self.compile_nanos
     }
 
     /// Number of blocks translated so far.
@@ -167,7 +174,10 @@ impl Jit {
                 None => {
                     // SAFETY: `context.bus` is the live `bus`; nothing else uses it meanwhile.
                     let bus = unsafe { &mut *context.bus.cast::<B>() };
-                    self.compile(pc, bus)?
+                    let timer = std::time::Instant::now();
+                    let block = self.compile(pc, bus)?;
+                    self.compile_nanos += timer.elapsed().as_nanos() as u64;
+                    block
                 }
             };
             // SAFETY: the code was generated for this `CpuState` layout, and
