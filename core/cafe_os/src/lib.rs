@@ -49,6 +49,11 @@ pub struct CafeOs {
     /// Latest GamePad sample from the front end.
     pub gamepad: GamePadState,
     pub(crate) gamepad_edges: ButtonEdges,
+    /// Wii U Pro Controllers by channel, as `WPAD`/`KPAD` see them.
+    pub pro_controllers: [Option<GamePadState>; nn::PRO_CHANNELS],
+    pub(crate) pro_edges: [ButtonEdges; nn::PRO_CHANNELS],
+    /// When each channel was last read: reading again too soon finds no new sample.
+    pub(crate) pro_last_read: [Option<std::time::Instant>; nn::PRO_CHANNELS],
     /// Raw panel coordinates of the last touch of the GamePad.
     pub(crate) last_touch: (u16, u16),
     /// Lines printed by `OSReport` and friends, drained by the front end.
@@ -89,6 +94,9 @@ impl CafeOs {
             settings: coreinit::settings::SystemSettings::default(),
             gamepad: GamePadState::default(),
             gamepad_edges: ButtonEdges::default(),
+            pro_controllers: [None; nn::PRO_CHANNELS],
+            pro_edges: [ButtonEdges::default(); nn::PRO_CHANNELS],
+            pro_last_read: [None; nn::PRO_CHANNELS],
             last_touch: (0, 0),
             console: Vec::new(),
             exit_code: None,

@@ -140,6 +140,12 @@ impl Emulator {
         self.os.gx2.forced_swap_interval = interval;
     }
 
+    /// Least vertical blanks per flip from now on.
+    pub fn set_min_swap_interval(&mut self, interval: Option<u32>) {
+        self.config.min_swap_interval = interval;
+        self.os.gx2.min_swap_interval = interval.unwrap_or(0);
+    }
+
     /// Where the cheat codes of the running title are kept.
     pub fn cheats_path(&self) -> Option<std::path::PathBuf> {
         let title_id = self.title.as_ref()?.meta.title_id?;
@@ -168,6 +174,13 @@ impl Emulator {
     /// Feeds the latest GamePad sample.
     pub const fn set_gamepad(&mut self, state: GamePadState) {
         self.os.gamepad = state;
+    }
+
+    /// Plugs in, updates or (with `None`) unplugs the Pro Controller on `channel`.
+    pub fn set_pro_controller(&mut self, channel: usize, state: Option<GamePadState>) {
+        if let Some(slot) = self.os.pro_controllers.get_mut(channel) {
+            *slot = state;
+        }
     }
 
     /// Drains render commands produced since the last call.

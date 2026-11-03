@@ -36,10 +36,16 @@ pub enum ConsoleCommand {
     /// Reads the running title's cheat codes again.
     ReloadCheats,
     GamePad(GamePadState),
+    /// A Pro Controller on a `WPAD` channel; `None` unplugs it.
+    ProController(usize, Option<GamePadState>),
+    /// Where a copy of the sound goes (48 kHz stereo). Full means that part is dropped.
+    AudioTap(Option<SyncSender<Vec<i16>>>),
     /// Where to find the system fonts from the next boot on.
     FontsDir(Option<PathBuf>),
     /// Vertical blanks per flip from now on, whatever the title asks for.
     SwapInterval(Option<u32>),
+    /// Least vertical blanks per flip from now on: never faster than this.
+    MinSwapInterval(Option<u32>),
 }
 
 /// State published by the emulation thread.
@@ -96,6 +102,7 @@ impl Console {
                     rx,
                     render,
                     audio: AudioOutput::open(AUDIO_RATE),
+                    audio_tap: None,
                     shared: thread_shared,
                     paused: false,
                 }
@@ -103,6 +110,12 @@ impl Console {
             })
             .map_err(|e| e.to_string())?;
         Ok(Self { tx: Some(tx), shared, thread: Some(thread) })
+    }
+
+    /// A handle for sending commands from another thread. Keeps the emulation thread alive:
+    /// drop it before the console.
+    pub fn commands(&self) -> Option<Sender<ConsoleCommand>> {
+        self.tx.clone()
     }
 
     pub fn send(&self, command: ConsoleCommand) {
@@ -137,6 +150,7 @@ struct EmuThread {
     rx: Receiver<ConsoleCommand>,
     render: SyncSender<Vec<RenderCommand>>,
     audio: AudioOutput,
+    audio_tap: Option<SyncSender<Vec<i16>>>,
     shared: Shared,
     paused: bool,
 }
@@ -182,14 +196,25 @@ impl EmuThread {
                 }
             }
             ConsoleCommand::GamePad(state) => self.emulator.set_gamepad(state),
+            ConsoleCommand::ProController(channel, state) => {
+                self.emulator.set_pro_controller(channel, state);
+            }
+            ConsoleCommand::AudioTap(tap) => self.audio_tap = tap,
             ConsoleCommand::FontsDir(dir) => self.emulator.config.fonts_dir = dir,
             ConsoleCommand::SwapInterval(interval) => self.emulator.set_swap_interval(interval),
+            ConsoleCommand::MinSwapInterval(interval) => {
+                self.emulator.set_min_swap_interval(interval);
+            }
         }
     }
 
     fn publish(&mut self, fps: f32) {
         // Before the renderer, which may take a while: sound must not run out meanwhile.
-        self.audio.push(&self.emulator.take_audio());
+        let sound = self.emulator.take_audio();
+        self.audio.push(&sound);
+        if let Some(tap) = self.audio_tap.as_ref().filter(|_| !sound.is_empty()) {
+            let _ = tap.try_send(sound);
+        }
         let commands = self.emulator.take_render_commands();
         // Waits while the renderer is behind: frames must not be dropped, they
         // carry uploads and draws later frames build on.

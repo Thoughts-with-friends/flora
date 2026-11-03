@@ -54,6 +54,7 @@ wiiu_title = { path = "./core/title" }
 # front end crates
 shocora_game_library = { path = "./gui/game_library" }
 shocora_gui_common = { path = "./gui/common" }
+shocora_netplay = { path = "./gui/netplay" }
 shocora_render = { path = "./gui/render" }
 
 [workspace.lints.clippy]

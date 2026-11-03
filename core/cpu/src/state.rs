@@ -60,8 +60,8 @@ pub struct CpuState {
     /// Graphics quantization registers used by `psq_l`/`psq_st`.
     pub gqr: [u32; 8],
     pub sr: [u32; 16],
-    /// Address reserved by `lwarx`, cleared by `stwcx.`.
-    pub reservation: Option<u32>,
+    /// Address reserved by `lwarx` and the word read there, cleared by `stwcx.`.
+    pub reservation: Option<(u32, u32)>,
     /// Every other SPR, indexed by SPR number.
     pub spr: Vec<u32>,
 }

@@ -23,6 +23,9 @@
 //! * `SHOCORA_FRAMEGEN`: generates frames; with `SHOCORA_SHOTS`, also saves them as `Gen*`.
 //! * `SHOCORA_RESET_AT=frame`: reboots the title at that frame, like the GUI's Reset.
 //! * `SHOCORA_TOUCH="frame,x,y,frames"`: touches the GamePad's screen (854 x 480 pixels).
+//! * `SHOCORA_MIN_SWAP_INTERVAL=n`: at least `n` vertical blanks per flip (2 caps at 30 fps).
+//! * `SHOCORA_NET_HOST="ip[/prefix],port[,password]"`: lets a second player join (with
+//!   `SHOCORA_SHOTS`); see `netclient`.
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -33,6 +36,27 @@ use shocora_render::{
     request_device, wgpu,
 };
 use wiiu_emu::{Config, Emulator, GamePadState, Status};
+
+/// The host's side of a second player, for a loop that polls.
+struct NetEvents {
+    pad: std::sync::Arc<std::sync::Mutex<Option<GamePadState>>>,
+    tap: shocora_render::StreamTap,
+}
+
+impl shocora_netplay::HostEvents for NetEvents {
+    fn input(&self, pad: Option<GamePadState>) {
+        *self.pad.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pad;
+    }
+
+    fn streaming(&self, wanted: bool) {
+        self.tap.set_enabled(wanted);
+    }
+
+    fn take_frame(&self) -> Option<shocora_netplay::Frame> {
+        let frame = self.tap.take()?;
+        Some(shocora_netplay::Frame { width: frame.width, height: frame.height, rgba: frame.rgba })
+    }
+}
 
 /// One scripted button press.
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +253,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jit: std::env::var_os("SHOCORA_INTERP").is_none(),
         paced: std::env::var_os("SHOCORA_UNPACED").is_none(),
         swap_interval: std::env::var("SHOCORA_SWAP_INTERVAL").ok().and_then(|n| n.parse().ok()),
+        min_swap_interval: std::env::var("SHOCORA_MIN_SWAP_INTERVAL")
+            .ok()
+            .and_then(|n| n.parse().ok()),
         profile: std::env::var("SHOCORA_PROFILE").is_ok_and(|value| value != "flips"),
         ..Config::default()
     };
@@ -283,6 +310,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut ubo_arena = std::collections::HashMap::new();
     let mut ubo_log = String::new();
+    let second_player = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let net_host = match (std::env::var("SHOCORA_NET_HOST").ok(), &renderer) {
+        (Some(text), Some(renderer)) => {
+            let mut parts = text.splitn(3, ',');
+            let address = parts.next().unwrap_or_default();
+            let port = parts.next().ok_or("SHOCORA_NET_HOST: expected ip,port")?.parse()?;
+            let config =
+                shocora_netplay::HostConfig::new(address, port, parts.next().unwrap_or_default())?;
+            let events = NetEvents {
+                pad: std::sync::Arc::clone(&second_player),
+                tap: renderer.stream_tap(),
+            };
+            let host = shocora_netplay::Host::start(config, events)?;
+            println!("netplay: listening on port {}", host.port());
+            Some(host)
+        }
+        _ => None,
+    };
     let start = Instant::now();
     let mut flips = 0_u64;
     let mut last_report = Instant::now();
@@ -311,6 +356,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (frame >= at && frame < at + length).then_some((x as u16, y as u16))
         });
         emu.set_gamepad(pad);
+        if net_host.is_some() {
+            let pad = *second_player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            emu.set_pro_controller(0, pad);
+        }
         // SHOCORA_RESET_AT=frame: the reset the GUI offers.
         if std::env::var("SHOCORA_RESET_AT").ok().and_then(|at| at.parse().ok()) == Some(frame) {
             emu.reset()?;
@@ -322,6 +371,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run_elapsed = frame_start.elapsed();
         if wav.is_some() {
             sound.extend(emu.take_audio());
+        } else if let Some(host) = &net_host {
+            let _ = host.audio_sink().try_send(emu.take_audio());
         }
         let commands = emu.take_render_commands();
         let new_flips = commands.iter().filter(|c| matches!(c, RenderCommand::Flip)).count() as u64;

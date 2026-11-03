@@ -94,6 +94,12 @@ fn gx2_get_system_tv_scan_mode(_ctx: &mut HleContext<'_>) -> u32 {
     3
 }
 
+#[hle_export(lib = "gx2", name = "GX2GetSystemTVAspectRatio")]
+fn gx2_get_system_tv_aspect_ratio(_ctx: &mut HleContext<'_>) -> u32 {
+    // GX2_ASPECT_RATIO_16_9
+    1
+}
+
 #[hle_export(lib = "gx2", name = "GX2IsVideoOutReady")]
 fn gx2_is_video_out_ready(_ctx: &mut HleContext<'_>) -> bool {
     true

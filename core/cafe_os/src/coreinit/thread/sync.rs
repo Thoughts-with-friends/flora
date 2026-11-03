@@ -5,7 +5,7 @@
 use wiiu_hle_macros::hle_export;
 
 use super::{
-    Reschedule, Wait, block,
+    Reschedule, ThreadState, Wait, block,
     scheduler::{MutexState, PendingCond},
 };
 use crate::hle::{HleContext, HleError};
@@ -208,7 +208,7 @@ fn signal_cond(ctx: &mut HleContext<'_>, cond: u32) {
             thread.pending_cond.as_mut().filter(|p| p.cond == cond && !p.signaled)
         {
             pending.signaled = true;
-            thread.state = super::ThreadState::Ready;
+            thread.state = ThreadState::Ready;
         }
     }
     ctx.os.coreinit.threads.request(Reschedule::Priority);
@@ -287,18 +287,68 @@ fn os_init_event_ex(
     init_event(ctx, event, signaled, mode)
 }
 
-#[hle_export(lib = "coreinit", name = "OSSignalEvent")]
-fn os_signal_event(ctx: &mut HleContext<'_>, event: u32) -> Result<(), HleError> {
-    ctx.memory.write_u32(event + offset::EVENT_STATE, 1)?;
+/// Whether `state` is a wait on `event`.
+const fn waits_on_event(state: ThreadState, event: u32) -> bool {
+    match state {
+        ThreadState::Waiting(Wait::Event(waited)) => waited == event,
+        ThreadState::Waiting(Wait::EventTimeout { event: waited, .. }) => waited == event,
+        _ => false,
+    }
+}
+
+/// Wakes threads waiting on `event`, most important first; they return from their wait whatever
+/// happens to the event's state before they run. Returns how many woke.
+fn wake_event_waiters(ctx: &mut HleContext<'_>, event: u32, limit: usize) -> usize {
+    let threads = &mut ctx.os.coreinit.threads.threads;
+    let mut waiters: Vec<_> =
+        threads.iter_mut().filter(|(_, t)| waits_on_event(t.state, event)).collect();
+    waiters.sort_by_key(|(_, t)| t.priority);
+    let woken = waiters.len().min(limit);
+    for (_, thread) in waiters.into_iter().take(limit) {
+        thread.state = ThreadState::Ready;
+        thread.woken_from_queue = Some(event);
+    }
+    woken
+}
+
+/// Port of Cemu's `OSSignalEvent[All]Internal`: an automatic event wakes `limit` threads and only
+/// stays signaled if none waits; a manual one stays signaled and wakes them all.
+fn signal_event(ctx: &mut HleContext<'_>, event: u32, limit: usize) -> Result<(), HleError> {
+    if ctx.memory.read_u32(event + offset::EVENT_STATE)? != 0 {
+        return Ok(());
+    }
+    if ctx.memory.read_u32(event + offset::EVENT_MODE)? == EVENT_MODE_AUTO {
+        if wake_event_waiters(ctx, event, limit) == 0 {
+            ctx.memory.write_u32(event + offset::EVENT_STATE, 1)?;
+        }
+    } else {
+        ctx.memory.write_u32(event + offset::EVENT_STATE, 1)?;
+        wake_event_waiters(ctx, event, usize::MAX);
+    }
     ctx.os.coreinit.threads.request(Reschedule::Priority);
     Ok(())
 }
 
+/// Whether the restarted wait was ended by a signal that left the event unsignaled.
+fn woken_by_signal(ctx: &mut HleContext<'_>, event: u32) -> bool {
+    let woken = ctx
+        .os
+        .coreinit
+        .threads
+        .current_mut()
+        .filter(|t| t.woken_from_queue == Some(event))
+        .map(|t| t.woken_from_queue = None);
+    woken.is_some()
+}
+
+#[hle_export(lib = "coreinit", name = "OSSignalEvent")]
+fn os_signal_event(ctx: &mut HleContext<'_>, event: u32) -> Result<(), HleError> {
+    signal_event(ctx, event, 1)
+}
+
 #[hle_export(lib = "coreinit", name = "OSSignalEventAll")]
 fn os_signal_event_all(ctx: &mut HleContext<'_>, event: u32) -> Result<(), HleError> {
-    ctx.memory.write_u32(event + offset::EVENT_STATE, 1)?;
-    ctx.os.coreinit.threads.request(Reschedule::Priority);
-    Ok(())
+    signal_event(ctx, event, usize::MAX)
 }
 
 #[hle_export(lib = "coreinit", name = "OSResetEvent")]
@@ -309,6 +359,9 @@ fn os_reset_event(ctx: &mut HleContext<'_>, event: u32) -> Result<(), HleError> 
 
 #[hle_export(lib = "coreinit", name = "OSWaitEvent")]
 fn os_wait_event(ctx: &mut HleContext<'_>, event: u32) -> Result<(), HleError> {
+    if woken_by_signal(ctx, event) {
+        return Ok(());
+    }
     if !take_event(ctx, event)? {
         block(ctx, Wait::Event(event));
     }
@@ -323,7 +376,7 @@ fn os_wait_event_with_timeout(
     timeout: i64,
 ) -> Result<bool, HleError> {
     let woke = ctx.os.coreinit.threads.take_woke_from();
-    if take_event(ctx, event)? {
+    if woken_by_signal(ctx, event) || take_event(ctx, event)? {
         return Ok(true);
     }
     if matches!(woke, Some(Wait::EventTimeout { .. })) {
@@ -434,4 +487,56 @@ fn os_wait_rendezvous_with_timeout(
     _timeout: i64,
 ) -> Result<bool, HleError> {
     wait_rendezvous(ctx, rendezvous, mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::test_env::{SCRATCH, TestEnv};
+
+    const MANUAL: u32 = 0;
+
+    fn add_waiter(env: &mut TestEnv, thread: u32, priority: i32, event: u32) {
+        let mut record = super::super::ThreadRecord::new(wiiu_cpu::CpuState::new(1), priority);
+        record.state = ThreadState::Waiting(Wait::Event(event));
+        env.os.coreinit.threads.threads.insert(thread, record);
+    }
+
+    #[test]
+    fn automatic_event_wakes_one_thread_and_stays_unsignaled() {
+        let mut env = TestEnv::new();
+        env.call("coreinit", "OSInitEvent", &[SCRATCH, 0, EVENT_MODE_AUTO]);
+        add_waiter(&mut env, 0x100, 20, SCRATCH);
+        add_waiter(&mut env, 0x200, 18, SCRATCH);
+        env.call("coreinit", "OSSignalEvent", &[SCRATCH]);
+        let threads = &env.os.coreinit.threads.threads;
+        assert_eq!(threads[&0x200].state, ThreadState::Ready, "the most important one");
+        assert_eq!(threads[&0x100].state, ThreadState::Waiting(Wait::Event(SCRATCH)));
+        assert_eq!(env.memory.read_u32(SCRATCH + offset::EVENT_STATE).unwrap(), 0);
+    }
+
+    #[test]
+    fn manual_event_reset_at_once_still_releases_its_waiters() {
+        let mut env = TestEnv::new();
+        env.call("coreinit", "OSInitEvent", &[SCRATCH, 0, MANUAL]);
+        add_waiter(&mut env, 0x100, 20, SCRATCH);
+        add_waiter(&mut env, 0x200, 18, SCRATCH);
+        env.call("coreinit", "OSSignalEvent", &[SCRATCH]);
+        env.call("coreinit", "OSResetEvent", &[SCRATCH]);
+        let threads = &env.os.coreinit.threads.threads;
+        assert_eq!(threads[&0x100].woken_from_queue, Some(SCRATCH));
+        assert_eq!(threads[&0x200].woken_from_queue, Some(SCRATCH));
+    }
+
+    #[test]
+    fn signal_all_wakes_every_waiter_of_an_automatic_event() {
+        let mut env = TestEnv::new();
+        env.call("coreinit", "OSInitEvent", &[SCRATCH, 0, EVENT_MODE_AUTO]);
+        add_waiter(&mut env, 0x100, 20, SCRATCH);
+        add_waiter(&mut env, 0x200, 18, SCRATCH);
+        env.call("coreinit", "OSSignalEventAll", &[SCRATCH]);
+        let threads = &env.os.coreinit.threads.threads;
+        assert_eq!(threads[&0x100].state, ThreadState::Ready);
+        assert_eq!(threads[&0x200].state, ThreadState::Ready);
+    }
 }

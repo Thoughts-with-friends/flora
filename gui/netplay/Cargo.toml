@@ -1,0 +1,22 @@
+[package]
+name = "shocora_netplay"
+description = "shocora: a second player on the local network"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+log = { workspace = true }
+sha2 = "0.10"
+wiiu_peripherals = { workspace = true }
+
+[lints]
+workspace = true

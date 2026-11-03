@@ -8,13 +8,26 @@ use shocora_gui_common::{
     console::{Console, ConsoleCommand},
     input::{Controllers, merge},
 };
+use shocora_netplay::{DEFAULT_PORT, HostConfig, LinkState, Refusal};
 use shocora_render::{GraphicsApi, Screen, UpscaleMethod, upscale};
 use wiiu_emu::{GamePadState, Status};
 
-use crate::{launcher::Launcher, presenter::Presenter};
+use crate::{
+    launcher::Launcher,
+    netplay::{self, Netplay},
+    presenter::Presenter,
+};
 
 /// Lines of guest output kept in the log panel.
 const LOG_LINES: usize = 500;
+
+/// The choices of the frame rate setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameRate {
+    Title,
+    Max30,
+    Force60,
+}
 
 /// The cheat editor window.
 #[derive(Debug)]
@@ -25,6 +38,14 @@ struct CheatEditor {
 }
 
 pub struct ShocoraApp {
+    /// Comes first, to be dropped before the console it sends commands to.
+    netplay: Netplay,
+    /// What went wrong when starting to host.
+    netplay_error: Option<String>,
+    /// Asked for each time: passwords are not written to the settings file.
+    netplay_password: String,
+    /// The network being hosted, for the status bar.
+    netplay_network: String,
     console: Console,
     presenter: Presenter,
     config: AppConfig,
@@ -76,12 +97,22 @@ impl ShocoraApp {
         let render = presenter.sender().ok_or("the render thread is not running")?;
         let console =
             Console::spawn(config.emulator_config(), render, move || ctx.request_repaint())?;
+        let mut config = config;
+        if config.netplay_address.is_empty() {
+            if let Some(address) = shocora_netplay::local_address() {
+                config.netplay_address = address.to_string();
+            }
+        }
         let picture_path = config
             .launcher_image
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
         presenter.set_frame_generation(config.frame_generation);
         let mut app = Self {
+            netplay: Netplay::Off,
+            netplay_error: None,
+            netplay_password: String::new(),
+            netplay_network: String::new(),
             cheats: None,
             cheats_path: None,
             picture_path,
@@ -219,7 +250,145 @@ impl ShocoraApp {
         pad.touch = self.touch;
         if pad != self.last_gamepad {
             self.last_gamepad = pad;
-            self.console.send(ConsoleCommand::GamePad(pad));
+            // A guest's controller belongs to the host's second player.
+            if let Netplay::Guest(guest) = &self.netplay {
+                guest.client.set_input(pad);
+            } else {
+                self.console.send(ConsoleCommand::GamePad(pad));
+            }
+        }
+    }
+
+    fn start_hosting(&mut self) {
+        self.netplay = Netplay::Off;
+        let Some(commands) = self.console.commands() else { return };
+        let config = match HostConfig::new(
+            &self.config.netplay_address,
+            DEFAULT_PORT,
+            &self.netplay_password,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                self.netplay_error = Some(error);
+                return;
+            }
+        };
+        self.netplay_network = config.network();
+        let address = config.address;
+        match netplay::host(config, commands, self.presenter.stream_tap()) {
+            Ok(host) => {
+                self.console.send(ConsoleCommand::AudioTap(Some(host.audio_sink())));
+                self.netplay = Netplay::Host(host);
+                self.netplay_error = None;
+                self.save_config();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                self.netplay_error = Some(format!("{address} はこの PC のアドレスではありません"));
+            }
+            Err(error) => {
+                self.netplay_error = Some(format!("port {DEFAULT_PORT}: {error}"));
+            }
+        }
+    }
+
+    fn join(&mut self, ctx: &egui::Context) {
+        self.stop_netplay();
+        match netplay::join(&self.config.netplay_host, &self.netplay_password, ctx.clone()) {
+            Ok(guest) => {
+                self.netplay = Netplay::Guest(guest);
+                self.netplay_error = None;
+                self.save_config();
+            }
+            Err(error) => self.netplay_error = Some(error.to_string()),
+        }
+    }
+
+    fn stop_netplay(&mut self) {
+        if matches!(self.netplay, Netplay::Host(_)) {
+            self.console.send(ConsoleCommand::AudioTap(None));
+        }
+        self.netplay = Netplay::Off;
+    }
+
+    fn netplay_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Netplay", |ui| match self.netplay {
+            Netplay::Off => {
+                ui.label("パスワード（なしでも可）");
+                ui.add(egui::TextEdit::singleline(&mut self.netplay_password).password(true));
+                ui.separator();
+                ui.label("この PC の IP アドレス");
+                ui.text_edit_singleline(&mut self.config.netplay_address).on_hover_text(
+                    "同じネットワーク（192.168.1.10 なら 192.168.1.x）の相手だけが参加できます。\n\
+                     広いネットワークは 10.1.2.3/16 のように指定します。",
+                );
+                let ready = !self.config.netplay_address.trim().is_empty();
+                if ui
+                    .add_enabled(ready, egui::Button::new("2P ホストを開始"))
+                    .on_hover_text(
+                        "パスワードそのものは送りませんが、通信は暗号化されません。\n\
+                         信頼できるネットワークで使ってください。",
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.start_hosting();
+                }
+                ui.separator();
+                ui.label("ホストの IP アドレス");
+                ui.text_edit_singleline(&mut self.config.netplay_host);
+                let ready = !self.config.netplay_host.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("参加")).clicked() {
+                    ui.close();
+                    self.join(ui.ctx());
+                }
+            }
+            Netplay::Host(_) | Netplay::Guest(_) => {
+                if ui.button("切断").clicked() {
+                    ui.close();
+                    self.stop_netplay();
+                }
+            }
+        });
+    }
+
+    /// The guest's screen: what the host sends.
+    fn guest_screen(&mut self, ui: &mut egui::Ui) {
+        let Netplay::Guest(guest) = &mut self.netplay else { return };
+        let Some(texture) = guest.texture(ui.ctx()) else {
+            ui.centered_and_justified(|ui| ui.label("ホストの画面を待っています…"));
+            return;
+        };
+        let size = texture.size_vec2();
+        let available = ui.available_size();
+        let scale = (available.x / size.x).min(available.y / size.y).max(0.01);
+        ui.centered_and_justified(|ui| {
+            ui.add(egui::Image::new((texture.id(), size * scale)));
+        });
+    }
+
+    fn netplay_status(&self) -> Option<String> {
+        let link = |state: &LinkState| match state {
+            LinkState::Waiting => "待機中".to_owned(),
+            LinkState::Connecting => "接続中…".to_owned(),
+            LinkState::Unreachable(_) => "接続できません（再試行中）".to_owned(),
+            LinkState::Refused(Refusal::WrongPassword) => "パスワードが違います".to_owned(),
+            LinkState::Refused(Refusal::Network) => {
+                "ホストと同じネットワークではありません".to_owned()
+            }
+            LinkState::Connected { peer, round_trip: Some(time) } => {
+                format!("{peer} ping {} ms", time.as_millis())
+            }
+            LinkState::Connected { peer, round_trip: None } => peer.clone(),
+        };
+        match &self.netplay {
+            Netplay::Off => self.netplay_error.as_ref().map(|error| format!("2P: {error}")),
+            Netplay::Host(host) => Some(format!(
+                "2P ホスト {} ポート {}: {}",
+                self.netplay_network,
+                host.port(),
+                link(&host.state())
+            )),
+            Netplay::Guest(guest) => Some(format!("2P: {}", link(&guest.client.state()))),
         }
     }
 
@@ -278,6 +447,7 @@ impl ShocoraApp {
                     ui.close();
                 }
             });
+            self.netplay_menu(ui);
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.show_library, "Game library");
                 ui.checkbox(&mut self.show_log, "Guest log");
@@ -324,22 +494,51 @@ impl ShocoraApp {
 
     fn frame_rate_menu(&mut self, ui: &mut egui::Ui) {
         ui.label("Frame rate");
-        let mut chosen = self.config.swap_interval;
-        if ui.radio(chosen.is_none(), "As the title asks").clicked() {
-            chosen = None;
-        }
-        let forced = ui.radio(chosen == Some(1), "Force 60 fps").on_hover_text(
+        let current = self.frame_rate();
+        let title = ui.radio(current == FrameRate::Title, "As the title asks");
+        let capped = ui.radio(current == FrameRate::Max30, "Max 30 fps").on_hover_text(
+            "ゲームの処理がフレーム数で進むタイトルが速すぎるときに使います。\n\
+             30 fps より遅いタイトルはそのままです。",
+        );
+        let forced = ui.radio(current == FrameRate::Force60, "Force 60 fps").on_hover_text(
             "A title made for 30 fps whose logic counts frames, such as Twilight Princess HD, \
              then runs at up to double speed.",
         );
-        if forced.clicked() {
-            chosen = Some(1);
+        let chosen = if title.clicked() {
+            FrameRate::Title
+        } else if capped.clicked() {
+            FrameRate::Max30
+        } else if forced.clicked() {
+            FrameRate::Force60
+        } else {
+            current
+        };
+        if chosen != current {
+            self.set_frame_rate(chosen);
         }
-        if chosen != self.config.swap_interval {
-            self.config.swap_interval = chosen;
-            self.console.send(ConsoleCommand::SwapInterval(chosen));
-            self.save_config();
+    }
+
+    fn frame_rate(&self) -> FrameRate {
+        if self.config.swap_interval.is_some() {
+            FrameRate::Force60
+        } else if self.config.min_swap_interval.is_some() {
+            FrameRate::Max30
+        } else {
+            FrameRate::Title
         }
+    }
+
+    fn set_frame_rate(&mut self, rate: FrameRate) {
+        let (forced, least) = match rate {
+            FrameRate::Title => (None, None),
+            FrameRate::Max30 => (None, Some(2)),
+            FrameRate::Force60 => (Some(1), None),
+        };
+        self.config.swap_interval = forced;
+        self.config.min_swap_interval = least;
+        self.console.send(ConsoleCommand::SwapInterval(forced));
+        self.console.send(ConsoleCommand::MinSwapInterval(least));
+        self.save_config();
     }
 
     fn upscale_menu(&mut self, ui: &mut egui::Ui) {
@@ -438,10 +637,11 @@ impl ShocoraApp {
 
     /// Follows the title's frame rate or forces 60 fps, at once.
     fn toggle_frame_rate(&mut self) {
-        let chosen = if self.config.swap_interval.is_some() { None } else { Some(1) };
-        self.config.swap_interval = chosen;
-        self.console.send(ConsoleCommand::SwapInterval(chosen));
-        self.save_config();
+        self.set_frame_rate(match self.frame_rate() {
+            FrameRate::Title => FrameRate::Max30,
+            FrameRate::Max30 => FrameRate::Force60,
+            FrameRate::Force60 => FrameRate::Title,
+        });
     }
 
     /// Off, then every factor of xBRZ in turn.
@@ -496,17 +696,17 @@ impl ShocoraApp {
                 ui.label(state);
             }
             ui.separator();
-            let rate = if self.config.swap_interval.is_some() {
-                "60 fps 強制"
-            } else {
-                "タイトル指定"
+            let rate = match self.frame_rate() {
+                FrameRate::Title => "タイトル指定",
+                FrameRate::Max30 => "最大 30 fps",
+                FrameRate::Force60 => "60 fps 強制",
             };
             let fps = format!("{:.1} fps ({rate})", self.fps);
             if setting(
                 ui,
                 fps,
-                "クリックでタイトル指定と 60 fps 強制を切り替え。\n\
-                 30 fps 用のタイトルは強制すると最大で倍速になります。",
+                "クリックでタイトル指定 → 最大 30 fps → 60 fps 強制 と切り替え。\n\
+                 30 fps 用のタイトルは 60 fps にすると最大で倍速になります。",
             ) {
                 self.toggle_frame_rate();
             }
@@ -534,6 +734,10 @@ impl ShocoraApp {
             ui.separator();
             #[allow(clippy::cast_precision_loss)]
             ui.label(format!("{:.1} M instructions", self.instructions as f64 / 1e6));
+            if let Some(status) = self.netplay_status() {
+                ui.separator();
+                ui.label(status);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let api = format!("{} ({})", self.active_api.label(), Presenter::backend_name());
                 if setting(ui, api, "クリックでグラフィックス API を切り替え（次回起動から）")
@@ -822,7 +1026,9 @@ impl eframe::App for ShocoraApp {
                 .default_size(140.0)
                 .show(ui, |ui| self.log_panel(ui));
         }
-        if in_menu {
+        if matches!(self.netplay, Netplay::Guest(_)) {
+            egui::CentralPanel::default().show(ui, |ui| self.guest_screen(ui));
+        } else if in_menu {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.menu_screen(ui));

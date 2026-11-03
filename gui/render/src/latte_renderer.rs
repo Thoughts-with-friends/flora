@@ -36,6 +36,7 @@ use wiiu_gpu::{
 
 use crate::{
     framegen::{FrameGenSetting, FrameGenerator},
+    stream::{StreamTap, Streamer},
     upscale::{UpscaleSetting, Upscaler},
 };
 
@@ -44,6 +45,22 @@ const PARAMS_BINDING_SIZE: u64 = 324;
 
 /// Address of the surfaces standing in for attachments of the wrong size.
 const STAND_IN_ADDRESS: u32 = 0xFFFF_F000;
+
+/// Writes a depth surface into a color one, which the host cannot copy between.
+const DEPTH_TO_COLOR_SHADER: &str = r"
+@group(0) @binding(0) var source: texture_depth_2d;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let corner = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+    return vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureLoad(source, vec2<i32>(position.xy), 0), 0.0, 0.0, 1.0);
+}
+";
 
 /// Features the renderer uses when the adapter offers them.
 pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
@@ -638,12 +655,16 @@ pub struct LatteRenderer {
     blit_pipeline: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
+    /// Layout and per-target pipelines of depth to color copies, made on first use.
+    depth_to_color: Option<(wgpu::BindGroupLayout, wgpu::PipelineLayout, wgpu::ShaderModule)>,
+    depth_to_color_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pending_scan: HashMap<Screen, (SurfaceKey, u32)>,
     screen_targets: HashMap<Screen, ScreenImage>,
     screens: ScreenImages,
     generation: u64,
     upscaler: Upscaler,
     frame_generator: FrameGenerator,
+    streamer: Streamer,
     /// Screens with a new image since the last flip.
     presented: Vec<Screen>,
     logged: std::collections::HashSet<String>,
@@ -808,12 +829,15 @@ impl LatteRenderer {
             blit_pipeline,
             blit_layout,
             blit_sampler,
+            depth_to_color: None,
+            depth_to_color_pipelines: HashMap::new(),
             pending_scan: HashMap::new(),
             screen_targets: HashMap::new(),
             screens: ScreenImages::default(),
             generation: 0,
             upscaler: Upscaler::default(),
             frame_generator: FrameGenerator::default(),
+            streamer: Streamer::default(),
             presented: Vec::new(),
             logged: std::collections::HashSet::new(),
             max_draws: std::env::var("SHOCORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
@@ -826,6 +850,11 @@ impl LatteRenderer {
 
     pub fn screens(&self) -> ScreenImages {
         self.screens.clone()
+    }
+
+    /// Where a second player's pictures come from, while the renderer runs.
+    pub fn stream_tap(&self) -> StreamTap {
+        self.streamer.tap()
     }
 
     /// Handle to switch frame generation while the renderer runs.
@@ -1651,6 +1680,12 @@ impl LatteRenderer {
         if !self.surfaces.contains_key(&source) {
             return;
         }
+        if source.format.is_depth()
+            && matches!(target.format, HostFormat::R32Float | HostFormat::R16Float)
+        {
+            self.copy_depth_to_color(source, source_slice, target, target_level, target_slice);
+            return;
+        }
         if wgpu_format(source.format).remove_srgb_suffix()
             != wgpu_format(target.format).remove_srgb_suffix()
         {
@@ -1699,6 +1734,117 @@ impl LatteRenderer {
             },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
+    }
+
+    /// What `GX2ConvertDepthBufferToTextureSurface` does for titles reading depth in a shader.
+    fn copy_depth_to_color(
+        &mut self,
+        source: SurfaceKey,
+        source_slice: u32,
+        target: SurfaceKey,
+        target_level: u32,
+        target_slice: u32,
+    ) {
+        let format = wgpu_format(target.format);
+        let target_view = self
+            .surface(target, TextureDim::D2, target_level + 1)
+            .target_view(target_level, target_slice);
+        let Some(source_texture) = self.surfaces.get(&source).map(|s| s.texture.clone()) else {
+            return;
+        };
+        if source_slice >= source_texture.depth_or_array_layers() {
+            self.log_once(format!("copy skipped: {source:?} slice {source_slice} -> {target:?}"));
+            return;
+        }
+        let source_view = source_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            base_array_layer: source_slice,
+            array_layer_count: Some(1),
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let device = self.device.clone();
+        let (layout, pipeline_layout, module) = self.depth_to_color.get_or_insert_with(|| {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shocora depth to color"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shocora depth to color"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shocora depth to color"),
+                source: wgpu::ShaderSource::Wgsl(DEPTH_TO_COLOR_SHADER.into()),
+            });
+            (layout, pipeline_layout, module)
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shocora depth to color"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source_view),
+            }],
+        });
+        let pipeline = self
+            .depth_to_color_pipelines
+            .entry(format)
+            .or_insert_with(|| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("shocora depth to color"),
+                    layout: Some(pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(format.into())],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .clone();
+        let width = source.width.min(target.width >> target_level).max(1);
+        let height = source.height.min(target.height >> target_level).max(1);
+        let encoder = self.encoder();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shocora depth to color"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+        pass.draw(0..3, 0..1);
     }
 
     fn present(&mut self, screen: Screen, source: SurfaceKey, slice: u32) {
@@ -1801,6 +1947,15 @@ impl LatteRenderer {
             &self.screens,
             &mut self.generation,
             upscaled,
+        );
+        let tv = self.presented.contains(&Screen::Tv);
+        self.streamer.update(
+            &self.device,
+            &self.queue,
+            tv.then(|| self.screen_targets.get(&Screen::Tv)).flatten(),
+            &self.blit_pipeline,
+            &self.blit_layout,
+            &self.blit_sampler,
         );
         self.presented.clear();
         self.flips += 1;

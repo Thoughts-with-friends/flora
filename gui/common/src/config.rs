@@ -30,6 +30,12 @@ pub struct AppConfig {
     pub frame_generation: bool,
     /// Picture behind the start screen's color.
     pub launcher_image: Option<PathBuf>,
+    /// The host a guest last joined.
+    pub netplay_host: String,
+    /// This machine's address when hosting, optionally with `/prefix`.
+    pub netplay_address: String,
+    /// Least vertical blanks per flip: `2` caps a title at 30 fps.
+    pub min_swap_interval: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -46,6 +52,9 @@ impl Default for AppConfig {
             launcher_background: [231, 234, 237, 255],
             frame_generation: false,
             launcher_image: None,
+            netplay_host: String::new(),
+            netplay_address: String::new(),
+            min_swap_interval: None,
         }
     }
 }
@@ -79,6 +88,7 @@ impl AppConfig {
             save_dir: self.save_dir.clone(),
             fonts_dir: self.fonts_dir.clone(),
             swap_interval: self.swap_interval,
+            min_swap_interval: self.min_swap_interval,
             ..wiiu_emu::Config::default()
         }
     }

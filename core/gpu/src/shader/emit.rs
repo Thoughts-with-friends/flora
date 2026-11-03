@@ -585,6 +585,19 @@ impl<'a> Translator<'a> {
                 let swizzled = self.swizzle_texel(signature, &bits);
                 self.write_tex_result(op, &swizzled);
             }
+            tex::FETCH4 if signature.dim == TextureDim::D2 => {
+                let call = self.sample_call(op, signature, &tex_name, &sampler_name);
+                let bits = if matches!(signature.kind, TextureKind::Uint) {
+                    call
+                } else {
+                    format!("bitcast<vec4<u32>>({call})")
+                };
+                // Four texels of one channel, so the view swizzle does not apply to the result.
+                // FETCH4 orders them yzxw, like `textureGather`'s xyzw.
+                let name = self.temp();
+                self.line(&format!("let {name} = ({bits}).zxyw;"));
+                self.write_tex_result(op, &name);
+            }
             _ => {
                 let call = self.sample_call(op, signature, &tex_name, &sampler_name);
                 let bits = self.texel_bits(signature, &call);
@@ -680,7 +693,19 @@ impl<'a> Translator<'a> {
                 format!("textureSampleGrad({tex_name}, {sampler_name}, {coords}, {h}, {v}{offset})")
             }
             tex::FETCH4 if signature.dim == TextureDim::D2 => {
-                format!("textureGather(0, {tex_name}, {sampler_name}, {coords}{offset})")
+                // Like Cemu, a small bias against rounding down when point sampling.
+                let coords = format!("{coords} + vec2<f32>(0.0001)");
+                if signature.kind == TextureKind::Depth {
+                    format!("textureGather({tex_name}, {sampler_name}, {coords}{offset})")
+                } else {
+                    let channel = match signature.comp_sel[0] {
+                        c @ 0..=3 => c,
+                        _ => 0,
+                    };
+                    format!(
+                        "textureGather({channel}, {tex_name}, {sampler_name}, {coords}{offset})"
+                    )
+                }
             }
             tex::SAMPLE_C | tex::SAMPLE_C_L | tex::SAMPLE_C_LZ => {
                 let reference_slot = if op.opcode == tex::SAMPLE_C_L { 2 } else { 3 };

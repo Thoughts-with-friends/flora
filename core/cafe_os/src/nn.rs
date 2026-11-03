@@ -4,6 +4,7 @@
 //! single local user and everything else stays at its "not connected" default
 //! (unimplemented imports return 0, which `nn::Result` reads as success).
 use wiiu_hle_macros::hle_export;
+use wiiu_peripherals::VpadButtons;
 
 use crate::{
     coreinit::fs::mutate::PERSISTENT_ID,
@@ -69,33 +70,132 @@ fn act_get_mii_name(ctx: &mut HleContext<'_>, out: u32) -> Result<u32, HleError>
     Ok(0)
 }
 
-/// `WPAD_ERROR_NO_CONTROLLER`: only the GamePad is connected.
+/// `WPAD_ERROR_NO_CONTROLLER`: nothing on this channel.
 const WPAD_NO_CONTROLLER: i32 = -1;
+/// `KPAD_READ_ERR_NO_SAMPLE_DATA`.
+const KPAD_NO_SAMPLE_DATA: i32 = -1;
 /// `KPAD_READ_ERR_NO_CONTROLLER`.
 const KPAD_NO_CONTROLLER: i32 = -2;
+/// `WPAD_EXT_DEV_NOT_FOUND`: what `WPADProbe` reports for an empty channel.
+const WPAD_DEV_NOT_FOUND: u32 = 0xFD;
+/// `WPAD_DEV_URCC`: the Wii U Pro Controller.
+const WPAD_DEV_PRO: u8 = 31;
+/// `WPAD_FMT_URCC`.
+const WPAD_FORMAT_PRO: u8 = 22;
+/// Channels `WPAD` serves.
+pub const PRO_CHANNELS: usize = 4;
+/// A controller delivers a new sample at most this often; titles read until there is none.
+const KPAD_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+/// `sizeof(KPADStatus)`.
+const KPAD_STATUS_SIZE: u32 = 0xF0;
+
+/// Offsets inside `KPADStatus`.
+mod kpad {
+    pub const DEVICE: u32 = 0x5C;
+    pub const FORMAT: u32 = 0x5F;
+    pub const PRO_HOLD: u32 = 0x60;
+    pub const PRO_TRIGGER: u32 = 0x64;
+    pub const PRO_RELEASE: u32 = 0x68;
+    pub const PRO_LEFT_STICK: u32 = 0x6C;
+    pub const PRO_RIGHT_STICK: u32 = 0x74;
+    /// Wired: the battery never runs out.
+    pub const PRO_CABLE: u32 = 0x80;
+}
+
+/// GamePad buttons to the bits of the Pro Controller.
+fn pro_buttons(held: VpadButtons) -> u32 {
+    const MAP: [(VpadButtons, u32); 17] = [
+        (VpadButtons::UP, 0x1),
+        (VpadButtons::LEFT, 0x2),
+        (VpadButtons::ZR, 0x4),
+        (VpadButtons::X, 0x8),
+        (VpadButtons::A, 0x10),
+        (VpadButtons::Y, 0x20),
+        (VpadButtons::B, 0x40),
+        (VpadButtons::ZL, 0x80),
+        (VpadButtons::R, 0x200),
+        (VpadButtons::PLUS, 0x400),
+        (VpadButtons::HOME, 0x800),
+        (VpadButtons::MINUS, 0x1000),
+        (VpadButtons::L, 0x2000),
+        (VpadButtons::DOWN, 0x4000),
+        (VpadButtons::RIGHT, 0x8000),
+        (VpadButtons::STICK_R, 0x1_0000),
+        (VpadButtons::STICK_L, 0x2_0000),
+    ];
+    MAP.iter().filter(|(button, _)| held.contains(*button)).fold(0, |bits, (_, bit)| bits | bit)
+}
 /// Work area `KPADSetMplsWorkarea` expects.
 const KPAD_MPLS_WORK_SIZE: u32 = 0x5FE0;
 
 #[hle_export(lib = "padscore", name = "WPADProbe")]
-fn wpad_probe(ctx: &mut HleContext<'_>, _channel: u32, extension: u32) -> Result<i32, HleError> {
-    if extension != 0 {
-        ctx.memory.write_u32(extension, 0xFD)?;
+fn wpad_probe(ctx: &mut HleContext<'_>, channel: u32, device: u32) -> Result<i32, HleError> {
+    let connected = ctx.os.pro_controllers.get(channel as usize).is_some_and(Option::is_some);
+    if device != 0 {
+        let kind = if connected { u32::from(WPAD_DEV_PRO) } else { WPAD_DEV_NOT_FOUND };
+        ctx.memory.write_u32(device, kind)?;
     }
-    Ok(WPAD_NO_CONTROLLER)
+    Ok(if connected { 0 } else { WPAD_NO_CONTROLLER })
+}
+
+/// Fills `buffer` with one sample of `channel`; returns the samples written and the error.
+fn kpad_read(
+    ctx: &mut HleContext<'_>,
+    channel: u32,
+    buffer: u32,
+    count: u32,
+) -> Result<(u32, i32), HleError> {
+    let index = channel as usize;
+    let Some(pad) = ctx.os.pro_controllers.get(index).copied().flatten() else {
+        return Ok((0, KPAD_NO_CONTROLLER));
+    };
+    let now = std::time::Instant::now();
+    let too_soon =
+        ctx.os.pro_last_read[index].is_some_and(|last| now - last < KPAD_SAMPLE_INTERVAL);
+    if count == 0 || buffer == 0 || too_soon {
+        return Ok((0, KPAD_NO_SAMPLE_DATA));
+    }
+    ctx.os.pro_last_read[index] = Some(now);
+    let (trigger, release) = ctx.os.pro_edges[index].update(pad.held);
+    ctx.memory.fill(buffer, KPAD_STATUS_SIZE, 0)?;
+    ctx.memory.write_u8(buffer + kpad::DEVICE, WPAD_DEV_PRO)?;
+    ctx.memory.write_u8(buffer + kpad::FORMAT, WPAD_FORMAT_PRO)?;
+    ctx.memory.write_u32(buffer + kpad::PRO_HOLD, pro_buttons(pad.held))?;
+    ctx.memory.write_u32(buffer + kpad::PRO_TRIGGER, pro_buttons(trigger))?;
+    ctx.memory.write_u32(buffer + kpad::PRO_RELEASE, pro_buttons(release))?;
+    for (at, stick) in
+        [(kpad::PRO_LEFT_STICK, pad.left_stick), (kpad::PRO_RIGHT_STICK, pad.right_stick)]
+    {
+        ctx.memory.write_f32(buffer + at, stick.x)?;
+        ctx.memory.write_f32(buffer + at + 4, stick.y)?;
+    }
+    ctx.memory.write_u32(buffer + kpad::PRO_CABLE, 1)?;
+    Ok((1, 0))
 }
 
 #[hle_export(lib = "padscore", name = "KPADReadEx")]
 fn kpad_read_ex(
     ctx: &mut HleContext<'_>,
-    _channel: u32,
-    _buffer: u32,
-    _count: u32,
+    channel: u32,
+    buffer: u32,
+    count: u32,
     error: u32,
 ) -> Result<u32, HleError> {
+    let (samples, result) = kpad_read(ctx, channel, buffer, count)?;
     if error != 0 {
-        ctx.memory.write_u32(error, KPAD_NO_CONTROLLER.cast_unsigned())?;
+        ctx.memory.write_u32(error, result.cast_unsigned())?;
     }
-    Ok(0)
+    Ok(samples)
+}
+
+#[hle_export(lib = "padscore", name = "KPADRead")]
+fn kpad_read_plain(
+    ctx: &mut HleContext<'_>,
+    channel: u32,
+    buffer: u32,
+    count: u32,
+) -> Result<u32, HleError> {
+    Ok(kpad_read(ctx, channel, buffer, count)?.0)
 }
 
 #[hle_export(lib = "padscore", name = "KPADGetMplsWorkSize")]
@@ -116,5 +216,6 @@ pub const EXPORTS: &[HleExport] = &[
     ACT_GET_MII_NAME,
     WPAD_PROBE,
     KPAD_READ_EX,
+    KPAD_READ_PLAIN,
     KPAD_GET_MPLS_WORK_SIZE,
 ];

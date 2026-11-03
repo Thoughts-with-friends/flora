@@ -193,12 +193,19 @@ pub(super) fn execute<B: Bus>(op: Opcode, i: Instr, s: &mut CpuState, bus: &mut 
         O::Sthbrx => bus.write_u16(ea_x(s, i), (s.gpr[rd] as u16).swap_bytes())?,
         O::Lwarx => {
             let ea = ea_x(s, i);
-            s.gpr[rd] = bus.read_u32(ea)?;
-            s.reservation = Some(ea);
+            let value = bus.read_u32(ea)?;
+            s.gpr[rd] = value;
+            s.reservation = Some((ea, value));
         }
         O::Stwcx => {
             let ea = ea_x(s, i);
-            let success = s.reservation.take() == Some(ea);
+            // Threads time-share one host core and each keeps its reservation across a switch:
+            // like Cemu, a word changed meanwhile fails the store, or that update would be lost.
+            let reserved = s.reservation.take();
+            let success = match reserved {
+                Some((address, value)) if address == ea => bus.read_u32(ea)? == value,
+                _ => false,
+            };
             if success {
                 bus.write_u32(ea, s.gpr[rd])?;
             }
@@ -277,6 +284,12 @@ mod tests {
         assert_eq!(bus.mem[0x4003], 99);
         run_one(&mut s, &mut bus, x(31, 4, 2, 3, 150, true)); // reservation gone
         assert_eq!(s.cr_field(0), 0);
+
+        run_one(&mut s, &mut bus, x(31, 4, 2, 3, 20, false)); // lwarx r4, 0, r3
+        bus.mem[0x4003] = 7; // another thread writes while this one is switched out
+        run_one(&mut s, &mut bus, x(31, 4, 2, 3, 150, true)); // stwcx. r4, 0, r3
+        assert_eq!(s.cr_field(0), 0, "the word changed");
+        assert_eq!(bus.mem[0x4003], 7);
     }
 
     #[test]

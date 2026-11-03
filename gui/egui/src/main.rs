@@ -8,6 +8,7 @@
 mod app;
 mod fonts;
 mod launcher;
+mod netplay;
 mod presenter;
 
 use std::path::PathBuf;

@@ -77,12 +77,15 @@ impl Emulator {
     /// Resets the machine and starts `rpx` on the main core.
     fn boot(&mut self, name: &str, rpx: &[u8], iosu: Iosu) -> Result<(), EmuError> {
         let gamepad = self.os.gamepad;
+        let pro_controllers = self.os.pro_controllers;
         self.memory = Memory::with_game_layout()?;
         self.cores = (0..CORE_COUNT as u32).map(CpuState::new).collect();
         self.jit = wiiu_cpu::Jit::new();
         self.os = CafeOs::new();
         self.os.gamepad = gamepad;
+        self.os.pro_controllers = pro_controllers;
         self.os.gx2.forced_swap_interval = self.config.swap_interval;
+        self.os.gx2.min_swap_interval = self.config.min_swap_interval.unwrap_or(0);
         self.os.coreinit.shared_data.fonts_dir.clone_from(&self.config.fonts_dir);
         self.gpu = Gpu::new();
         self.gpu.reset_renderer();

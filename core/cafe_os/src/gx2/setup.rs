@@ -79,6 +79,22 @@ fn gx2_get_geometry_shader_gprs(ctx: &mut HleContext<'_>, shader: u32) -> Result
     Ok(resources(ctx, shader)? & 0xFF)
 }
 
+#[hle_export(lib = "gx2", name = "GX2CalcGeometryShaderInputRingBufferSize")]
+const fn gx2_calc_geometry_shader_input_ring_buffer_size(
+    _ctx: &mut HleContext<'_>,
+    item_size: u32,
+) -> u32 {
+    item_size.wrapping_mul(4).wrapping_mul(0x1000)
+}
+
+#[hle_export(lib = "gx2", name = "GX2CalcGeometryShaderOutputRingBufferSize")]
+const fn gx2_calc_geometry_shader_output_ring_buffer_size(
+    _ctx: &mut HleContext<'_>,
+    item_size: u32,
+) -> u32 {
+    item_size.wrapping_mul(4).wrapping_mul(0x1000)
+}
+
 #[hle_export(lib = "gx2", name = "GX2GetGeometryShaderStackEntries")]
 fn gx2_get_geometry_shader_stack_entries(
     ctx: &mut HleContext<'_>,

@@ -12,8 +12,8 @@ const CACHE_SIZE: u32 = 0x4000;
 /// Distance between the windows of consecutive cores.
 const CORE_STRIDE: u32 = 0x4_0000;
 const BLOCK_COUNT: usize = (CACHE_SIZE / GRANULARITY) as usize;
-/// `LCLoadDMABlocks` counts in cache lines; zero stands for 128 of them.
-const DMA_BLOCK_SIZE: u32 = 64;
+/// `LCLoadDMABlocks` counts in 32-byte blocks; zero stands for 128 of them.
+const DMA_BLOCK_SIZE: u32 = 32;
 const DMA_MAX_BLOCKS: u32 = 128;
 
 /// Allocation state of every core's window.
@@ -155,7 +155,7 @@ fn lc_wait_dma_queue(_ctx: &mut HleContext<'_>, _length: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hle::test_env::TestEnv;
+    use crate::hle::test_env::{SCRATCH, TestEnv};
 
     #[test]
     fn allocates_blocks_and_reuses_freed_ones() {
@@ -167,5 +167,17 @@ mod tests {
         env.call("coreinit", "LCDealloc", &[first]);
         assert_eq!(env.call("coreinit", "LCAlloc", &[0x200]), first);
         assert_eq!(env.call("coreinit", "LCAlloc", &[CACHE_SIZE + 1]), 0);
+    }
+
+    #[test]
+    fn dma_copies_exactly_the_blocks_asked_for() {
+        let mut env = TestEnv::new();
+        env.memory.map(LOCKED_CACHE).unwrap();
+        let cache = env.call("coreinit", "LCAlloc", &[0x200]);
+        env.memory.fill(cache, 0x80, 0xAA).unwrap();
+        env.memory.fill(SCRATCH, 0x80, 0x55).unwrap();
+        env.call("coreinit", "LCStoreDMABlocks", &[SCRATCH, cache, 2]);
+        assert_eq!(env.memory.read_u8(SCRATCH + 0x3F).unwrap(), 0xAA);
+        assert_eq!(env.memory.read_u8(SCRATCH + 0x40).unwrap(), 0x55, "nothing past 2 blocks");
     }
 }

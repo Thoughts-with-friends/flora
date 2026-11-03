@@ -137,6 +137,8 @@ pub fn host_format(gx2_format: u32) -> HostFormat {
         0x10D => H::R32Uint,
         0x30D => H::R32Sint,
         0x80E => H::R32Float,
+        // `T_R24_UNORM_X8` and `T_R24_FLOAT_X8`: depth read as a texture, its value in red.
+        0x011 | 0x811 => H::R32Float,
         0x11D => H::Rg32Uint,
         0x31D => H::Rg32Sint,
         0x81E => H::Rg32Float,
@@ -1706,6 +1708,13 @@ fn decode_mips(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_read_as_a_texture_keeps_its_precision() {
+        assert_eq!(host_format(0x011), HostFormat::R32Float);
+        assert_eq!(host_format(0x811), HostFormat::R32Float);
+        assert_eq!(host_depth_format(0x011), HostFormat::Depth24PlusStencil8);
+    }
 
     #[test]
     fn a_program_is_translated_once_whatever_earlier_draws_left_in_the_registers() {

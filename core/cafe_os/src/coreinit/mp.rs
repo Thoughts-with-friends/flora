@@ -145,19 +145,29 @@ fn mp_init_task_q(
     Ok(())
 }
 
+/// Stops the queue and waits for the tasks still running, whose caller frees them next.
 #[hle_export(lib = "coreinit", name = "MPTermTaskQ")]
-fn mp_term_task_q(_ctx: &mut HleContext<'_>, _queue: u32) -> bool {
-    true
+fn mp_term_task_q(ctx: &mut HleContext<'_>, address: u32) -> Result<bool, HleError> {
+    if ctx.memory.read_u32(address + queue::STATE)? == queue_state::RUN {
+        ctx.memory.write_u32(address + queue::STATE, queue_state::STOP)?;
+    }
+    if ctx.memory.read_u32(address + queue::RUNNING)? != 0 {
+        ctx.cpu.pc = ctx.cpu.pc.wrapping_sub(4);
+        ctx.os.coreinit.threads.request(super::thread::Reschedule::Yield);
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Rewinds the queue so its tasks can run again.
 #[hle_export(lib = "coreinit", name = "MPResetTaskQ")]
 fn mp_reset_task_q(ctx: &mut HleContext<'_>, address: u32) -> Result<bool, HleError> {
     let state = ctx.memory.read_u32(address + queue::STATE)?;
-    if !matches!(state, queue_state::INIT | queue_state::STOP | queue_state::DONE) {
+    if !matches!(state, queue_state::STOP | queue_state::DONE) {
         return Ok(false);
     }
-    let count = ctx.memory.read_u32(address + queue::TASK_COUNT)?;
+    let count = ctx.memory.read_u32(address + queue::END + SLOT)?;
+    ctx.memory.write_u32(address + queue::TASK_COUNT, count)?;
     let tasks = ctx.memory.read_u32(address + queue::TASKS)?;
     for i in 0..count {
         let entry = ctx.memory.read_u32(tasks + 4 * i)?;
@@ -171,7 +181,6 @@ fn mp_reset_task_q(ctx: &mut HleContext<'_>, address: u32) -> Result<bool, HleEr
     ctx.memory.write_u32(address + queue::RUNNING, 0)?;
     ctx.memory.write_u32(address + queue::DONE + SLOT, 0)?;
     ctx.memory.write_u32(address + queue::NEXT + SLOT, 0)?;
-    ctx.memory.write_u32(address + queue::END + SLOT, count)?;
     Ok(true)
 }
 

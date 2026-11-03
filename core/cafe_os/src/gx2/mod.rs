@@ -59,6 +59,8 @@ pub struct Gx2State {
     pub swap_interval: u32,
     /// Replaces the interval the title asks for (`Config::swap_interval`).
     pub forced_swap_interval: Option<u32>,
+    /// The title gets at least this interval (`Config::min_swap_interval`).
+    pub min_swap_interval: u32,
     /// Timebase value of the last flip shown.
     pub last_flip_time: u64,
     /// Timebase value of the last vertical blank.
@@ -88,6 +90,7 @@ impl Default for Gx2State {
             flips_executed: 0,
             swap_interval: 1,
             forced_swap_interval: None,
+            min_swap_interval: 0,
             last_flip_time: 0,
             last_vsync_time: 0,
             vsync_count: 0,
@@ -147,6 +150,11 @@ impl Gx2State {
         self.lists.remove(&self.active_thread)
     }
 
+    /// `(address, capacity)` of the list the active thread is recording.
+    pub(crate) fn current_display_list(&self) -> Option<(u32, u32)> {
+        self.lists.get(&self.active_thread).map(|list| (list.address, list.capacity))
+    }
+
     pub(crate) fn recording(&self) -> bool {
         self.lists.contains_key(&self.active_thread)
     }
@@ -197,6 +205,7 @@ pub const EXPORTS: &[HleExport] = &[
     display::GX2_RESOLVE_AA_COLOR_BUFFER,
     display::GX2_CONVERT_DEPTH_BUFFER_TO_TEXTURE_SURFACE,
     display::GX2_GET_SYSTEM_TV_SCAN_MODE,
+    display::GX2_GET_SYSTEM_TV_ASPECT_RATIO,
     display::GX2_IS_VIDEO_OUT_READY,
     display::GX2_GET_GPU_TIMEOUT,
     render_target::GX2_INIT_COLOR_BUFFER_REGS,
@@ -216,6 +225,8 @@ pub const EXPORTS: &[HleExport] = &[
     setup::GX2_GET_PIXEL_SHADER_STACK_ENTRIES,
     setup::GX2_GET_GEOMETRY_SHADER_GPRS,
     setup::GX2_GET_GEOMETRY_SHADER_STACK_ENTRIES,
+    setup::GX2_CALC_GEOMETRY_SHADER_INPUT_RING_BUFFER_SIZE,
+    setup::GX2_CALC_GEOMETRY_SHADER_OUTPUT_RING_BUFFER_SIZE,
     setup::GX2_PERF_INIT,
     setup::GX2_PERF_SET_COLLECTION_METHOD,
     setup::GX2_PERF_METRICS_CLEAR,

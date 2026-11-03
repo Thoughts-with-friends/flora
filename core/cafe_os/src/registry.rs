@@ -57,7 +57,10 @@ pub enum Entry {
 type Key = (String, String);
 
 fn key(library: &str, name: &str) -> Key {
-    (library.trim_end_matches(".rpl").to_ascii_lowercase(), name.to_owned())
+    let library = library.trim_end_matches(".rpl").to_ascii_lowercase();
+    // Older titles import the same audio API under the library's first name.
+    let library = if library == "snd_core" { "sndcore2".to_owned() } else { library };
+    (library, name.to_owned())
 }
 
 /// The registry of every HLE function and data export.
