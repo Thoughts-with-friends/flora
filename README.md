@@ -27,45 +27,85 @@ cargo xtask test
 cargo xtask icon   # gui/egui/assets/shocora.svg -> shocora.png, shocora.ico
 ```
 
-## Implimentation
+## Features & Configuration Guide
 
-- `wgpu` picks the best backend (DX12 / Metal / Vulkan / GL), `vulkan` forces
-  wgpu's Vulkan backend, `opengl` uses native OpenGL through glow.
-- Settings are stored in `shocora.toml` in the working directory.
-- ROM directories are listed in `roms.json` (git-ignored; copy
-  `roms.example.json`). Each directory may hold extracted titles
-  (`<name>/code`, `content`, `meta`) and `.rpx` files; they appear in the
-  "Games" panel, double-click to boot.
-- Headless boot for debugging:
-  `cargo run --release -p shocora_tests --example headless -- <TITLE_DIR> [FRAMES]`
-- Default keys: A=`X` B=`Z` X=`S` Y=`A` L=`Q` R=`W` ZL=`1` ZR=`2`
-  +=`Enter` −=`Backspace` D-pad=arrows, left stick=`IJKL`.
-- Controllers work through [gilrs](https://gitlab.com/gilrs-project/gilrs) as soon as they
-  are plugged in; buttons go by position (`East` is the Wii U's A). `[pad_bindings]` in
-  `shocora.toml` changes the mapping.
-- Settings has a page each for general, graphics, input and netplay settings.
-- Settings > General changes the language. The texts are in `lang/translation.eng.json` and
-  `lang/translation.jpn.json`, built into the program; a `lang` folder in the working
-  directory takes precedence, so they can be edited without rebuilding.
-- Settings > Graphics > 3D resolution draws the title's pictures 2 to 8 times larger, up to
-  10240 pixels wide (8x at 720p, 5x at 1080p). This takes a lot of video memory.
-- Settings > Graphics > Screen upscaling runs xBRZ on the GPU at 2x to 6x. It is GPL-3.0 code behind
-  the default `xbrz` feature of `shocora_render`.
-- Settings > Graphics > Frame rate > Force 60 fps replaces the title's swap interval. Titles made for
-  30 fps whose logic counts frames, such as Twilight Princess HD, then run at up to
-  double speed; the default keeps the frame rate the title asks for. Max 30 fps caps
-  titles that run too fast and leaves slower ones alone.
-- Tab, pressing the left stick, or the status bar's speed cycles the game speed:
-  1x, 2x, 3x, 4x, 0.5x. Sound follows like a tape, so its pitch changes with the speed. The
-  left stick's press then does not reach the title.
-- Netplay lets a second player join over the local network. The host enters this PC's IP
-  address (`192.168.1.10`, or `10.1.2.3/16` for a wider network) and starts hosting on port
-  47800; only guests from that network get in, and a password is optional. The guest enters
-  the host's address and plays as a Pro Controller, seeing the TV at 640 x 360, 20 fps and
-  hearing 16 kHz sound. Each side pings once a second; 3 s of silence ends the link and the
-  guest keeps trying to reconnect. The password itself is never sent, but nothing is
-  encrypted: use it on networks you trust.
-- The driver's compiled shaders are kept in `shader_cache/`, so later runs stutter less.
+### 🎨 Graphics & Display
+
+- **Graphics Backends**:
+  - `wgpu` (default): Automatically selects the best backend (DX12 / Metal / Vulkan / GL).
+  - `vulkan`: Forces wgpu's Vulkan backend.
+  - `opengl`: Uses native OpenGL through `glow`.
+- **3D Resolution**: Scalable from **2x to 8x** (up to 10,240 pixels wide).
+  - *Examples*: 8x at 720p, 5x at 1080p.
+  - *Note*: Significantly increases VRAM usage.
+- **Screen Upscaling**: Runs xBRZ on the GPU at **2x to 6x**.
+  - Included under the default `xbrz` feature of `shocora_render` (GPL-3.0 licensed).
+- **Frame Rate Control**:
+  - **Force 60 fps**: Overrides the title's native swap interval.
+    - *Warning*: Titles logic-bound to 30 fps (e.g., *Twilight Princess HD*) will run up to double speed.
+  - **Default**: Preserves the target frame rate requested by the title.
+  - **Max 30 fps**: Caps titles that run excessively fast while leaving slower ones untouched.
+
+---
+
+### 🎮 Controls & Input
+
+#### Default Keybindings
+
+| Action / Button     | Keyboard Key                 |
+| :------------------ | :--------------------------- |
+| **A / B / X / Y**   | `X` / `Z` / `S` / `A`        |
+| **L / R / ZL / ZR** | `Q` / `W` / `1` / `2`        |
+| **+ / −**           | `Enter` / `Backspace`        |
+| **D-Pad**           | Arrow Keys (`↑` `↓` `←` `→`) |
+| **Left Stick**      | `I` `J` `K` `L`              |
+
+#### Controller & Hotkeys
+
+- **Gamepad Support**: Powered by [gilrs](https://gitlab.com/gilrs-project/gilrs) with plug-and-play functionality.
+  - Mapped by physical button position (`East` corresponds to the Wii U's **A** button).
+  - Custom mappings can be configured under `[pad_bindings]` in `shocora.toml`.
+- **Game Speed Toggle**: Cycle through speeds (`1x` → `2x` → `3x` → `4x` → `0.5x`) using `Tab`, pressing the Left Stick, or clicking the speed indicator on the status bar.
+  - Audio pitch dynamically scales with speed (tape-style playback).
+  - *Note*: Pressing the Left Stick to change speed prevents the input from reaching the game.
+
+---
+
+### 📂 Setup & File Structure
+
+- **Configuration File**: Settings are saved in `shocora.toml` within the working directory.
+- **ROM Directory Management**: Listed in `roms.json` (git-ignored; template available as `roms.example.json`).
+  - Supports extracted titles (`<name>/code`, `content`, `meta`) and `.rpx` files.
+  - Detected games appear in the **Games** panel; double-click to boot.
+- **Shader Cache**: Compiled GPU shaders are saved in `shader_cache/` to minimize stuttering on subsequent runs.
+- **Localization**: Change languages in **Settings > General**.
+  - Built-in translations: `lang/translation.eng.json` and `lang/translation.jpn.json`.
+  - Placing a custom `lang` folder in the working directory takes precedence, allowing translation edits without rebuilding.
+
+---
+
+### 🌐 Local Network Netplay
+
+Allows a second player to join via local network.
+
+- **Host Setup**: Enter the host PC's IP address (e.g., `192.168.1.10` or `10.1.2.3/16` for wider subnets) and host on port `47800`.
+  - Access is limited to guests within the specified network.
+  - Password protection is optional.
+- **Guest Experience**: Connect to the host's IP to play as a **Pro Controller**.
+  - **Video**: 640 × 360 resolution at 20 fps.
+  - **Audio**: 16 kHz stream.
+- **Connection Handling**: Ping checks occur once per second. If no response is received for 3 seconds, the connection closes and the guest continuously attempts reconnection.
+- **Security Warning**: While passwords are not sent in plain text, network traffic is **unencrypted**. Only use Netplay on trusted networks.
+
+---
+
+### 🛠 Debugging
+
+Run headless boots for debugging via command line:
+
+```bash
+cargo run --release -p shocora_tests --example headless -- <TITLE_DIR> [FRAMES]
+```
 
 ## References
 
