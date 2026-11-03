@@ -230,12 +230,14 @@ impl Launcher {
         let tile = 128.0 * scale;
         let mut balloon = None;
         let mut clicked_empty = false;
+
         for (index, slot) in slots.iter().skip(self.page * PAGE_SLOTS).take(PAGE_SLOTS).enumerate()
         {
             let (column, row) = (index % COLUMNS, index / COLUMNS);
             let center =
                 at((column as f32).mul_add(156.0, 228.0), (row as f32).mul_add(142.0, 148.0));
             let rect = Rect::from_center_size(center, Vec2::splat(tile));
+
             match *slot {
                 Slot::Game(game) => {
                     let response = ui.interact(
@@ -291,12 +293,14 @@ impl Launcher {
                 }
             }
         }
+
         if clicked_empty {
             self.selected = None;
         }
         if let Some((rect, name)) = balloon {
             paint_balloon(ui, rect, name, scale);
         }
+
         self.page_arrow(ui, &painter, at(1012.0, 290.0), scale, pages);
         paint_dock(&painter, &at, scale);
         paint_transfer(&painter, at(1014.0, 54.0), scale);
@@ -335,6 +339,7 @@ impl Launcher {
                 0
             }
         });
+
         if step != 0 {
             let next = self.selected.map_or(0, |selected| (selected + step) % games.len());
             self.selected = Some(next);
@@ -342,6 +347,7 @@ impl Launcher {
                 self.page = position / PAGE_SLOTS;
             }
         }
+
         if let Some(selected) = self.selected {
             if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 let center = ui.available_rect_before_wrap().center();
@@ -383,6 +389,7 @@ impl Launcher {
         let rect = Rect::from_center_size(center, vec2(70.0, 130.0) * scale);
         let response = ui.interact(rect, ui.scope_id().with("launcher next page"), Sense::click());
         let alpha = if response.hovered() { 255 } else { 190 };
+
         painter.add(Shape::convex_polygon(
             vec![
                 center + vec2(-28.0, -60.0) * scale,
@@ -392,6 +399,7 @@ impl Launcher {
             Color32::from_white_alpha(alpha),
             Stroke::new(1.5 * scale, Color32::from_gray(200)),
         ));
+
         if response.clicked() {
             self.page = (self.page + 1) % pages;
         }
@@ -403,6 +411,7 @@ impl Launcher {
         let screen = ctx.content_rect();
         let painter =
             ctx.layer_painter(LayerId::new(Order::Foreground, Id::NULL.with("launcher wave")));
+
         match &self.transition {
             None => return,
             Some(Transition::Launch { from, started, .. }) => {
@@ -430,12 +439,14 @@ fn paint_wave(painter: &Painter, screen: Rect, from: Pos2, t: f32) {
             .iter()
             .map(|corner| corner.distance(from))
             .fold(0.0, f32::max);
+
     // White spreads behind the front and takes over at the end.
     painter.circle_filled(
         from,
         reach * ease_out(t),
         Color32::from_white_alpha((t * t * 255.0) as u8),
     );
+
     for ring in 0..4 {
         let lag = ring as f32 * 0.09;
         let local = ((t - lag) / (1.0 - lag)).clamp(0.0, 1.0);

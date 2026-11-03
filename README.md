@@ -21,6 +21,14 @@ software of the console. Its design references [Cemu](https://github.com/cemu-pr
 
 ## Quick Start
 
+- Build
+
+```text
+cargo build --release
+```
+
+- Utils
+
 ```text
 cargo xtask run [--graphics wgpu|vulkan|opengl] [-- TITLE_DIR | FILE.rpx]
 cargo xtask test
@@ -116,5 +124,5 @@ cargo run --release -p shocora_tests --example headless -- <TITLE_DIR> [FRAMES]
 
 ## License
 
-SPDX-FileCopyrightText: (C) 2026 Cemu Project
-SPDX-License-Identifier: MPL-2.0
+- SPDX-FileCopyrightText: (C) 2026 Cemu Project
+- SPDX-License-Identifier: MPL-2.0

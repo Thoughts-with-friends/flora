@@ -30,21 +30,28 @@ impl<R: Read + Seek> WuxReader<R> {
     pub fn new(mut inner: R) -> Result<Self, TitleError> {
         let mut header = [0_u8; 0x20];
         inner.read_exact(&mut header).map_err(|_| TitleError::BadWuxMagic)?;
+
         let u32_at =
             |o: usize| u32::from_le_bytes([header[o], header[o + 1], header[o + 2], header[o + 3]]);
+
         if u32_at(0) != MAGIC0 || u32_at(4) != MAGIC1 {
             return Err(TitleError::BadWuxMagic);
         }
+
         let sector_size = u64::from(u32_at(8));
         let uncompressed_size = u64::from(u32_at(0x10)) | (u64::from(u32_at(0x14)) << 32);
+
         if sector_size == 0 {
             return Err(TitleError::CorruptWux);
         }
+
         let sector_count = usize::try_from(uncompressed_size.div_ceil(sector_size))
             .map_err(|_| TitleError::CorruptWux)?;
         let mut raw = vec![0_u8; sector_count * 4];
+
         inner.seek(SeekFrom::Start(INDEX_OFFSET)).map_err(|_| TitleError::CorruptWux)?;
         inner.read_exact(&mut raw).map_err(|_| TitleError::CorruptWux)?;
+
         let index = raw
             .as_chunks::<4>()
             .0
@@ -52,6 +59,7 @@ impl<R: Read + Seek> WuxReader<R> {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let data_offset = (INDEX_OFFSET + raw.len() as u64).next_multiple_of(sector_size);
+
         Ok(Self { inner, sector_size, uncompressed_size, index, data_offset })
     }
 
