@@ -14,5 +14,6 @@ mod error;
 pub use emulator::{EmuStats, Emulator, Status, emu_config::Config};
 pub use error::EmuError;
 pub use wiiu_gpu::{RenderCommand, Screen};
+pub mod cheat;
 pub use wiiu_peripherals::{GamePadState, VpadButtons};
 pub use wiiu_title::TitleInfo;

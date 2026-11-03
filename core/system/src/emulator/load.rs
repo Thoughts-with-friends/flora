@@ -29,6 +29,9 @@ impl Emulator {
         self.boot(&name, &rpx, Iosu::new(vfs))?;
         self.title = Some(info);
         self.boot_source = Some(BootSource::Title(path.to_owned()));
+        if let Err(error) = self.reload_cheats() {
+            log::warn!("{error}");
+        }
         Ok(())
     }
 

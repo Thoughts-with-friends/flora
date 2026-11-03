@@ -246,7 +246,7 @@ impl RplBuilder {
 
         let mut info = vec![0_u8; 0x60];
         let mut put = |index: usize, value: u32| {
-            info[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes())
+            info[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
         };
         put(0, 0xCAFE_0402);
         put(1, self.text.len() as u32);

@@ -243,14 +243,13 @@ fn mip_level_tile_mode(
         // GetFlagNo1DTiledMSAA() is set in Latte's configuration.
         TM_1D_TILED_THIN1 if samples > 1 => TM_2D_TILED_THIN1,
         TM_1D_TILED_THICK => {
-            let mut m = base;
-            if samples > 1 || is_depth {
-                m = TM_1D_TILED_THIN1;
-            }
             if samples == 2 || samples == 4 {
-                m = TM_2D_TILED_THICK;
+                TM_2D_TILED_THICK
+            } else if samples > 1 || is_depth {
+                TM_1D_TILED_THIN1
+            } else {
+                base
             }
-            m
         }
         TM_2D_TILED_THIN2 if 2 * PIPE_INTERLEAVE_BYTES > SPLIT_SIZE => TM_2D_TILED_THIN1,
         TM_2D_TILED_THIN4 if 4 * PIPE_INTERLEAVE_BYTES > SPLIT_SIZE => TM_2D_TILED_THIN2,
@@ -361,13 +360,7 @@ fn alignments_macro_tiled(tile_mode: u32, mut bpp: u32, samples: u32) -> (u32, u
 pub(crate) fn bank_swapped_width(tile_mode: u32, bpp: u32, mut samples: u32, pitch: u32) -> u32 {
     let bytes_per_sample = 8 * bpp;
     let samples_per_tile = SPLIT_SIZE / bytes_per_sample;
-    let mut slices_per_tile = 1;
-    if samples_per_tile != 0 {
-        slices_per_tile = samples / samples_per_tile;
-        if slices_per_tile == 0 {
-            slices_per_tile = 1;
-        }
-    }
+    let slices_per_tile = samples.checked_div(samples_per_tile).map_or(1, |slices| slices.max(1));
     if is_thick_and_macro_tiled(tile_mode) {
         samples = 4;
     }

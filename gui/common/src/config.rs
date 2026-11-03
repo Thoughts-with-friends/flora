@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub swap_interval: Option<u32>,
     /// Backdrop of the start screen, as RGBA: alpha lets the picture behind it show.
     pub launcher_background: [u8; 4],
+    /// Generate a picture between frames: a title made for 30 fps shows at 60.
+    pub frame_generation: bool,
     /// Picture behind the start screen's color.
     pub launcher_image: Option<PathBuf>,
 }
@@ -42,6 +44,7 @@ impl Default for AppConfig {
             upscale: UpscaleConfig::default(),
             swap_interval: None,
             launcher_background: [231, 234, 237, 255],
+            frame_generation: false,
             launcher_image: None,
         }
     }

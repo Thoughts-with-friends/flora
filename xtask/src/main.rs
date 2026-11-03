@@ -1,10 +1,14 @@
 //! `cargo xtask <build|run|test> [--release] [--graphics wgpu|vulkan|opengl] [-- ARGS...]`
+//! `cargo xtask icon`: makes the PNG and ICO icons from `gui/egui/assets/shocora.svg`.
 //!
 //! Thin dispatcher so the common invocations are one short command.
+mod icon;
+
 use std::process::{Command, ExitCode};
 
 const USAGE: &str =
-    "usage: cargo xtask <build|run|test> [--release] [--graphics wgpu|vulkan|opengl] [-- ARGS...]";
+    "usage: cargo xtask <build|run|test> [--release] [--graphics wgpu|vulkan|opengl] [-- ARGS...]
+       cargo xtask icon";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -12,6 +16,16 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+
+    if task == "icon" {
+        return match icon::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let mut release = false;
     let mut passthrough = Vec::new();

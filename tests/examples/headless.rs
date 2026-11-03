@@ -20,6 +20,7 @@
 //! * `SHOCORA_WAV=file`: saves what the TV plays. Stays outside the repository unless you say otherwise.
 //! * `SHOCORA_CAPTURE="flip,dir,min_pixels"` (with `SHOCORA_SHOTS`): one frame draw by draw, then exit.
 //! * `SHOCORA_TRACE_UBO="first_flip,last_flip,file"`: uniform blocks of every draw, then exit.
+//! * `SHOCORA_FRAMEGEN`: generates frames; with `SHOCORA_SHOTS`, also saves them as `Gen*`.
 //! * `SHOCORA_RESET_AT=frame`: reboots the title at that frame, like the GUI's Reset.
 //! * `SHOCORA_TOUCH="frame,x,y,frames"`: touches the GamePad's screen (854 x 480 pixels).
 use std::{
@@ -75,6 +76,7 @@ fn create_renderer() -> Result<LatteRenderer, Box<dyn std::error::Error>> {
     let (device, queue) = pollster::block_on(request_device(&adapter))?;
     let mut renderer = LatteRenderer::new(device, queue);
     renderer.use_pipeline_cache(Path::new("shader_cache"), &adapter.get_info());
+    renderer.frame_gen_setting().set(std::env::var_os("SHOCORA_FRAMEGEN").is_some());
     Ok(renderer)
 }
 
@@ -166,7 +168,9 @@ fn capture_frame(
         {
             let before = last.get(&key);
             let count = rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
                 .filter(|(pixel, value)| {
                     before.is_none_or(|b| b[pixel * 4..pixel * 4 + 4] != **value)
@@ -381,7 +385,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if offset != 0 {
                                             if let Some(data) = arena.get(&offset) {
                                                 let floats: Vec<f32> = data
-                                                    .chunks_exact(4)
+                                                    .as_chunks::<4>()
+                                                    .0
+                                                    .iter()
                                                     .take(16)
                                                     .map(|b| {
                                                         f32::from_le_bytes([b[0], b[1], b[2], b[3]])
@@ -398,7 +404,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 for (name, offset) in [("vs", word(0)), ("ps", word(1))] {
                                     if let Some(data) = arena.get(&offset) {
                                         let floats: Vec<f32> = data
-                                            .chunks_exact(4)
+                                            .as_chunks::<4>()
+                                            .0
+                                            .iter()
                                             .take(32)
                                             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                                             .collect();
@@ -532,7 +540,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for block in 0..16 {
                             let Some(data) = ubo_arena.get(&word(8 + block)) else { continue };
                             let floats: Vec<String> = data
-                                .chunks_exact(4)
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
                                 .take(16)
                                 .map(|b| {
                                     format!("{:.3}", f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -575,6 +585,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for screen in Screen::ALL {
                         if let Some((width, height, rgba)) = renderer.read_screen(screen) {
                             let name = format!("{:?}_{:06}.png", screen, flips + new_flips);
+                            save_png(&dir.join(name), width, height, &rgba)?;
+                        }
+                        if let Some((width, height, rgba)) = renderer.read_generated(screen) {
+                            let name = format!("Gen{:?}_{:06}.png", screen, flips + new_flips);
                             save_png(&dir.join(name), width, height, &rgba)?;
                         }
                     }
@@ -710,6 +724,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("threads:");
     for line in emu.thread_report() {
         println!("  {line}");
+    }
+    if let Some(renderer) = &renderer {
+        println!("generated frames: {}", renderer.frame_gen_setting().images_generated());
     }
     println!("status: {:?}", emu.status());
     println!(

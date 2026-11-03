@@ -103,12 +103,13 @@ fn gx2_init_color_buffer_regs(ctx: &mut HleContext<'_>, buffer: u32) -> Result<(
     }
     ctx.memory.write_u32(buffer + field::CB_REG_INFO, reg_info)?;
 
-    let mut reg_view = 0;
-    if surface.tile_mode != tile_mode::TM_LINEAR_SPECIAL {
+    let reg_view = if surface.tile_mode == tile_mode::TM_LINEAR_SPECIAL {
+        0
+    } else {
         let first = ctx.memory.read_u32(buffer + field::VIEW_FIRST_SLICE)?;
         let count = ctx.memory.read_u32(buffer + field::VIEW_NUM_SLICES)?;
-        reg_view = (first & 0x7FF) | (((count + first).wrapping_sub(1) & 0x7FF) << 13);
-    }
+        (first & 0x7FF) | (((count + first).wrapping_sub(1) & 0x7FF) << 13)
+    };
     ctx.memory.write_u32(buffer + field::CB_REG_VIEW, reg_view)?;
     ctx.memory.write_u32(buffer + field::CB_REG_MASK, 0)?;
     Ok(())

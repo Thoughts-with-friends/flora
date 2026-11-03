@@ -4,7 +4,7 @@
 
 use wiiu_gpu::{
     addrlib,
-    command::{opcode, pm4::type3_header},
+    command::opcode,
     regs::{base, config, context as reg, resource},
 };
 use wiiu_hle_macros::hle_export;
@@ -582,10 +582,8 @@ fn gx2_init_texture_regs(ctx: &mut HleContext<'_>, tex: u32) -> Result<(), HleEr
         | ((comp_sel & 7) << 25)
         | ((view_first_mip & 0xF) << 28);
 
-    let mut last_level = view_first_mip + view_num_mips - 1;
-    if (1..=3).contains(&surface.aa) {
-        last_level = surface.aa;
-    }
+    let last_level =
+        if (1..=3).contains(&surface.aa) { surface.aa } else { view_first_mip + view_num_mips - 1 };
     let word5 = (last_level & 0xF)
         | ((view_first_slice & 0x1FFF) << 4)
         | (((view_first_slice + view_num_slices - 1) & 0x1FFF) << 17);
@@ -735,11 +733,6 @@ fn gx2_set_vertex_sampler_border_color(
         unit,
         [red, green, blue, alpha],
     );
-}
-
-/// `PM4` packets a guest-visible draw consists of are also useful for tests.
-pub(crate) const fn packet_header(op: u8, words: usize) -> u32 {
-    type3_header(op, words)
 }
 
 pub const EXPORTS: &[HleExport] = &[

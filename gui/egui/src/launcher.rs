@@ -197,7 +197,7 @@ impl Launcher {
     /// finished.
     pub fn show(
         &mut self,
-        ui: &mut egui::Ui,
+        ui: &egui::Ui,
         games: &[GameEntry],
         background: Color32,
         picture: Option<&Path>,
@@ -369,7 +369,7 @@ impl Launcher {
     /// The next page, if there is one, or back to the first.
     fn page_arrow(
         &mut self,
-        ui: &mut egui::Ui,
+        ui: &egui::Ui,
         painter: &Painter,
         center: Pos2,
         scale: f32,
@@ -441,10 +441,10 @@ fn paint_wave(painter: &Painter, screen: Rect, from: Pos2, t: f32) {
             continue;
         }
         let radius = reach * ease_out(local);
-        let fade = (1.0 - local) * (1.0 - ring as f32 * 0.2);
+        let fade = (1.0 - local) * (ring as f32).mul_add(-0.2, 1.0);
         // Several strokes make the edge feather instead of being a hard line.
         for layer in 0..5 {
-            let spread = layer as f32 * 7.0 + 3.0;
+            let spread = (layer as f32).mul_add(7.0, 3.0);
             let alpha = (fade * 60.0 / (layer as f32 + 1.0)) as u8;
             painter.circle_stroke(
                 from,
@@ -476,15 +476,14 @@ fn paint_background(
         return;
     }
     let line = Stroke::new(1.0, Color32::from_white_alpha(70));
-    let mut x = area.left();
-    while x < area.right() {
+    let every_5 = |from: f32, to: f32| {
+        std::iter::successors(Some(from), |at| Some(at + 5.0)).take_while(move |at| *at < to)
+    };
+    for x in every_5(area.left(), area.right()) {
         painter.line_segment([pos2(x, area.top()), pos2(x, area.bottom())], line);
-        x += 5.0;
     }
-    let mut y = area.top();
-    while y < area.bottom() {
+    for y in every_5(area.top(), area.bottom()) {
         painter.line_segment([pos2(area.left(), y), pos2(area.right(), y)], line);
-        y += 5.0;
     }
 }
 
@@ -535,7 +534,7 @@ fn paint_game_tile(
             game.name.clone(),
             FontId::proportional(15.0 * scale),
             INK,
-            inner.width() - 8.0 * scale,
+            8.0_f32.mul_add(-scale, inner.width()),
         );
         let position = inner.center() - galley.size() * 0.5;
         painter.galley(position, galley, INK);
@@ -551,8 +550,10 @@ fn paint_selection(painter: &Painter, rect: Rect, scale: f32) {
         Stroke::new(7.0 * scale, SELECTION_BLUE),
         StrokeKind::Outside,
     );
-    let band =
-        Rect::from_min_max(pos2(rect.left(), rect.bottom() - 30.0 * scale), rect.right_bottom());
+    let band = Rect::from_min_max(
+        pos2(rect.left(), 30.0_f32.mul_add(-scale, rect.bottom())),
+        rect.right_bottom(),
+    );
     painter.rect_filled(band, 8.0 * scale, SELECTION_BLUE);
     painter.text(
         band.center(),
@@ -582,11 +583,15 @@ fn paint_balloon(ui: &egui::Ui, tile: Rect, name: &str, scale: f32) {
     let galley =
         painter.layout(name.to_owned(), FontId::proportional(30.0 * scale), INK, 620.0 * scale);
     let size = galley.size() + vec2(40.0, 26.0) * scale;
-    let top = tile.bottom() + 26.0 * scale;
+    let top = 26.0_f32.mul_add(scale, tile.bottom());
     let rect = Rect::from_min_size(pos2(tile.center().x - size.x / 2.0, top), size);
-    let tip = pos2(tile.center().x, tile.bottom() + 8.0 * scale);
+    let tip = pos2(tile.center().x, 8.0_f32.mul_add(scale, tile.bottom()));
     painter.add(Shape::convex_polygon(
-        vec![tip, pos2(tip.x + 14.0 * scale, top + 1.0), pos2(tip.x - 14.0 * scale, top + 1.0)],
+        vec![
+            tip,
+            pos2(14.0_f32.mul_add(scale, tip.x), top + 1.0),
+            pos2(14.0_f32.mul_add(-scale, tip.x), top + 1.0),
+        ],
         Color32::from_white_alpha(245),
         Stroke::NONE,
     ));
@@ -643,7 +648,8 @@ fn paint_wii(painter: &Painter, center: Pos2, size: f32) {
     let points: Vec<Pos2> = (0..=24)
         .map(|step| {
             let t = step as f32 / 24.0;
-            center + vec2((t - 0.5) * size * 2.2, size * 0.72 + (t * PI).sin() * size * 0.14)
+            center
+                + vec2((t - 0.5) * size * 2.2, ((t * PI).sin() * size).mul_add(0.14, size * 0.72))
         })
         .collect();
     painter.add(Shape::line(points, Stroke::new(size * 0.09, SELECTION_BLUE)));
@@ -684,7 +690,7 @@ fn paint_smile(painter: &Painter, center: Pos2, size: f32) {
     let smile: Vec<Pos2> = (0..=16)
         .map(|step| {
             let a = PI * step as f32 / 16.0;
-            center + vec2(a.cos() * 0.5, 0.12 + a.sin() * 0.36) * size
+            center + vec2(a.cos() * 0.5, a.sin().mul_add(0.36, 0.12)) * size
         })
         .collect();
     painter.add(Shape::line(smile, Stroke::new(size * 0.13, orange)));
@@ -714,7 +720,7 @@ fn paint_bag(painter: &Painter, center: Pos2, size: f32) {
     let handle: Vec<Pos2> = (0..=16)
         .map(|step| {
             let a = PI * step as f32 / 16.0;
-            center + vec2(a.cos() * 0.44, -0.42 - a.sin() * 0.5) * size
+            center + vec2(a.cos() * 0.44, a.sin().mul_add(-0.5, -0.42)) * size
         })
         .collect();
     painter.add(Shape::line(handle, Stroke::new(size * 0.11, Color32::from_rgb(150, 110, 30))));
@@ -746,7 +752,7 @@ fn paint_globe(painter: &Painter, center: Pos2, size: f32) {
         .collect();
     painter.add(Shape::line(meridian, line));
     for y in [-0.55_f32, 0.55] {
-        let half = (1.0 - y * y).sqrt();
+        let half = f32::mul_add(y, -y, 1.0).sqrt();
         painter.line_segment(
             [center + vec2(-half, y) * radius, center + vec2(half, y) * radius],
             line,

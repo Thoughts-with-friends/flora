@@ -21,6 +21,8 @@ pub struct Config {
     /// Vertical blanks per flip, whatever the title asks for. A title whose logic
     /// counts frames runs faster with less than it was made for.
     pub swap_interval: Option<u32>,
+    /// Host directory holding per-title cheat codes (`<dir>/<title id>.txt`).
+    pub cheats_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -34,6 +36,7 @@ impl Default for Config {
             paced: true,
             fonts_dir: None,
             swap_interval: None,
+            cheats_dir: PathBuf::from("cheats"),
         }
     }
 }

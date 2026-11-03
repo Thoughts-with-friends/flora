@@ -1,6 +1,7 @@
-//! Tiling apertures (port of Cemu's GX2_TilingAperture): a linear window onto
-//! one level of a tiled surface. The hardware translates every access; here the
-//! texels are copied in on allocation and written back on free.
+//! Tiling apertures: a linear window onto one level of a tiled surface.
+//!
+//! A port of Cemu's GX2_TilingAperture. The hardware translates every access; here
+//! the texels are copied in on allocation and written back on free.
 use wiiu_gpu::{addrlib, tiling::Layout};
 use wiiu_hle_macros::hle_export;
 use wiiu_mem_addr::TILING_APERTURE;

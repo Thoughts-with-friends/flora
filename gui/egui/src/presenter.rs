@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::Path, sync::mpsc::SyncSender};
 
 use eframe::{egui, egui_wgpu};
 use shocora_render::{
-    LatteRenderer, RenderCommand, RenderThread, Screen, ScreenImages, UpscaleConfig,
-    UpscaleSetting, wgpu,
+    FrameGenSetting, LatteRenderer, RenderCommand, RenderThread, Screen, ScreenImages,
+    UpscaleConfig, UpscaleSetting, wgpu,
 };
 
 /// Where the driver's compiled shaders stay between runs.
@@ -22,6 +22,7 @@ pub struct Presenter {
     render_thread: RenderThread,
     screens: ScreenImages,
     upscale: UpscaleSetting,
+    frame_gen: FrameGenSetting,
     device: wgpu::Device,
     egui_renderer: std::sync::Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
     /// Registered texture, the generation it shows and the image size.
@@ -43,11 +44,13 @@ impl Presenter {
         renderer.use_pipeline_cache(Path::new(PIPELINE_CACHE_DIR), &info);
 
         let upscale = renderer.upscale_setting();
+        let frame_gen = renderer.frame_gen_setting();
         let render_thread = RenderThread::spawn(renderer).map_err(|e| e.to_string())?;
 
         Ok(Self {
             screens: render_thread.screens(),
             upscale,
+            frame_gen,
             render_thread,
             device: state.device.clone(),
             egui_renderer: std::sync::Arc::clone(&state.renderer),
@@ -58,6 +61,11 @@ impl Presenter {
     /// Applies from the next flip on.
     pub fn set_upscale(&self, config: UpscaleConfig) {
         self.upscale.set(config);
+    }
+
+    /// Applies from the next flip on.
+    pub fn set_frame_generation(&self, enabled: bool) {
+        self.frame_gen.set(enabled);
     }
 
     /// Where the emulator sends its work.

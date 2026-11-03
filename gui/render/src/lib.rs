@@ -5,10 +5,12 @@
 //! | `Wgpu`          | best available: Vulkan / DX12 / Metal / GL  |
 //! | `Vulkan`        | Vulkan only                                 |
 //! | `OpenGl`        | OpenGL only (wgpu's GL backend)             |
+pub mod framegen;
 mod latte_renderer;
 pub mod upscale;
 
 pub use egui_wgpu::wgpu;
+pub use framegen::FrameGenSetting;
 pub use latte_renderer::{
     LatteRenderer, RenderThread, ScreenImage, ScreenImages, request_device, wanted_features,
     wgpu_format,

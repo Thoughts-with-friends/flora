@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="100%" height="100%">
+  <defs>
+    <!-- 背景グラデーション（シックなダークブラウン） -->
+    <radialGradient id="bgGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#231F1D" />
+      <stop offset="100%" stop-color="#0F0E0D" />
+    </radialGradient>
+
+    <!-- カップのグラデーション（マットなホワイト陶器） -->
+    <linearGradient id="cupGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="75%" stop-color="#EDE7E1" />
+      <stop offset="100%" stop-color="#D5CAC0" />
+    </linearGradient>
+
+    <!-- ショコララテ液面（濃厚なダークブラウン） -->
+    <radialGradient id="chocolatGrad" cx="40%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#5C2E14" />
+      <stop offset="65%" stop-color="#3A1A09" />
+      <stop offset="100%" stop-color="#210D03" />
+    </radialGradient>
+
+    <!-- 影用フィルタ -->
+    <filter id="dropShadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="10" flood-color="#000000" flood-opacity="0.45" />
+    </filter>
+  </defs>
+
+  <!-- アイコン背景（角丸正方形） -->
+  <rect width="400" height="400" rx="90" fill="url(#bgGrad)" />
+
+  <!-- メインコンテンツ（影付き） -->
+  <g filter="url(#dropShadow)">
+    
+    <!-- ソーサー（受け皿） -->
+    <ellipse cx="200" cy="325" rx="125" ry="24" fill="#1C1816" />
+    <ellipse cx="200" cy="320" rx="115" ry="20" fill="#362F2B" />
+
+    <!-- マグカップの取っ手 -->
+    <path d="M 265 195 C 325 195 325 285 260 285" fill="none" stroke="url(#cupGrad)" stroke-width="18" stroke-linecap="round" />
+
+    <!-- マグカップ本体 -->
+    <path d="M 125 170 L 138 295 C 140 310 152 315 200 315 C 248 315 260 310 262 295 L 275 170 Z" fill="url(#cupGrad)" />
+
+    <!-- カップのフチ（厚み表現） -->
+    <ellipse cx="200" cy="170" rx="75" ry="18" fill="#CBBFBE" />
+    
+    <!-- ショコララテ液面（フラットで滑らかな茶色メイン） -->
+    <ellipse cx="200" cy="170" rx="69" ry="14" fill="url(#chocolatGrad)" />
+
+    <!-- 中央のホワイトクリームベース（すっきりとした楕円） -->
+    <ellipse cx="200" cy="169" rx="22" ry="8" fill="#F7EFE8" opacity="0.95" />
+    <ellipse cx="200" cy="168" rx="17" ry="6" fill="#FFFFFF" />
+
+    <!-- 中央のミントの葉（ワンポイントアクセント） -->
+    <g transform="translate(200, 166)">
+      <!-- 左の葉 -->
+      <path d="M 0 0 C -10 -12, -22 -6, -18 3 C -15 10, -4 6, 0 0 Z" fill="#4E9F65" />
+      <path d="M 0 0 L -12 -3" stroke="#83C295" stroke-width="1" stroke-linecap="round" />
+
+      <!-- 右の葉 -->
+      <path d="M 0 0 C 12 -8, 20 2, 14 12 C 7 18, 1 9, 0 0 Z" fill="#3B7D4E" />
+      <path d="M 0 0 L 9 3" stroke="#68A473" stroke-width="1" stroke-linecap="round" />
+
+      <!-- 中央の小さな若葉 -->
+      <path d="M 0 0 C -4 -10, 6 -14, 3 -5 Z" fill="#68A473" />
+    </g>
+
+    <!-- マグカップ側面のアウトラインハイライト -->
+    <path d="M 143 185 L 151 285" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" opacity="0.5" />
+  </g>
+</svg>

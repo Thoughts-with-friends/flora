@@ -1,5 +1,9 @@
 # shocora
 
+<p align="center">
+  <img src="gui/egui/assets/shocora.png" alt="shocora" width="300"/>
+</p>
+
 Wii U emulator written in Rust, structured after the hardware and system
 software of the console. Its design references [Cemu](https://github.com/cemu-project/Cemu).
 
@@ -15,6 +19,7 @@ software of the console. Its design references [Cemu](https://github.com/cemu-pr
 ```text
 cargo xtask run [--graphics wgpu|vulkan|opengl] [-- TITLE_DIR | FILE.rpx]
 cargo xtask test
+cargo xtask icon   # gui/egui/assets/shocora.svg -> shocora.png, shocora.ico
 ```
 
 - `wgpu` picks the best backend (DX12 / Metal / Vulkan / GL), `vulkan` forces

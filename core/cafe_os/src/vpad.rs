@@ -34,7 +34,10 @@ const SCREEN: (f32, f32) = (854.0, 480.0);
 /// Screen position to raw panel coordinates.
 fn panel_from_screen(x: u16, y: u16) -> (u16, u16) {
     let (x, y) = ((f32::from(x) / SCREEN.0).min(1.0), (f32::from(y) / SCREEN.1).min(1.0));
-    ((x * PANEL_WIDTH + PANEL_LEFT) as u16, (PANEL_TOP - y * PANEL_HEIGHT) as u16)
+    (
+        f32::mul_add(x, PANEL_WIDTH, PANEL_LEFT) as u16,
+        f32::mul_add(y, -PANEL_HEIGHT, PANEL_TOP) as u16,
+    )
 }
 
 /// Raw panel coordinates to a position on a `width` x `height` screen.

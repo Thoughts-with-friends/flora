@@ -47,7 +47,6 @@ mod primitive {
     pub const POINTS: u32 = 1;
     pub const LINES: u32 = 2;
     pub const LINE_STRIP: u32 = 3;
-    pub const TRIANGLES: u32 = 4;
     pub const TRIANGLE_FAN: u32 = 5;
     pub const TRIANGLE_STRIP: u32 = 6;
     pub const RECTS: u32 = 0x11;
@@ -330,7 +329,7 @@ pub struct Latte {
     /// Kept between draws: every draw builds a key in it.
     key_buffer: Vec<u8>,
     /// Hash of a shader program, valid for a guest address.
-    code_cache: HashMap<(u32, u32), (u64, Arc<[u8]>, u64)>,
+    code_cache: HashMap<(u32, u32), CachedCode>,
     next_module_id: u64,
     stream_buffers: Vec<StreamBuffer>,
     stream_cursor: u32,
@@ -359,6 +358,17 @@ impl Default for Latte {
             skipped_draws: 0,
         }
     }
+}
+
+/// A shader program in guest memory: its hash, its code, and the frame it was last checked.
+type CachedCode = (u64, Arc<[u8]>, u64);
+
+/// Which texture registers and shader bindings a stage uses.
+#[derive(Debug, Clone, Copy)]
+struct TextureStage {
+    resource_base: u32,
+    binding_base: u32,
+    sampler_base: u32,
 }
 
 /// What a shader program reads and writes, whatever the state around it.
@@ -644,7 +654,6 @@ impl Latte {
                 code,
                 &[],
                 &[],
-                uniform_blocks,
                 &[TextureSignature::default(); TEXTURE_UNITS],
                 0,
             );
@@ -671,7 +680,6 @@ impl Latte {
             let (probe, _) = shader::translate_pixel(
                 code,
                 &inputs,
-                uniform_blocks,
                 &[TextureSignature::default(); TEXTURE_UNITS],
             );
             ShaderUse {
@@ -801,13 +809,11 @@ impl Latte {
             alpha_function,
             target_kinds,
         };
-        let (pixel, flat_params) =
-            shader::translate_pixel(&ps.1, &inputs, uniform_blocks, &ps_signatures);
+        let (pixel, flat_params) = shader::translate_pixel(&ps.1, &inputs, &ps_signatures);
         let vertex = shader::translate_vertex(
             &vs.1,
             &attributes,
             &semantic_table,
-            uniform_blocks,
             &vs_signatures,
             flat_params,
         );
@@ -871,12 +877,11 @@ impl Latte {
         memory: &Memory,
         regs: &RegisterFile,
         out: &mut Vec<BoundTexture>,
-        stage_base: u32,
-        binding_base: u32,
-        sampler_base: u32,
+        stage: TextureStage,
         units: &[u8],
         samplers: &[(u8, u8)],
     ) {
+        let TextureStage { resource_base: stage_base, binding_base, sampler_base } = stage;
         for &unit in units {
             let sampler_unit = samplers.iter().find(|(t, _)| *t == unit).map(|(_, s)| *s);
             let Some((signature, words)) = self.texture_signature(
@@ -1089,9 +1094,7 @@ impl Latte {
             memory,
             regs,
             &mut textures,
-            resource::VS_TEXTURE,
-            0,
-            18,
+            TextureStage { resource_base: resource::VS_TEXTURE, binding_base: 0, sampler_base: 18 },
             &pair.vs_textures,
             &pair.vs_samplers,
         );
@@ -1100,9 +1103,11 @@ impl Latte {
                 memory,
                 regs,
                 &mut textures,
-                resource::PS_TEXTURE,
-                TEXTURE_UNITS as u32,
-                0,
+                TextureStage {
+                    resource_base: resource::PS_TEXTURE,
+                    binding_base: TEXTURE_UNITS as u32,
+                    sampler_base: 0,
+                },
                 &pair.ps_textures,
                 &pair.ps_samplers,
             );
@@ -1115,8 +1120,7 @@ impl Latte {
         let color_enabled = (color_control >> 4) & 7 == 0;
         let mut state = pipeline_state(regs);
         let mut color_targets = [None; 8];
-        for target in 0..8 {
-            let words = self.color_targets[target];
+        for (target, words) in self.color_targets.into_iter().enumerate() {
             let mask =
                 ((cb_target_mask >> (4 * target)) & (cb_shader_mask >> (4 * target)) & 0xF) as u8;
             if stream_only
@@ -1682,7 +1686,7 @@ fn decode_mips(
             bank_swizzle,
         };
         let Some(effective) = wiiu_mem_addr::physical_to_effective(address) else { break };
-        let size = (info.surf_size as u32).max(1).min(0x0800_0000);
+        let size = (info.surf_size as u32).clamp(1, 0x0800_0000);
         let Ok(source) = memory.slice(effective, size) else {
             log::debug!("mip {level} at {address:#010x} is outside mapped memory");
             break;

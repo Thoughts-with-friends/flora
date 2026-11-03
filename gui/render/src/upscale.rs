@@ -401,7 +401,7 @@ mod tests {
         // Flat areas keep their exact colours, and the image is opaque.
         assert_eq!(value(SIZE * FACTOR - 2, 1), 255);
         assert_eq!(value(1, SIZE * FACTOR - 2), 0);
-        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
         // A plain enlargement would be a staircase of whole source pixels: here,
         // inside the source pixels on the edge, some output pixels differ from E.
         let source_at = |x: u32, y: u32| source[(((y / FACTOR) * SIZE + x / FACTOR) * 4) as usize];

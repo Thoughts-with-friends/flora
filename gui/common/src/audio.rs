@@ -62,6 +62,8 @@ impl Playback {
             return self.previous;
         }
         self.phase += step;
+        // Each pass takes one off a small sum of positive steps: this cannot stall.
+        #[allow(clippy::while_float)]
         while self.phase >= 1.0 {
             self.phase -= 1.0;
             self.previous = self.current;
@@ -75,7 +77,10 @@ impl Playback {
         }
         let [left, right] = self.previous;
         let [next_left, next_right] = self.current;
-        [left + (next_left - left) * self.phase, right + (next_right - right) * self.phase]
+        [
+            f32::mul_add(next_left - left, self.phase, left),
+            f32::mul_add(next_right - right, self.phase, right),
+        ]
     }
 
     /// Fills a device buffer of interleaved frames.

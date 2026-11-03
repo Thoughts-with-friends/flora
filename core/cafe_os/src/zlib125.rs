@@ -2,7 +2,7 @@
 //!
 //! The guest `z_stream` keeps its pointers and counters in guest memory;
 //! the codec state lives host-side, keyed by the stream's address.
-#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 
 use std::collections::HashMap;
 
@@ -184,9 +184,17 @@ fn inflate_reset2(
     Ok(Z_OK)
 }
 
+/// Real zlib turns these calls down instead of touching memory, and titles check for it.
+const fn missing_buffer(next_in: u32, avail_in: u32, next_out: u32) -> bool {
+    next_out == 0 || (next_in == 0 && avail_in != 0)
+}
+
 #[hle_export(lib = "zlib125", name = "inflate")]
 fn inflate(ctx: &mut HleContext<'_>, stream: u32, flush: u32) -> Result<i32, HleError> {
     let (next_in, avail_in, next_out, avail_out) = buffers(ctx, stream)?;
+    if missing_buffer(next_in, avail_in, next_out) {
+        return Ok(Z_STREAM_ERROR);
+    }
     let mut input = vec![0; avail_in as usize];
     ctx.memory.read_bytes(next_in, &mut input)?;
     let Some(Stream::Inflate {
@@ -304,6 +312,9 @@ fn deflate_init2(
 #[hle_export(lib = "zlib125", name = "deflate")]
 fn deflate(ctx: &mut HleContext<'_>, stream: u32, flush: u32) -> Result<i32, HleError> {
     let (next_in, avail_in, next_out, avail_out) = buffers(ctx, stream)?;
+    if missing_buffer(next_in, avail_in, next_out) {
+        return Ok(Z_STREAM_ERROR);
+    }
     let mut input = vec![0; avail_in as usize];
     ctx.memory.read_bytes(next_in, &mut input)?;
     let Some(Stream::Deflate(codec)) = ctx.os.zlib.streams.get_mut(&stream) else {
@@ -444,6 +455,23 @@ mod tests {
 
     use super::*;
     use crate::hle::test_env::{SCRATCH, TestEnv};
+
+    #[test]
+    fn missing_buffers_are_an_error_not_a_crash() {
+        let mut env = TestEnv::new();
+        let stream = SCRATCH;
+        env.call("zlib125", "inflateInit_", &[stream, 0, 0x38]);
+        // No input although some is promised, as when a title's allocation failed.
+        for (field, value) in
+            [(0x00, 0), (0x04, 0x480_2000), (0x0C, SCRATCH + 0x400), (0x10, 0x100)]
+        {
+            env.memory.write_u32(stream + field, value).unwrap();
+        }
+        assert_eq!(
+            env.call("zlib125", "inflate", &[stream, Z_FINISH]),
+            Z_STREAM_ERROR.cast_unsigned()
+        );
+    }
 
     #[test]
     fn inflate_streams_into_guest_memory() {

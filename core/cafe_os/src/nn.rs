@@ -1,4 +1,6 @@
-//! Network-service and account libraries. shocora is offline: accounts report a
+//! Network-service and account libraries.
+//!
+//! shocora is offline: accounts report a
 //! single local user and everything else stays at its "not connected" default
 //! (unimplemented imports return 0, which `nn::Result` reads as success).
 use wiiu_hle_macros::hle_export;

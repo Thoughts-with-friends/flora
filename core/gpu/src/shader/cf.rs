@@ -269,13 +269,12 @@ pub fn parse_alu(code: &[u8], clause: &AluClause) -> Vec<AluGroup> {
                 literal_mask |= 1 << src.chan;
             }
         }
-        let mut unit = op.dest_elem;
-        if !is_op3 && is_trans_op(op.opcode) {
-            unit = 4;
-        }
-        if unit < 4 && used_units & (1 << unit) != 0 {
-            unit = 4;
-        }
+        // The transcendental unit takes what only it can do, and what finds its vector unit taken.
+        let unit = if (!is_op3 && is_trans_op(op.opcode)) || used_units & (1 << op.dest_elem) != 0 {
+            4
+        } else {
+            op.dest_elem
+        };
         used_units |= 1 << unit;
         op.unit = unit;
         group.ops.push(op);

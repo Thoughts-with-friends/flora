@@ -19,6 +19,7 @@ use std::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use egui_wgpu::wgpu;
@@ -33,7 +34,10 @@ use wiiu_gpu::{
     shader::{TextureDim, TextureKind},
 };
 
-use crate::upscale::{UpscaleSetting, Upscaler};
+use crate::{
+    framegen::{FrameGenSetting, FrameGenerator},
+    upscale::{UpscaleSetting, Upscaler},
+};
 
 /// Size the shader prelude reads through the dynamic binding.
 const PARAMS_BINDING_SIZE: u64 = 324;
@@ -71,15 +75,36 @@ pub struct ScreenImage {
 
 /// The latest image of each screen, readable from the UI thread.
 #[derive(Debug, Default, Clone)]
-pub struct ScreenImages(Arc<Mutex<HashMap<Screen, ScreenImage>>>);
+pub struct ScreenImages(Arc<Mutex<ScreenSlots>>);
+
+/// What each screen shows, and what it shows next from a given moment on.
+#[derive(Debug, Default)]
+struct ScreenSlots {
+    shown: HashMap<Screen, ScreenImage>,
+    next: HashMap<Screen, (ScreenImage, Instant)>,
+}
 
 impl ScreenImages {
     pub fn get(&self, screen: Screen) -> Option<ScreenImage> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).get(&screen).cloned()
+        let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if slots.next.get(&screen).is_some_and(|(_, due)| *due <= Instant::now()) {
+            if let Some((image, _)) = slots.next.remove(&screen) {
+                slots.shown.insert(screen, image);
+            }
+        }
+        slots.shown.get(&screen).cloned()
     }
 
     pub(crate) fn set(&self, screen: Screen, image: ScreenImage) {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(screen, image);
+        let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        slots.next.remove(&screen);
+        slots.shown.insert(screen, image);
+    }
+
+    /// `image` takes over at `due`.
+    pub(crate) fn set_after(&self, screen: Screen, image: ScreenImage, due: Instant) {
+        let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        slots.next.insert(screen, (image, due));
     }
 }
 
@@ -618,6 +643,7 @@ pub struct LatteRenderer {
     screens: ScreenImages,
     generation: u64,
     upscaler: Upscaler,
+    frame_generator: FrameGenerator,
     /// Screens with a new image since the last flip.
     presented: Vec<Screen>,
     logged: std::collections::HashSet<String>,
@@ -787,6 +813,7 @@ impl LatteRenderer {
             screens: ScreenImages::default(),
             generation: 0,
             upscaler: Upscaler::default(),
+            frame_generator: FrameGenerator::default(),
             presented: Vec::new(),
             logged: std::collections::HashSet::new(),
             max_draws: std::env::var("SHOCORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
@@ -799,6 +826,18 @@ impl LatteRenderer {
 
     pub fn screens(&self) -> ScreenImages {
         self.screens.clone()
+    }
+
+    /// Handle to switch frame generation while the renderer runs.
+    pub fn frame_gen_setting(&self) -> FrameGenSetting {
+        self.frame_generator.setting()
+    }
+
+    /// The last generated picture of a screen as RGBA8 (tools and tests).
+    pub fn read_generated(&mut self, screen: Screen) -> Option<(u32, u32, Vec<u8>)> {
+        self.submit();
+        let image = self.frame_generator.image(screen)?.clone();
+        self.read_texture(&image.texture, image.width, image.height)
     }
 
     /// Handle to change the screens' upscaling while the renderer runs.
@@ -1060,7 +1099,9 @@ impl LatteRenderer {
             compile()
         } else {
             std::thread::scope(|scope| {
-                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(&compile)).collect();
+                // Collected first: joining as they are spawned would compile one at a time.
+                #[allow(clippy::needless_collect)]
+                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(compile)).collect();
                 workers.into_iter().filter_map(|w| w.join().ok()).flatten().collect()
             })
         };
@@ -1185,7 +1226,6 @@ impl LatteRenderer {
                         BorderColor::OpaqueBlack => wgpu::SamplerBorderColor::OpaqueBlack,
                         BorderColor::OpaqueWhite => wgpu::SamplerBorderColor::OpaqueWhite,
                     }),
-                    ..Default::default()
                 })
             })
             .clone()
@@ -1752,6 +1792,16 @@ impl LatteRenderer {
             &self.screens,
             &mut self.generation,
         );
+        let upscaled = self.presented.iter().any(|screen| self.upscaler.shows(*screen));
+        self.frame_generator.update(
+            &self.device,
+            &self.queue,
+            &self.presented,
+            &self.screen_targets,
+            &self.screens,
+            &mut self.generation,
+            upscaled,
+        );
         self.presented.clear();
         self.flips += 1;
         self.frame_draws = 0;
@@ -1807,6 +1857,7 @@ impl LatteRenderer {
         self.feedback_copies.clear();
         self.pending_scan.clear();
         self.presented.clear();
+        self.frame_generator.reset();
         self.frame_draws = 0;
     }
 

@@ -16,6 +16,14 @@ use crate::{launcher::Launcher, presenter::Presenter};
 /// Lines of guest output kept in the log panel.
 const LOG_LINES: usize = 500;
 
+/// The cheat editor window.
+#[derive(Debug)]
+struct CheatEditor {
+    text: String,
+    /// What is wrong with the text, or what saving it did.
+    message: String,
+}
+
 pub struct ShocoraApp {
     console: Console,
     presenter: Presenter,
@@ -42,6 +50,10 @@ pub struct ShocoraApp {
     boot_pending: bool,
     /// Where the mouse holds the GamePad's screen, in its pixels.
     touch: Option<(u16, u16)>,
+    /// The cheat editor's text, while it is open.
+    cheats: Option<CheatEditor>,
+    /// Where the running title's cheat codes are kept.
+    cheats_path: Option<PathBuf>,
     /// What the backdrop picture's path field shows while being edited.
     picture_path: String,
 }
@@ -68,7 +80,10 @@ impl ShocoraApp {
             .launcher_image
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
+        presenter.set_frame_generation(config.frame_generation);
         let mut app = Self {
+            cheats: None,
+            cheats_path: None,
             picture_path,
             console,
             presenter,
@@ -166,9 +181,8 @@ impl ShocoraApp {
         }
     }
 
-    fn pull_emulator_state(&mut self, frame: &mut eframe::Frame) {
+    fn pull_emulator_state(&mut self) {
         let snapshot = self.console.drain();
-        let _ = frame;
         self.presenter.sync();
         self.log.extend(snapshot.console_lines.iter().map(|l| l.trim_end().to_owned()));
         if snapshot.title.is_some() {
@@ -186,6 +200,7 @@ impl ShocoraApp {
         let overflow = self.log.len().saturating_sub(LOG_LINES);
         self.log.drain(..overflow);
         self.status = snapshot.status;
+        self.cheats_path = snapshot.cheats_path;
         self.paused = snapshot.paused;
         self.title = snapshot.title;
         self.fps = snapshot.fps;
@@ -249,6 +264,10 @@ impl ShocoraApp {
                     });
                     ui.close();
                 }
+                if ui.add_enabled(self.cheats_path.is_some(), egui::Button::new("Cheats…")).clicked() {
+                    self.open_cheats();
+                    ui.close();
+                }
                 if ui.add_enabled(self.title.is_some(), egui::Button::new("Reset")).clicked() {
                     self.log.push("reset".to_owned());
                     self.console.send(ConsoleCommand::Reset);
@@ -266,6 +285,14 @@ impl ShocoraApp {
                 self.upscale_menu(ui);
                 ui.separator();
                 self.frame_rate_menu(ui);
+                let mut generate = self.config.frame_generation;
+                if ui
+                    .checkbox(&mut generate, "Frame generation (30 → 60 fps)")
+                    .on_hover_text("ゲーム速度を変えずに、フレームの間の絵を作って表示します。\nxBRZ の使用中は働きません。")
+                    .changed()
+                {
+                    self.set_frame_generation(generate);
+                }
                 ui.separator();
                 if ui.button("System fonts folder…").clicked() {
                     ui.close();
@@ -318,10 +345,10 @@ impl ShocoraApp {
     fn upscale_menu(&mut self, ui: &mut egui::Ui) {
         ui.add_enabled_ui(upscale::available(), |ui| {
             ui.label("Screen upscaling (xBRZ)");
-            let mut changed = false;
-            if ui.radio(self.config.upscale.method == UpscaleMethod::None, "Off").clicked() {
+            let mut changed =
+                ui.radio(self.config.upscale.method == UpscaleMethod::None, "Off").clicked();
+            if changed {
                 self.config.upscale.method = UpscaleMethod::None;
-                changed = true;
             }
             for factor in 2..=upscale::MAX_FACTOR {
                 let selected = self.config.upscale.method == UpscaleMethod::Xbrz
@@ -337,6 +364,76 @@ impl ShocoraApp {
                 self.save_config();
             }
         });
+    }
+
+    fn set_frame_generation(&mut self, enabled: bool) {
+        self.config.frame_generation = enabled;
+        self.presenter.set_frame_generation(enabled);
+        self.save_config();
+    }
+
+    /// Opens the cheat editor on the running title's file.
+    fn open_cheats(&mut self) {
+        let text = self
+            .cheats_path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        self.cheats = Some(CheatEditor { text, message: String::new() });
+    }
+
+    /// Checks the editor's text; if it is fine, writes it and has the emulator use it.
+    fn save_cheats(&mut self) {
+        let Some(editor) = &mut self.cheats else { return };
+        let count = match wiiu_emu::cheat::parse(&editor.text) {
+            Ok(cheats) => cheats.iter().filter(|cheat| cheat.enabled).count(),
+            Err(error) => {
+                editor.message = error.to_string();
+                return;
+            }
+        };
+        let Some(path) = &self.cheats_path else { return };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, &editor.text));
+        editor.message = match written {
+            Ok(()) => {
+                self.console.send(ConsoleCommand::ReloadCheats);
+                format!("適用しました（有効なコード: {count}）")
+            }
+            Err(error) => format!("{}: {error}", path.display()),
+        };
+    }
+
+    fn cheat_window(&mut self, ctx: &egui::Context) {
+        let Some(editor) = &mut self.cheats else { return };
+        let (mut open, mut save) = (true, false);
+        egui::Window::new("チートコード").open(&mut open).default_size([460.0, 380.0]).show(
+            ctx,
+            |ui| {
+                ui.label("「アドレス 値」を 16 進数で 1 行ずつ。値の桁数で書き込み幅が決まります（2 桁: 8bit、4 桁: 16bit、8 桁: 32bit）。");
+                ui.label("// で名前を付け、// disabled で次のコードを無効にできます。");
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut editor.text)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .hint_text("// ルピー 999\n1050_6A1C 03E7"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    save = ui.button("保存して適用").clicked();
+                    ui.label(&editor.message);
+                });
+            },
+        );
+        if save {
+            self.save_cheats();
+        }
+        if !open {
+            self.cheats = None;
+        }
     }
 
     /// Follows the title's frame rate or forces 60 fps, at once.
@@ -412,6 +509,16 @@ impl ShocoraApp {
                  30 fps 用のタイトルは強制すると最大で倍速になります。",
             ) {
                 self.toggle_frame_rate();
+            }
+            ui.separator();
+            let generation = if self.config.frame_generation {
+                "フレーム生成 ON"
+            } else {
+                "フレーム生成 OFF"
+            };
+            if setting(ui, generation.to_owned(), "クリックでフレーム生成（30 → 60 fps）を切り替え")
+            {
+                self.set_frame_generation(!self.config.frame_generation);
             }
             ui.separator();
             let scale = match self.config.upscale.method {
@@ -696,8 +803,8 @@ impl eframe::App for ShocoraApp {
         [0.0; 4]
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.pull_emulator_state(frame);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.pull_emulator_state();
         self.poll_input(ui.ctx());
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
@@ -722,6 +829,7 @@ impl eframe::App for ShocoraApp {
         } else {
             egui::CentralPanel::default().show(ui, |ui| self.screens(ui));
         }
+        self.cheat_window(ui.ctx());
         self.launcher.paint_transition(ui.ctx());
     }
 }

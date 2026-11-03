@@ -77,7 +77,6 @@ const RECT_WORD_MASK: u32 = (1 << RECT_CORNER_SHIFT) - 1;
 struct Translator<'a> {
     stage: Stage,
     code: &'a [u8],
-    uniform_blocks: bool,
     textures: &'a [TextureSignature; TEXTURE_UNITS],
     body: String,
     max_gpr: u32,
@@ -96,16 +95,10 @@ struct Translator<'a> {
 }
 
 impl<'a> Translator<'a> {
-    fn new(
-        stage: Stage,
-        code: &'a [u8],
-        uniform_blocks: bool,
-        textures: &'a [TextureSignature; TEXTURE_UNITS],
-    ) -> Self {
+    fn new(stage: Stage, code: &'a [u8], textures: &'a [TextureSignature; TEXTURE_UNITS]) -> Self {
         Self {
             stage,
             code,
-            uniform_blocks,
             textures,
             body: String::new(),
             max_gpr: 0,
@@ -224,8 +217,7 @@ impl<'a> Translator<'a> {
         let is_reduction = |op: &AluOp| !op.is_op3 && matches!(op.opcode, 0x50..=0x52);
 
         // Reduction ops compute one result from all four vector units.
-        let mut reduction: Option<String> = None;
-        if group.ops.iter().any(is_reduction) {
+        let reduction = if group.ops.iter().any(is_reduction) {
             let parts: Vec<(String, String)> = (0..4)
                 .map(|unit| {
                     group.ops.iter().find(|op| op.unit == unit && is_reduction(op)).map_or_else(
@@ -259,15 +251,17 @@ impl<'a> Translator<'a> {
                 self.line(&format!("let {d} = bitcast<u32>({sum});"));
                 self.line(&format!("let {result} = vec4<u32>({d});"));
             }
-            reduction = Some(result);
-        }
+            Some(result)
+        } else {
+            None
+        };
 
         for op in &group.ops {
             let value = if is_reduction(op) {
                 let chan = CHANNEL[op.unit.min(3) as usize];
                 let result = reduction.clone().unwrap_or_default();
                 let inner = format!("{result}.{chan}");
-                self.modifiers(op, inner, true)
+                Self::modifiers(op, inner, true)
             } else {
                 self.alu_op(op, clause, group)
             };
@@ -295,7 +289,7 @@ impl<'a> Translator<'a> {
     }
 
     /// Output modifiers of float-producing ops.
-    fn modifiers(&mut self, op: &AluOp, bits: String, is_float: bool) -> Option<String> {
+    fn modifiers(op: &AluOp, bits: String, is_float: bool) -> Option<String> {
         if !is_float {
             return Some(bits);
         }
@@ -341,7 +335,7 @@ impl<'a> Translator<'a> {
                     ("0u".to_owned(), false)
                 }
             };
-            return self.modifiers(op, bits, is_float);
+            return Self::modifiers(op, bits, is_float);
         }
 
         let b = self.source(op, 1, clause, group);
@@ -384,7 +378,7 @@ impl<'a> Translator<'a> {
                 self.line(&line);
                 (format!("bitcast<u32>(clamp({ia}, -256, 255))"), false)
             }
-            0x19 => return self.modifiers(op, a, op.omod != 0 || op.clamp),
+            0x19 => return Self::modifiers(op, a, op.omod != 0 || op.clamp),
             0x1A => return None,
             0x20..=0x23 | 0x42..=0x45 => {
                 let cond = match op.opcode {
@@ -463,7 +457,7 @@ impl<'a> Translator<'a> {
                 ("0u".to_owned(), false)
             }
         };
-        self.modifiers(op, bits, is_float)
+        Self::modifiers(op, bits, is_float)
     }
 
     fn tex_clause(&mut self, addr: u32, count: u32) {
@@ -1145,11 +1139,10 @@ pub fn translate_vertex(
     code: &[u8],
     attributes: &[Attribute],
     semantic_table: &[u32],
-    uniform_blocks: bool,
     textures: &[TextureSignature; TEXTURE_UNITS],
     flat_params: u32,
 ) -> TranslatedShader {
-    let mut t = Translator::new(Stage::Vertex, code, uniform_blocks, textures);
+    let mut t = Translator::new(Stage::Vertex, code, textures);
     let list = parse_cf(code);
 
     let mut fetch = String::new();
@@ -1234,10 +1227,9 @@ pub struct PixelInputs<'a> {
 pub fn translate_pixel(
     code: &[u8],
     inputs: &PixelInputs<'_>,
-    uniform_blocks: bool,
     textures: &[TextureSignature; TEXTURE_UNITS],
 ) -> (TranslatedShader, u32) {
-    let mut t = Translator::new(Stage::Pixel, code, uniform_blocks, textures);
+    let mut t = Translator::new(Stage::Pixel, code, textures);
     let list = parse_cf(code);
     let mut flat_params = 0_u32;
 

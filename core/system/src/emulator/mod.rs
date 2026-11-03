@@ -60,6 +60,8 @@ enum BootSource {
 /// A Wii U.
 pub struct Emulator {
     boot_source: Option<BootSource>,
+    /// Applied at every frame.
+    cheats: Vec<crate::cheat::Cheat>,
     pub config: Config,
     memory: Memory,
     cores: Vec<CpuState>,
@@ -94,6 +96,7 @@ impl Emulator {
     pub fn new(config: Config) -> Result<Self, EmuError> {
         Ok(Self {
             boot_source: None,
+            cheats: Vec::new(),
             config,
             memory: Memory::with_game_layout()?,
             cores: (0..CORE_COUNT as u32).map(CpuState::new).collect(),
@@ -135,6 +138,31 @@ impl Emulator {
     pub fn set_swap_interval(&mut self, interval: Option<u32>) {
         self.config.swap_interval = interval;
         self.os.gx2.forced_swap_interval = interval;
+    }
+
+    /// Where the cheat codes of the running title are kept.
+    pub fn cheats_path(&self) -> Option<std::path::PathBuf> {
+        let title_id = self.title.as_ref()?.meta.title_id?;
+        Some(self.config.cheats_dir.join(format!("{title_id:016x}.txt")))
+    }
+
+    /// Reads the running title's cheat codes again; no file means none.
+    ///
+    /// # Errors
+    /// Fails if the file cannot be read or understood. The codes in use stay then.
+    pub fn reload_cheats(&mut self) -> Result<usize, String> {
+        let Some(path) = self.cheats_path() else {
+            self.cheats.clear();
+            return Ok(0);
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        self.cheats =
+            crate::cheat::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+        Ok(self.cheats.len())
     }
 
     /// Feeds the latest GamePad sample.

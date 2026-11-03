@@ -1,4 +1,6 @@
 //! Initialisation, scan buffers, clears and surface copies.
+#![allow(clippy::too_many_arguments)]
+
 use wiiu_gpu::{addrlib::tile_mode, command::opcode, regs::context as reg};
 use wiiu_hle_macros::hle_export;
 use wiiu_memory::GuestPtr;

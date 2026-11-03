@@ -33,6 +33,8 @@ pub enum ConsoleCommand {
     Stop,
     /// Reboots the running title.
     Reset,
+    /// Reads the running title's cheat codes again.
+    ReloadCheats,
     GamePad(GamePadState),
     /// Where to find the system fonts from the next boot on.
     FontsDir(Option<PathBuf>),
@@ -52,6 +54,8 @@ pub struct Snapshot {
     pub fps: f32,
     /// Error from the last `Load`.
     pub load_error: Option<String>,
+    /// Where the running title's cheat codes are kept.
+    pub cheats_path: Option<PathBuf>,
 }
 
 type Shared = Arc<Mutex<Snapshot>>;
@@ -171,6 +175,12 @@ impl EmuThread {
                         Some(format!("reset: {error}"));
                 }
             }
+            ConsoleCommand::ReloadCheats => {
+                if let Err(error) = self.emulator.reload_cheats() {
+                    self.shared.lock().unwrap_or_else(PoisonError::into_inner).load_error =
+                        Some(error);
+                }
+            }
             ConsoleCommand::GamePad(state) => self.emulator.set_gamepad(state),
             ConsoleCommand::FontsDir(dir) => self.emulator.config.fonts_dir = dir,
             ConsoleCommand::SwapInterval(interval) => self.emulator.set_swap_interval(interval),
@@ -193,6 +203,7 @@ impl EmuThread {
         shared.paused = self.paused;
         shared.stats = self.emulator.stats();
         shared.fps = fps;
+        shared.cheats_path = self.emulator.cheats_path();
     }
 
     fn run(mut self, repaint: &dyn Fn()) {

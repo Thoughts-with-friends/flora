@@ -35,6 +35,7 @@ impl Emulator {
         if self.status != Status::Running {
             return;
         }
+        crate::cheat::apply(&self.cheats, &mut self.memory);
         let frame_time = self.config.frame_time;
         let now = Instant::now();
         let deadline = match self.next_vsync {
