@@ -26,12 +26,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::lang::tr;
 use eframe::egui::{
     self, Align2, Color32, FontId, Id, LayerId, Order, Painter, Pos2, Rect, Sense, Shape, Stroke,
     StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 use shocora_game_library::GameEntry;
+
+use crate::lang::tr;
 
 /// Tiles across and down one page.
 const COLUMNS: usize = 5;
