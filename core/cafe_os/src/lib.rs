@@ -49,6 +49,8 @@ pub struct CafeOs {
     /// Latest GamePad sample from the front end.
     pub gamepad: GamePadState,
     pub(crate) gamepad_edges: ButtonEdges,
+    /// Raw panel coordinates of the last touch of the GamePad.
+    pub(crate) last_touch: (u16, u16),
     /// Lines printed by `OSReport` and friends, drained by the front end.
     pub console: Vec<String>,
     /// Set by `exit`/`_Exit`.
@@ -87,6 +89,7 @@ impl CafeOs {
             settings: coreinit::settings::SystemSettings::default(),
             gamepad: GamePadState::default(),
             gamepad_edges: ButtonEdges::default(),
+            last_touch: (0, 0),
             console: Vec::new(),
             exit_code: None,
             frame_done: false,

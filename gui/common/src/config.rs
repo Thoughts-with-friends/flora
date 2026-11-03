@@ -1,7 +1,7 @@
 //! Front-end settings, stored as TOML.
 use std::path::{Path, PathBuf};
 
-use flora_render::{GraphicsApi, UpscaleConfig};
+use shocora_render::{GraphicsApi, UpscaleConfig};
 
 use crate::input::{KeyBindings, PadBindings};
 
@@ -24,6 +24,10 @@ pub struct AppConfig {
     /// Vertical blanks per flip, whatever the title asks for. `1` is 60 fps, and
     /// double speed in a title made for 30 whose logic counts frames.
     pub swap_interval: Option<u32>,
+    /// Backdrop of the start screen, as RGBA: alpha lets the picture behind it show.
+    pub launcher_background: [u8; 4],
+    /// Picture behind the start screen's color.
+    pub launcher_image: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -37,14 +41,16 @@ impl Default for AppConfig {
             pad_bindings: PadBindings::default(),
             upscale: UpscaleConfig::default(),
             swap_interval: None,
+            launcher_background: [231, 234, 237, 255],
+            launcher_image: None,
         }
     }
 }
 
 impl AppConfig {
-    /// Default location: `flora.toml` in the working directory.
+    /// Default location: `shocora.toml` in the working directory.
     pub fn default_path() -> PathBuf {
-        PathBuf::from("flora.toml")
+        PathBuf::from("shocora.toml")
     }
 
     /// Loads `path`, falling back to defaults when missing or invalid.

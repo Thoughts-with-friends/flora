@@ -1,6 +1,6 @@
 [package]
-name = "flora_gui_common"
-description = "Front-end helpers shared by every flora GUI: console thread, config, input mapping, loader"
+name = "shocora_gui_common"
+description = "Front-end helpers shared by every shocora GUI: console thread, config, input mapping, loader"
 authors.workspace = true
 categories.workspace = true
 edition.workspace = true
@@ -13,7 +13,7 @@ version.workspace = true
 
 [dependencies]
 cpal = "0.17"
-flora_render = { workspace = true }
+shocora_render = { workspace = true }
 gilrs = "0.11"
 log = { workspace = true }
 serde = { workspace = true }

@@ -15,8 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         app:
-          - package: flora_egui
-            app_name: flora_egui
+          - package: shocora_egui
+            app_name: shocora_egui
             features: release
 
         target:

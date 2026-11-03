@@ -12,7 +12,7 @@ use crate::{
     GpuError, Screen,
     display::Display,
     latte::{DrawRequest, Latte, SurfaceWords, index_type},
-    regs::{RegisterFile, base},
+    regs::{RegisterFile, base, context as reg},
 };
 
 /// Maximum nesting of `INDIRECT_BUFFER`.
@@ -110,9 +110,10 @@ impl CommandProcessor {
             self.current_context = *state;
             return;
         }
-        if *state == 0 || *state == self.current_context {
+        if *state == self.current_context {
             return;
         }
+        // State 0 turns shadowing off: what is set from now on belongs to no context.
         self.save_context(ctx);
         self.current_context = *state;
         if let Some(saved) = self.contexts.get(state) {
@@ -139,7 +140,7 @@ impl CommandProcessor {
             indices,
             immediate,
         };
-        ctx.latte.draw(ctx.memory, &self.regs, &request);
+        ctx.latte.draw(ctx.memory, &mut self.regs, &request);
     }
 
     fn type3(
@@ -187,6 +188,25 @@ impl CommandProcessor {
                     // DATA32 (bit 18) clear: also write the high dword.
                     if control & (1 << 18) == 0 {
                         ctx.memory.write_u32(address + 4, *data_hi)?;
+                    }
+                }
+            }
+            opcode::STRMOUT_BUFFER_UPDATE => {
+                if let [control, write_address, _, read_address, ..] = body {
+                    let buffer = (control >> 8) & 3;
+                    let register = reg::VGT_STRMOUT_BUFFER_OFFSET_0 + buffer * 4;
+                    match (control >> 1) & 3 {
+                        0 => self.regs.set(register, 0),
+                        // The offset a saved context holds.
+                        2 => {
+                            let saved = ctx.memory.read_u32(translate(*read_address)?)?;
+                            self.regs.set(register, saved);
+                        }
+                        3 => {
+                            let at = translate(*write_address)?;
+                            ctx.memory.write_u32(at, self.regs.get(register))?;
+                        }
+                        mode => log::debug!("STRMOUT_BUFFER_UPDATE mode {mode}"),
                     }
                 }
             }

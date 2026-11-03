@@ -4,7 +4,7 @@
 //! `roms.json`, so the tools work with whatever the developer owns.
 use std::path::{Path, PathBuf};
 
-use flora_game_library::{GameEntry, GameLibrary, RomPaths};
+use shocora_game_library::{GameEntry, GameLibrary, RomPaths};
 
 /// Location of `roms.json`, relative to this crate.
 pub fn roms_json() -> PathBuf {

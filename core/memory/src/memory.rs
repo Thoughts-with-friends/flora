@@ -287,11 +287,11 @@ mod tests {
     #[test]
     fn c_strings_and_moves() {
         let mut memory = test_memory();
-        memory.write_c_string(0x1000, "flora").unwrap();
-        assert_eq!(memory.read_c_string(0x1000, 64).unwrap(), "flora");
+        memory.write_c_string(0x1000, "shocora").unwrap();
+        assert_eq!(memory.read_c_string(0x1000, 64).unwrap(), "shocora");
         memory.copy_within(0x1002, 0x1000, 5).unwrap();
-        assert_eq!(memory.read_c_string(0x1000, 64).unwrap(), "flflora");
+        assert_eq!(memory.read_c_string(0x1000, 64).unwrap(), "shshoco");
         memory.copy_within(0x0010, 0x1000, 3).unwrap();
-        assert_eq!(memory.read_c_string(0x0010, 3).unwrap(), "flf");
+        assert_eq!(memory.read_c_string(0x0010, 3).unwrap(), "shs");
     }
 }

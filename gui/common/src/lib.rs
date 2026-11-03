@@ -1,4 +1,4 @@
-//! What every flora front end shares on top of the core crates:
+//! What every shocora front end shares on top of the core crates:
 //! [`console::Console`] (the emulator running on its own thread), the
 //! persisted [`config::AppConfig`] and keyboard/controller → GamePad [`input`] mapping.
 pub mod audio;

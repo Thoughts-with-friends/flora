@@ -152,7 +152,7 @@ fn os_switch_fiber(ctx: &mut HleContext<'_>, function: u32, stack: u32) -> Resul
 }
 
 /// The fiber's function returned: back to the caller of `OSSwitchFiberEx`.
-#[hle_export(lib = "flora", name = "__flora_FiberReturn")]
+#[hle_export(lib = "shocora", name = "__shocora_FiberReturn")]
 fn fiber_return(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
     let me = ctx.os.coreinit.threads.current;
     let (stack, lr) = ctx

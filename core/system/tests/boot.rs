@@ -1,6 +1,6 @@
 //! End-to-end: RPX → loader → interpreter → HLE → process exit.
 #![allow(clippy::unwrap_used, reason = "test helpers")]
-use wiiu_emu::{Config, Emulator, Status};
+use wiiu_emu::{Config, Emulator, RenderCommand, Status};
 use wiiu_rpl::builder::RplBuilder;
 
 const BL: u32 = 0x4800_0001;
@@ -38,6 +38,32 @@ fn hello_world_through_os_report_and_exit() {
     let mut emu = run(&rpx);
     assert_eq!(*emu.status(), Status::Exited(7));
     assert_eq!(emu.take_console(), ["value=42\n"]);
+}
+
+#[test]
+fn reset_boots_the_same_program_again_and_tells_the_renderer() {
+    let rpx = RplBuilder::new()
+        .text(&[
+            0x3860_0007, // li r3, 7
+            BL,          // bl exit
+            0x4800_0000, // b .
+        ])
+        .call_import(4, "coreinit", "exit")
+        .build();
+    let mut emu = run(&rpx);
+    assert_eq!(*emu.status(), Status::Exited(7));
+    emu.take_render_commands();
+
+    assert!(emu.reset().unwrap());
+    assert_eq!(*emu.status(), Status::Running);
+    assert!(matches!(emu.take_render_commands().first(), Some(RenderCommand::Reset)));
+    for _ in 0..10 {
+        emu.run_frame();
+    }
+    assert_eq!(*emu.status(), Status::Exited(7));
+
+    emu.stop();
+    assert!(!emu.reset().unwrap());
 }
 
 #[test]

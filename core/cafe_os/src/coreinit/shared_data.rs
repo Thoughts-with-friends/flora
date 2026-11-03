@@ -1,6 +1,6 @@
 //! `OSGetSharedData`: the system fonts every title can map.
 //!
-//! Fonts are not part of flora. They are looked for in `FLORA_FONTS`, the
+//! Fonts are not part of shocora. They are looked for in `SHOCORA_FONTS`, the
 //! configured folder, a `resources/sharedFonts` folder next to the working
 //! directory or executable, and a Cemu installation nearby (`CafeCn.ttf`,
 //! `CafeKr.ttf`, `CafeStd.ttf`, `CafeTw.ttf`). Failing that a host font stands
@@ -58,7 +58,7 @@ fn cemu_font_dirs(start: &Path) -> Vec<PathBuf> {
 
 fn font_directories(configured: Option<&Path>) -> Vec<PathBuf> {
     let mut directories: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("FLORA_FONTS") {
+    if let Some(dir) = std::env::var_os("SHOCORA_FONTS") {
         directories.push(dir.into());
     }
     directories.extend(configured.map(Path::to_path_buf));
@@ -115,7 +115,7 @@ fn font_bytes(id: usize, configured: Option<&Path>) -> Option<(Vec<u8>, Option<S
             return Some((bytes, Some(warning)));
         }
     }
-    log::warn!("system font {name} not found; see FLORA_FONTS");
+    log::warn!("system font {name} not found; see SHOCORA_FONTS");
     None
 }
 #[hle_export(lib = "coreinit", name = "OSGetSharedData")]
@@ -202,12 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn cemu_installations_are_found_next_to_flora() {
-        let root = std::env::temp_dir().join(format!("flora-fonts-{}", std::process::id()));
+    fn cemu_installations_are_found_next_to_shocora() {
+        let root = std::env::temp_dir().join(format!("shocora-fonts-{}", std::process::id()));
         let fonts = root.join("Cemu_2.6/resources/sharedFonts");
         std::fs::create_dir_all(&fonts).unwrap();
-        std::fs::create_dir_all(root.join("flora")).unwrap();
-        assert_eq!(cemu_font_dirs(&root.join("flora")), [fonts]);
+        std::fs::create_dir_all(root.join("shocora")).unwrap();
+        assert_eq!(cemu_font_dirs(&root.join("shocora")), [fonts]);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

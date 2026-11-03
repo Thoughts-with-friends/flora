@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn scans_titles_and_rpx_files() {
-        let root = std::env::temp_dir().join(format!("flora-library-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("shocora-library-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("Game B/code")).unwrap();
         fs::create_dir_all(root.join("Game B/meta")).unwrap();

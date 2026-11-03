@@ -74,6 +74,11 @@ pub mod context {
     pub const VGT_MULTI_PRIM_IB_RESET_EN: u32 = 0xA2A5;
     pub const VGT_INSTANCE_STEP_RATE_0: u32 = 0xA2A8;
     pub const VGT_STRMOUT_EN: u32 = 0xA2AC;
+    /// Four registers per stream-out buffer from here: size, stride, base, offset.
+    pub const VGT_STRMOUT_BUFFER_SIZE_0: u32 = 0xA2B4;
+    pub const VGT_STRMOUT_VTX_STRIDE_0: u32 = 0xA2B5;
+    pub const VGT_STRMOUT_BUFFER_BASE_0: u32 = 0xA2B6;
+    pub const VGT_STRMOUT_BUFFER_OFFSET_0: u32 = 0xA2B7;
     pub const PA_SU_POLY_OFFSET_CLAMP: u32 = 0xA37F;
     pub const PA_SU_POLY_OFFSET_FRONT_SCALE: u32 = 0xA380;
 }

@@ -75,7 +75,7 @@ impl AddressSpace {
     ///
     /// # Panics
     /// If the host cannot reserve 4 GiB of address space (64-bit hosts always can).
-    #[allow(clippy::expect_used, reason = "only fails on hosts flora cannot run on")]
+    #[allow(clippy::expect_used, reason = "only fails on hosts shocora cannot run on")]
     pub fn new() -> Self {
         let base = NonNull::new(os::reserve(ADDRESS_SPACE))
             .expect("cannot reserve the guest address space");

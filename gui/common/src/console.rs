@@ -31,10 +31,12 @@ pub enum ConsoleCommand {
     Pause,
     Resume,
     Stop,
+    /// Reboots the running title.
+    Reset,
     GamePad(GamePadState),
     /// Where to find the system fonts from the next boot on.
     FontsDir(Option<PathBuf>),
-    /// Vertical blanks per flip from the next boot on, whatever the title asks for.
+    /// Vertical blanks per flip from now on, whatever the title asks for.
     SwapInterval(Option<u32>),
 }
 
@@ -83,7 +85,7 @@ impl Console {
         let (tx, rx) = mpsc::channel();
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("flora-emu".into())
+            .name("shocora-emu".into())
             .spawn(move || {
                 EmuThread {
                     emulator,
@@ -162,9 +164,16 @@ impl EmuThread {
                 self.emulator.stop();
                 self.shared.lock().unwrap_or_else(PoisonError::into_inner).title = None;
             }
+            ConsoleCommand::Reset => {
+                self.paused = false;
+                if let Err(error) = self.emulator.reset() {
+                    self.shared.lock().unwrap_or_else(PoisonError::into_inner).load_error =
+                        Some(format!("reset: {error}"));
+                }
+            }
             ConsoleCommand::GamePad(state) => self.emulator.set_gamepad(state),
             ConsoleCommand::FontsDir(dir) => self.emulator.config.fonts_dir = dir,
-            ConsoleCommand::SwapInterval(interval) => self.emulator.config.swap_interval = interval,
+            ConsoleCommand::SwapInterval(interval) => self.emulator.set_swap_interval(interval),
         }
     }
 

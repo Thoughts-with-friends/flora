@@ -25,10 +25,10 @@ use egui_wgpu::wgpu;
 use wgpu::util::DeviceExt as _;
 use wiiu_gpu::{
     RenderBackend, RenderCommand, Screen,
-    latte::ARENA_SIZE,
+    latte::{ARENA_SIZE, STREAM_REGION_BASE, STREAM_REGION_SIZE},
     render::{
-        AddressMode, BindingKind, BoundTexture, DrawCommand, HostFormat, SamplerDesc, ShaderModule,
-        SurfaceKey, TextureUpload, Topology,
+        AddressMode, BindingKind, BorderColor, BoundTexture, DrawCommand, HostFormat, SamplerDesc,
+        ShaderModule, SurfaceKey, TextureUpload, Topology,
     },
     shader::{TextureDim, TextureKind},
 };
@@ -36,7 +36,7 @@ use wiiu_gpu::{
 use crate::upscale::{UpscaleSetting, Upscaler};
 
 /// Size the shader prelude reads through the dynamic binding.
-const PARAMS_BINDING_SIZE: u64 = 288;
+const PARAMS_BINDING_SIZE: u64 = 324;
 
 /// Address of the surfaces standing in for attachments of the wrong size.
 const STAND_IN_ADDRESS: u32 = 0xFFFF_F000;
@@ -50,7 +50,10 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::RG11B10UFLOAT_RENDERABLE
             | wgpu::Features::DEPTH_CLIP_CONTROL
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
             | wgpu::Features::PIPELINE_CACHE
+            // Stream-out: vertex shaders store their results in a buffer.
+            | wgpu::Features::VERTEX_WRITABLE_STORAGE
             // Latte renders to formats WebGPU keeps read-only, such as RGBA8 SNORM.
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
 }
@@ -198,12 +201,30 @@ const fn blend_operation(value: u8) -> wgpu::BlendOperation {
     }
 }
 
-const fn address_mode(mode: AddressMode) -> wgpu::AddressMode {
+const fn address_mode(mode: AddressMode, border: bool) -> wgpu::AddressMode {
     match mode {
         AddressMode::Repeat => wgpu::AddressMode::Repeat,
         AddressMode::Mirror => wgpu::AddressMode::MirrorRepeat,
-        AddressMode::Clamp => wgpu::AddressMode::ClampToEdge,
-        AddressMode::Border => wgpu::AddressMode::ClampToEdge,
+        AddressMode::Border if border => wgpu::AddressMode::ClampToBorder,
+        AddressMode::Clamp | AddressMode::Border => wgpu::AddressMode::ClampToEdge,
+    }
+}
+
+/// `MIN` and `MAX` ignore the blend factors, and the host insists they say so.
+const fn blend_component(src: u8, dst: u8, operation: u8) -> wgpu::BlendComponent {
+    let operation = blend_operation(operation);
+    if matches!(operation, wgpu::BlendOperation::Min | wgpu::BlendOperation::Max) {
+        wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation,
+        }
+    } else {
+        wgpu::BlendComponent {
+            src_factor: blend_factor(src),
+            dst_factor: blend_factor(dst),
+            operation,
+        }
     }
 }
 
@@ -250,8 +271,8 @@ impl PipelineContext<'_> {
         // Parsed outside the lock: this is the slow part. Another thread doing the
         // same module at the same time only wastes a little work.
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("flora shader"),
-            source: wgpu::ShaderSource::Wgsl(if std::env::var_os("FLORA_DEBUG_RED").is_some() {
+            label: Some("shocora shader"),
+            source: wgpu::ShaderSource::Wgsl(if std::env::var_os("SHOCORA_DEBUG_RED").is_some() {
                 shader
                     .wgsl
                     .replace(
@@ -270,7 +291,28 @@ impl PipelineContext<'_> {
         module
     }
 
-    fn build(&self, draw: &DrawCommand, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    /// A pipeline the host refuses is `None`: using it would lose the whole frame, not one draw.
+    fn build(
+        &self,
+        draw: &DrawCommand,
+        layout: &wgpu::PipelineLayout,
+    ) -> Option<wgpu::RenderPipeline> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = self.create(draw, layout);
+        match pollster::block_on(scope.pop()) {
+            None => Some(pipeline),
+            Some(error) => {
+                log::error!(
+                    "shaders vs{} ps{} rejected, draws using them are skipped: {error}",
+                    draw.vertex.id,
+                    draw.pixel.id
+                );
+                None
+            }
+        }
+    }
+
+    fn create(&self, draw: &DrawCommand, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
         let vs = self.module(&draw.vertex);
         let fs = self.module(&draw.pixel);
         let state = &draw.state;
@@ -280,20 +322,26 @@ impl PipelineContext<'_> {
                     let wgpu_format = wgpu_format(format);
                     let integer = matches!(format.kind(), TextureKind::Uint | TextureKind::Sint);
                     let blend = state.blend[i];
+                    let blendable = wgpu_format
+                        .guaranteed_format_features(self.device.features())
+                        .flags
+                        .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
                     wgpu::ColorTargetState {
                         format: wgpu_format,
-                        blend: (blend.enabled && !integer).then_some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: blend_factor(blend.color_src),
-                                dst_factor: blend_factor(blend.color_dst),
-                                operation: blend_operation(blend.color_op),
+                        blend: (blend.enabled && !integer && blendable).then_some(
+                            wgpu::BlendState {
+                                color: blend_component(
+                                    blend.color_src,
+                                    blend.color_dst,
+                                    blend.color_op,
+                                ),
+                                alpha: blend_component(
+                                    blend.alpha_src,
+                                    blend.alpha_dst,
+                                    blend.alpha_op,
+                                ),
                             },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: blend_factor(blend.alpha_src),
-                                dst_factor: blend_factor(blend.alpha_dst),
-                                operation: blend_operation(blend.alpha_op),
-                            },
-                        }),
+                        ),
                         write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(
                             state.color_masks[i] & 0xF,
                         )),
@@ -302,6 +350,16 @@ impl PipelineContext<'_> {
             })
             .collect();
         let last = targets.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        let fragment = (!draw.stream_only).then_some(wgpu::FragmentState {
+            module: &fs,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            targets: &targets[..last],
+        });
+        let triangles = matches!(
+            state.topology,
+            Topology::Triangles | Topology::Rects | Topology::TriangleStrip
+        );
         let depth_stencil = state.depth_format.map(|format| {
             let face = |f: wiiu_gpu::render::StencilFace| wgpu::StencilFaceState {
                 compare: compare_function(f.compare),
@@ -328,10 +386,15 @@ impl PipelineContext<'_> {
                 } else {
                     wgpu::StencilState::default()
                 },
-                bias: wgpu::DepthBiasState {
-                    constant: f32::from_bits(state.depth_bias[1]) as i32,
-                    slope_scale: f32::from_bits(state.depth_bias[0]) / 16.0,
-                    clamp: f32::from_bits(state.depth_bias[2]),
+                // The host biases triangles only.
+                bias: if triangles {
+                    wgpu::DepthBiasState {
+                        constant: f32::from_bits(state.depth_bias[1]) as i32,
+                        slope_scale: f32::from_bits(state.depth_bias[0]) / 16.0,
+                        clamp: f32::from_bits(state.depth_bias[2]),
+                    }
+                } else {
+                    wgpu::DepthBiasState::default()
                 },
             }
         });
@@ -349,7 +412,7 @@ impl PipelineContext<'_> {
             _ => None,
         };
         self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("flora pipeline"),
+            label: Some("shocora pipeline"),
             layout: Some(layout),
             vertex: wgpu::VertexState {
                 module: &vs,
@@ -376,12 +439,7 @@ impl PipelineContext<'_> {
             },
             depth_stencil,
             multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &fs,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &targets[..last],
-            }),
+            fragment,
             multiview_mask: None,
             cache: self.cache,
         })
@@ -470,6 +528,60 @@ impl HostSurface {
     }
 }
 
+/// The stream-out buffer and what rendering into nothing needs.
+struct StreamOutput {
+    buffer: wgpu::Buffer,
+    layout: wgpu::BindGroupLayout,
+    group: wgpu::BindGroup,
+    /// A pass needs an attachment, even with nothing to draw.
+    depth: wgpu::TextureView,
+}
+
+impl StreamOutput {
+    fn new(device: &wgpu::Device) -> Option<Self> {
+        if !device.features().contains(wgpu::Features::VERTEX_WRITABLE_STORAGE) {
+            return None;
+        }
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shocora stream-out"),
+            size: u64::from(STREAM_REGION_SIZE),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shocora stream-out"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shocora stream-out"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        });
+        let depth = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shocora stream-out depth"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        Some(Self { buffer, layout, group, depth })
+    }
+}
+
 /// `(color attachments, depth attachment)` of the open render pass.
 type PassKey = ([Option<(SurfaceKey, u32)>; 8], Option<(SurfaceKey, u32)>);
 
@@ -488,7 +600,9 @@ pub struct LatteRenderer {
     pipeline_cache: Option<(wgpu::PipelineCache, PathBuf)>,
     pipelines: HashMap<(u64, u64, u64), Option<Arc<wgpu::RenderPipeline>>>,
     resource_layouts: HashMap<Vec<(u32, BindingKind)>, wgpu::BindGroupLayout>,
-    pipeline_layouts: HashMap<Vec<(u32, BindingKind)>, wgpu::PipelineLayout>,
+    pipeline_layouts: HashMap<(Vec<(u32, BindingKind)>, bool), wgpu::PipelineLayout>,
+    /// What vertex shaders stream out to, with its `group(2)`, if the adapter allows it.
+    stream: Option<StreamOutput>,
     samplers: HashMap<SamplerDesc, wgpu::Sampler>,
     bind_groups: HashMap<u64, wgpu::BindGroup>,
     dummy_textures: HashMap<(TextureDim, TextureKind), wgpu::TextureView>,
@@ -507,7 +621,7 @@ pub struct LatteRenderer {
     /// Screens with a new image since the last flip.
     presented: Vec<Screen>,
     logged: std::collections::HashSet<String>,
-    /// Debugging aid: only the first draws of each frame execute (FLORA_MAX_DRAWS).
+    /// Debugging aid: only the first draws of each frame execute (SHOCORA_MAX_DRAWS).
     max_draws: Option<u32>,
     frame_draws: u32,
     target_log: HashMap<SurfaceKey, u32>,
@@ -527,19 +641,21 @@ impl std::fmt::Debug for LatteRenderer {
 impl LatteRenderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         device.on_uncaptured_error(Arc::new(|error| log::error!("wgpu: {error}")));
+
         let limit = device.limits().max_storage_buffer_binding_size;
         let arena_size = u64::from(ARENA_SIZE).min(limit);
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flora arena"),
+            label: Some("shocora arena"),
             size: arena_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDEX
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
         let visibility = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let arena_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("flora arena layout"),
+            label: Some("shocora arena layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -563,8 +679,9 @@ impl LatteRenderer {
                 },
             ],
         });
+
         let arena_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flora arena group"),
+            label: Some("shocora arena group"),
             layout: &arena_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: arena.as_entire_binding() },
@@ -580,7 +697,7 @@ impl LatteRenderer {
         });
 
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("flora blit layout"),
+            label: Some("shocora blit layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -600,17 +717,20 @@ impl LatteRenderer {
                 },
             ],
         });
+
         let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("flora blit"),
+            label: Some("shocora blit"),
             source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
         });
+
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("flora blit"),
+            label: Some("shocora blit"),
             bind_group_layouts: &[Some(&blit_layout)],
             immediate_size: 0,
         });
+
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("flora blit"),
+            label: Some("shocora blit"),
             layout: Some(&blit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &blit_module,
@@ -630,11 +750,14 @@ impl LatteRenderer {
             multiview_mask: None,
             cache: None,
         });
+
         let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let stream = StreamOutput::new(&device);
+
         Self {
             device,
             queue,
@@ -648,6 +771,7 @@ impl LatteRenderer {
             pipelines: HashMap::new(),
             resource_layouts: HashMap::new(),
             pipeline_layouts: HashMap::new(),
+            stream,
             samplers: HashMap::new(),
             bind_groups: HashMap::new(),
             dummy_textures: HashMap::new(),
@@ -665,7 +789,7 @@ impl LatteRenderer {
             upscaler: Upscaler::default(),
             presented: Vec::new(),
             logged: std::collections::HashSet::new(),
-            max_draws: std::env::var("FLORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
+            max_draws: std::env::var("SHOCORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
             frame_draws: 0,
             target_log: HashMap::new(),
             draws_executed: 0,
@@ -695,7 +819,7 @@ impl LatteRenderer {
     fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
         self.encoder.get_or_insert_with(|| {
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("flora frame"),
+                label: Some("shocora frame"),
             })
         })
     }
@@ -742,7 +866,7 @@ impl LatteRenderer {
             }
             let max_levels = (32 - width.max(height).leading_zeros()).max(1);
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("flora surface"),
+                label: Some("shocora surface"),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
                 mip_level_count: mip_count.clamp(1, max_levels),
                 sample_count: 1,
@@ -852,7 +976,7 @@ impl LatteRenderer {
         }
         let encoder = self.encoder();
         drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("flora clear"),
+            label: Some("shocora clear"),
             color_attachments: &[color_attachment],
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: None,
@@ -869,12 +993,20 @@ impl LatteRenderer {
         }
         let Some(name) = wgpu::util::pipeline_cache_key(adapter) else { return };
         let path = dir.join(name);
-        let data = std::fs::read(&path).ok();
-        // SAFETY: the file is named after this adapter and driver, as wgpu asks, and
-        // `fallback` makes a file that does not match mean an empty cache.
+        // A damaged cache counts as no cache: not every driver survives one.
+        let data = std::fs::read(&path).ok().and_then(|file| {
+            let data = verified_cache_data(&file).map(<[u8]>::to_vec);
+            if data.is_none() {
+                log::warn!("{}: damaged shader cache thrown away", path.display());
+                let _ = std::fs::remove_file(&path);
+            }
+            data
+        });
+        // SAFETY: the file is named after this adapter and driver, as wgpu asks, its checksum
+        // holds, and `fallback` makes data the driver does not accept mean an empty cache.
         let cache = unsafe {
             self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                label: Some("flora pipelines"),
+                label: Some("shocora pipelines"),
                 data: data.as_deref(),
                 fallback: true,
             })
@@ -884,11 +1016,15 @@ impl LatteRenderer {
 
     fn save_pipeline_cache(&self) {
         let Some((cache, path)) = &self.pipeline_cache else { return };
-        let Some(data) = cache.get_data() else { return };
+        let Some(mut data) = cache.get_data() else { return };
+        data.extend_from_slice(&cache_checksum(&data).to_le_bytes());
+        // Written aside and moved in place: a crash leaves the old file, not half of a new one.
+        let partial = path.with_extension("partial");
         let written = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(path, data));
+            .and_then(|()| std::fs::write(&partial, data))
+            .and_then(|()| std::fs::rename(&partial, path));
         if let Err(error) = written {
             log::warn!("{}: {error}", path.display());
         }
@@ -900,7 +1036,8 @@ impl LatteRenderer {
         for draw in draws {
             let key = pipeline_key(draw);
             if !self.pipelines.contains_key(&key) && !jobs.contains_key(&key) {
-                jobs.insert(key, (draw, self.pipeline_layout(&sorted_bindings(draw))));
+                let layout = self.pipeline_layout(&sorted_bindings(draw), draw.vertex.stream_out);
+                jobs.insert(key, (draw, layout));
             }
         }
         let jobs: Vec<_> = jobs.into_iter().collect();
@@ -913,7 +1050,7 @@ impl LatteRenderer {
         let compile = || {
             let mut done = Vec::new();
             while let Some((key, (draw, layout))) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                done.push((*key, Arc::new(context.build(draw, layout))));
+                done.push((*key, context.build(draw, layout).map(Arc::new)));
             }
             done
         };
@@ -928,7 +1065,7 @@ impl LatteRenderer {
             })
         };
         for (key, pipeline) in compiled {
-            self.pipelines.insert(key, Some(pipeline));
+            self.pipelines.insert(key, pipeline);
         }
     }
 
@@ -977,23 +1114,28 @@ impl LatteRenderer {
                     })
                     .collect();
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("flora resources"),
+                    label: Some("shocora resources"),
                     entries: &entries,
                 })
             })
             .clone()
     }
 
-    fn pipeline_layout(&mut self, bindings: &[(u32, BindingKind)]) -> wgpu::PipelineLayout {
+    fn pipeline_layout(
+        &mut self,
+        bindings: &[(u32, BindingKind)],
+        stream_out: bool,
+    ) -> wgpu::PipelineLayout {
         let resources = self.resource_layout(bindings);
         let device = &self.device;
         let arena_layout = &self.arena_layout;
+        let stream_layout = self.stream.as_ref().filter(|_| stream_out).map(|s| &s.layout);
         self.pipeline_layouts
-            .entry(bindings.to_vec())
+            .entry((bindings.to_vec(), stream_out))
             .or_insert_with(|| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("flora pipeline"),
-                    bind_group_layouts: &[Some(arena_layout), Some(&resources)],
+                    label: Some("shocora pipeline"),
+                    bind_group_layouts: &[Some(arena_layout), Some(&resources), stream_layout],
                     immediate_size: 0,
                 })
             })
@@ -1010,20 +1152,23 @@ impl LatteRenderer {
 
     fn sampler(&mut self, desc: SamplerDesc) -> wgpu::Sampler {
         let device = &self.device;
+        let border = device.features().contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
         self.samplers
             .entry(desc)
             .or_insert_with(|| {
                 let filter = |linear: bool| {
                     if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest }
                 };
+                // The host only filters anisotropically between mips, too.
+                let anisotropy = desc.anisotropy.max(1);
                 device.create_sampler(&wgpu::SamplerDescriptor {
-                    label: Some("flora sampler"),
-                    address_mode_u: address_mode(desc.address[0]),
-                    address_mode_v: address_mode(desc.address[1]),
-                    address_mode_w: address_mode(desc.address[2]),
+                    label: Some("shocora sampler"),
+                    address_mode_u: address_mode(desc.address[0], border),
+                    address_mode_v: address_mode(desc.address[1], border),
+                    address_mode_w: address_mode(desc.address[2], border),
                     mag_filter: filter(desc.mag_linear),
                     min_filter: filter(desc.min_linear),
-                    mipmap_filter: if desc.mip_linear {
+                    mipmap_filter: if desc.mip_linear || anisotropy > 1 {
                         wgpu::MipmapFilterMode::Linear
                     } else {
                         wgpu::MipmapFilterMode::Nearest
@@ -1032,8 +1177,14 @@ impl LatteRenderer {
                     lod_max_clamp: (f32::from(desc.max_lod) / 64.0)
                         .max(f32::from(desc.min_lod) / 64.0),
                     compare: desc.compare.map(compare_function),
-                    anisotropy_clamp: 1,
-                    border_color: None,
+                    anisotropy_clamp: u16::from(anisotropy),
+                    border_color: desc.address.contains(&AddressMode::Border).then_some(match desc
+                        .border
+                    {
+                        BorderColor::TransparentBlack => wgpu::SamplerBorderColor::TransparentBlack,
+                        BorderColor::OpaqueBlack => wgpu::SamplerBorderColor::OpaqueBlack,
+                        BorderColor::OpaqueWhite => wgpu::SamplerBorderColor::OpaqueWhite,
+                    }),
                     ..Default::default()
                 })
             })
@@ -1056,7 +1207,7 @@ impl LatteRenderer {
                 let texture = device.create_texture_with_data(
                     &queue,
                     &wgpu::TextureDescriptor {
-                        label: Some("flora dummy"),
+                        label: Some("shocora dummy"),
                         size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
                         mip_level_count: 1,
                         sample_count: 1,
@@ -1109,7 +1260,7 @@ impl LatteRenderer {
         let device = self.device.clone();
         let copy = self.feedback_copies.entry(bound.key).or_insert_with(|| {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("flora feedback copy"),
+                label: Some("shocora feedback copy"),
                 size: source.size(),
                 mip_level_count: 1,
                 sample_count: 1,
@@ -1142,7 +1293,7 @@ impl LatteRenderer {
         &mut self,
         draw: &DrawCommand,
         bindings: &[(u32, BindingKind)],
-    ) -> wgpu::BindGroup {
+    ) -> Option<wgpu::BindGroup> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bindings.hash(&mut hasher);
         for bound in &draw.textures {
@@ -1160,7 +1311,7 @@ impl LatteRenderer {
         });
         if !feedback {
             if let Some(group) = self.bind_groups.get(&key) {
-                return group.clone();
+                return Some(group.clone());
             }
         }
         let mut views: Vec<(u32, wgpu::TextureView)> = Vec::new();
@@ -1231,15 +1382,20 @@ impl LatteRenderer {
             .get(bindings)
             .cloned()
             .unwrap_or_else(|| self.resource_layout(bindings));
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flora resources"),
+            label: Some("shocora resources"),
             layout: &layout,
             entries: &entries,
         });
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            self.log_once(format!("draw skipped, its textures do not fit: {error}"));
+            return None;
+        }
         if !feedback {
             self.bind_groups.insert(key, group.clone());
         }
-        group
+        Some(group)
     }
 
     fn open_pass(&mut self, draw: &DrawCommand) {
@@ -1315,7 +1471,7 @@ impl LatteRenderer {
         let encoder = self.encoder();
         let pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("flora draw"),
+                label: Some("shocora draw"),
                 color_attachments: &attachments,
                 depth_stencil_attachment: depth_attachment,
                 timestamp_writes: None,
@@ -1327,10 +1483,70 @@ impl LatteRenderer {
         self.pass_key = Some(key);
     }
 
+    /// Runs a draw that only has its vertex shader stream out.
+    fn stream_draw(&mut self, draw: &DrawCommand, pipeline: &wgpu::RenderPipeline) {
+        let bindings = sorted_bindings(draw);
+        let Some(group) = self.resource_group(draw, &bindings) else { return };
+        let Some((stream_group, depth)) =
+            self.stream.as_ref().map(|s| (s.group.clone(), s.depth.clone()))
+        else {
+            return;
+        };
+        self.end_pass();
+        let arena_group = self.arena_group.clone();
+        let encoder = self.encoder();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shocora stream-out"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &arena_group, &[draw.params_offset]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.set_bind_group(2, &stream_group, &[]);
+        let first = draw.base_vertex.cast_unsigned();
+        pass.draw(first..first + draw.count, 0..draw.instances);
+    }
+
+    /// Moves stream-out results to where later draws read vertices.
+    fn finish_stream_out(&mut self, draw: &DrawCommand) {
+        if draw.stream_copies.is_empty() {
+            return;
+        }
+        let Some(source) = self.stream.as_ref().map(|s| s.buffer.clone()) else { return };
+        self.end_pass();
+        let arena = self.arena.clone();
+        let encoder = self.encoder();
+        for copy in &draw.stream_copies {
+            encoder.copy_buffer_to_buffer(
+                &source,
+                u64::from(copy.offset),
+                &arena,
+                u64::from(STREAM_REGION_BASE) + u64::from(copy.offset),
+                u64::from(copy.size),
+            );
+        }
+    }
+
     fn draw(&mut self, draw: &DrawCommand) {
         let bindings = sorted_bindings(draw);
         let Some(pipeline) = self.pipeline(draw) else { return };
-        let group = self.resource_group(draw, &bindings);
+        if draw.stream_only {
+            self.stream_draw(draw, &pipeline);
+            self.finish_stream_out(draw);
+            return;
+        }
+        let Some(group) = self.resource_group(draw, &bindings) else { return };
         self.open_pass(draw);
         let extent = draw
             .color_targets
@@ -1343,6 +1559,11 @@ impl LatteRenderer {
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &self.arena_group, &[draw.params_offset]);
         pass.set_bind_group(1, &group, &[]);
+        if draw.vertex.stream_out {
+            if let Some(stream) = &self.stream {
+                pass.set_bind_group(2, &stream.group, &[]);
+            }
+        }
         let [x, y, width, height, near, far] = draw.viewport;
         let (limit_w, limit_h) = (extent.0 as f32, extent.1 as f32);
         let vx = x.clamp(0.0, limit_w - 1.0);
@@ -1375,6 +1596,7 @@ impl LatteRenderer {
         for (key, _) in draw.color_targets.iter().flatten() {
             *self.target_log.entry(*key).or_insert(0) += 1;
         }
+        self.finish_stream_out(draw);
     }
 
     fn copy_surface(
@@ -1405,6 +1627,21 @@ impl LatteRenderer {
             source.width.min(target.width >> target_level).max(1),
             source.height.min(target.height >> target_level).max(1),
         );
+        // An invalid copy would invalidate everything recorded with it, the whole frame.
+        let format = source_texture.format();
+        let (block_w, block_h) = format.block_dimensions();
+        let partial_depth = format.is_depth_stencil_format()
+            && (width != source_texture.width() || height != source_texture.height());
+        if source_slice >= source_texture.depth_or_array_layers()
+            || target_slice >= target_texture.depth_or_array_layers()
+            || target_level >= target_texture.mip_level_count()
+            || width % block_w != 0
+            || height % block_h != 0
+            || partial_depth
+        {
+            self.log_once(format!("copy skipped: {source:?} slice {source_slice} -> {target:?}"));
+            return;
+        }
         let aspect = wgpu::TextureAspect::All;
         let encoder = self.encoder();
         encoder.copy_texture_to_texture(
@@ -1439,8 +1676,8 @@ impl LatteRenderer {
         if stale {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(match screen {
-                    Screen::Tv => "flora TV",
-                    Screen::Drc => "flora GamePad",
+                    Screen::Tv => "shocora TV",
+                    Screen::Drc => "shocora GamePad",
                 }),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -1460,7 +1697,7 @@ impl LatteRenderer {
         }
         let Some(target) = self.screen_targets.get(&screen).cloned() else { return };
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flora blit"),
+            label: Some("shocora blit"),
             layout: &self.blit_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1476,7 +1713,7 @@ impl LatteRenderer {
         let pipeline = self.blit_pipeline.clone();
         let encoder = self.encoder();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("flora present"),
+            label: Some("shocora present"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &target.view,
                 depth_slice: None,
@@ -1536,7 +1773,7 @@ impl LatteRenderer {
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
-                label: Some("flora blank screen"),
+                label: Some("shocora blank screen"),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -1558,6 +1795,21 @@ impl LatteRenderer {
         self.screens.set(screen, image);
     }
 
+    /// The console rebooted: what the last boot left must not be taken for the new one's, above
+    /// all its shaders, whose ids start over.
+    fn reset(&mut self) {
+        self.submit();
+        self.save_pipeline_cache();
+        self.surfaces.clear();
+        self.modules.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.pipelines.clear();
+        self.bind_groups.clear();
+        self.feedback_copies.clear();
+        self.pending_scan.clear();
+        self.presented.clear();
+        self.frame_draws = 0;
+    }
+
     /// Render targets drawn since the last call, with their draw counts (tools).
     pub fn take_target_log(&mut self) -> Vec<(SurfaceKey, u32)> {
         let mut list: Vec<_> = std::mem::take(&mut self.target_log).into_iter().collect();
@@ -1569,12 +1821,92 @@ impl LatteRenderer {
     pub fn read_surface(&mut self, key: SurfaceKey) -> Option<(u32, u32, Vec<u8>)> {
         self.submit();
         let format = wgpu_format(key.format);
-        if !matches!(format, wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb)
-        {
-            return None;
-        }
         let texture = self.surfaces.get(&key)?.texture.clone();
-        self.read_texture(&texture, key.width, key.height)
+        match format {
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+                self.read_texture(&texture, key.width, key.height)
+            }
+            wgpu::TextureFormat::Rgb10a2Unorm
+            | wgpu::TextureFormat::Rg11b10Ufloat
+            | wgpu::TextureFormat::Rgba16Float
+            | wgpu::TextureFormat::Rgba8Snorm
+            | wgpu::TextureFormat::R16Float
+            | wgpu::TextureFormat::R8Unorm
+            | wgpu::TextureFormat::Depth16Unorm => {
+                if format.is_depth_stencil_format() {
+                    return None;
+                }
+                let (width, height, raw) =
+                    self.read_raw(&texture, key.width, key.height, format)?;
+                let eight = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+                let half = |v: u16| half_to_f32(v);
+                let rgba = match format {
+                    wgpu::TextureFormat::Rgba8Snorm => {
+                        raw.iter().map(|v| v.wrapping_add(128)).collect()
+                    }
+                    wgpu::TextureFormat::R8Unorm => {
+                        raw.iter().flat_map(|v| [*v, *v, *v, 255]).collect()
+                    }
+                    wgpu::TextureFormat::R16Float => raw
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .flat_map(|p| {
+                            // Linear depth and the like: the fraction shows the structure.
+                            let value = half(u16::from_le_bytes(*p)).abs();
+                            let v = eight(value.fract());
+                            [v, v, eight(value / 256.0), 255]
+                        })
+                        .collect(),
+                    wgpu::TextureFormat::Rgba16Float => raw
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .flat_map(|p| {
+                            let c = |i: usize| half(u16::from_le_bytes([p[i], p[i + 1]]));
+                            [eight(c(0)), eight(c(2)), eight(c(4)), eight(c(6))]
+                        })
+                        .collect(),
+                    wgpu::TextureFormat::Rgb10a2Unorm => raw
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .flat_map(|p| {
+                            let v = u32::from_le_bytes(*p);
+                            let c = |shift: u32| ((v >> shift) & 0x3FF) as f32 / 1023.0;
+                            [eight(c(0)), eight(c(10)), eight(c(20)), (v >> 30) as u8 * 85]
+                        })
+                        .collect(),
+                    _ => raw
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .flat_map(|p| {
+                            let v = u32::from_le_bytes(*p);
+                            let c = |shift: u32, bits: u32| {
+                                let part = (v >> shift) & ((1 << bits) - 1);
+                                half(((part << (15 - bits)) & 0xFFFF) as u16)
+                            };
+                            [eight(c(0, 11)), eight(c(11, 11)), eight(c(22, 10)), 255]
+                        })
+                        .collect(),
+                };
+                Some((width, height, rgba))
+            }
+            _ => None,
+        }
+    }
+
+    fn read_raw(
+        &self,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let bytes = format.block_copy_size(None)?;
+        let (_, _, rows) = self.read_texels(texture, width, height, bytes)?;
+        Some((width, height, rows))
     }
 
     fn read_texture(
@@ -1583,15 +1915,25 @@ impl LatteRenderer {
         width: u32,
         height: u32,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        self.read_texels(texture, width, height, 4)
+    }
+
+    fn read_texels(
+        &self,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        bytes: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let row = (width * bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flora readback"),
+            label: Some("shocora readback"),
             size: u64::from(row) * u64::from(height),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("flora readback"),
+            label: Some("shocora readback"),
         });
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
@@ -1610,9 +1952,9 @@ impl LatteRenderer {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let data = slice.get_mapped_range().ok()?;
-        let mut out = Vec::with_capacity((width * height * 4) as usize);
+        let mut out = Vec::with_capacity((width * height * bytes) as usize);
         for line in data.chunks_exact(row as usize) {
-            out.extend_from_slice(&line[..(width * 4) as usize]);
+            out.extend_from_slice(&line[..(width * bytes) as usize]);
         }
         drop(data);
         buffer.unmap();
@@ -1624,6 +1966,30 @@ impl LatteRenderer {
         self.submit();
         let image = self.screens.get(screen)?;
         self.read_texture(&image.texture, image.width, image.height)
+    }
+}
+
+fn cache_checksum(data: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(data);
+    hasher.finish()
+}
+
+/// The contents of a pipeline cache file, if its checksum still matches them.
+fn verified_cache_data(file: &[u8]) -> Option<&[u8]> {
+    let (data, checksum) = file.split_at_checked(file.len().checked_sub(8)?)?;
+    (cache_checksum(data).to_le_bytes().as_slice() == checksum).then_some(data)
+}
+
+/// Decodes a 16-bit float; small floats of packed formats are shifted up to this layout.
+fn half_to_f32(value: u16) -> f32 {
+    let sign = if value & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((value >> 10) & 0x1F);
+    let mantissa = f32::from(value & 0x3FF) / 1024.0;
+    sign * match exponent {
+        0 => mantissa * 2.0_f32.powi(-14),
+        0x1F => f32::INFINITY,
+        _ => (1.0 + mantissa) * 2.0_f32.powi(exponent - 15),
     }
 }
 
@@ -1645,15 +2011,31 @@ impl Drop for LatteRenderer {
 
 impl RenderBackend for LatteRenderer {
     fn execute(&mut self, commands: &[RenderCommand]) {
+        if let Some(at) =
+            commands.iter().rposition(|command| matches!(command, RenderCommand::Reset))
+        {
+            self.execute(&commands[..at]);
+            self.reset();
+            self.execute(&commands[at + 1..]);
+            return;
+        }
         // New pipelines stall the host's draw thread: compiled together up front,
         // their cost does not add up.
         let new: Vec<&DrawCommand> = commands
             .iter()
             .filter_map(|command| match command {
-                RenderCommand::Draw(draw) if !self.pipelines.contains_key(&pipeline_key(draw)) => {
-                    Some(draw.as_ref())
+                RenderCommand::Draw(draw) => {
+                    (!self.pipelines.contains_key(&pipeline_key(draw))).then_some(draw.as_ref())
                 }
-                _ => None,
+                RenderCommand::ClearScreen { .. }
+                | RenderCommand::ArenaWrite { .. }
+                | RenderCommand::ArenaWrap
+                | RenderCommand::Reset
+                | RenderCommand::Upload(_)
+                | RenderCommand::Clear { .. }
+                | RenderCommand::CopySurface { .. }
+                | RenderCommand::CopyToScanBuffer { .. }
+                | RenderCommand::Flip => None,
             })
             .collect();
         if !new.is_empty() {
@@ -1668,6 +2050,7 @@ impl RenderBackend for LatteRenderer {
                     }
                 }
                 RenderCommand::ArenaWrap => self.submit(),
+                RenderCommand::Reset => self.reset(),
                 RenderCommand::Upload(upload) => self.upload(upload),
                 RenderCommand::Clear { color, depth } => self.clear(*color, *depth),
                 RenderCommand::Draw(draw) => {
@@ -1682,7 +2065,8 @@ impl RenderBackend for LatteRenderer {
                     target,
                     target_level,
                     target_slice,
-                    ..
+                    // The surface's first level already is the one Latte picked.
+                    source_level: _,
                 } => {
                     self.copy_surface(
                         *source,
@@ -1719,11 +2103,12 @@ impl RenderThread {
         let screens = renderer.screens();
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<Vec<RenderCommand>>(RENDER_QUEUE_LENGTH);
-        let thread = std::thread::Builder::new().name("flora-render".into()).spawn(move || {
-            while let Ok(commands) = receiver.recv() {
-                renderer.execute(&commands);
-            }
-        })?;
+        let thread =
+            std::thread::Builder::new().name("shocora-render".into()).spawn(move || {
+                while let Ok(commands) = receiver.recv() {
+                    renderer.execute(&commands);
+                }
+            })?;
         Ok(Self { sender: Some(sender), thread: Some(thread), screens })
     }
 
@@ -1755,10 +2140,27 @@ pub async fn request_device(
 ) -> Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError> {
     adapter
         .request_device(&wgpu::DeviceDescriptor {
-            label: Some("flora"),
+            label: Some("shocora"),
             required_features: wanted_features(adapter),
             required_limits: adapter.limits(),
             ..Default::default()
         })
         .await
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn a_damaged_cache_file_is_not_believed() {
+        let mut file = vec![1, 2, 3, 4, 5];
+        file.extend_from_slice(&cache_checksum(&file).to_le_bytes());
+        assert_eq!(verified_cache_data(&file), Some([1, 2, 3, 4, 5].as_slice()));
+
+        file[2] ^= 1;
+        assert_eq!(verified_cache_data(&file), None);
+        assert_eq!(verified_cache_data(&file[..file.len() - 3]), None);
+        assert_eq!(verified_cache_data(&[1, 2]), None);
+    }
 }

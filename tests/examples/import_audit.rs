@@ -1,7 +1,7 @@
-//! Lists the system functions a title imports that flora does not implement.
+//! Lists the system functions a title imports that shocora does not implement.
 //!
 //! ```text
-//! cargo run -p flora_tests --example import_audit -- FILE.rpx [...]
+//! cargo run -p shocora_tests --example import_audit -- FILE.rpx [...]
 //! ```
 //!
 //! Without arguments every title in `roms.json` is audited. Output never names
@@ -14,7 +14,7 @@ use wiiu_rpl::RplFile;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if files.is_empty() {
-        files = flora_tests::local_games().into_iter().map(|game| game.rpx_path).collect();
+        files = shocora_tests::local_games().into_iter().map(|game| game.rpx_path).collect();
     }
     let registry = CafeOs::new().registry;
     for (index, path) in files.iter().enumerate() {

@@ -1,6 +1,6 @@
 [package]
-name = "flora_egui"
-description = "flora: the default egui front end"
+name = "shocora_egui"
+description = "shocora: the default egui front end"
 authors.workspace = true
 categories.workspace = true
 edition.workspace = true
@@ -14,12 +14,16 @@ version.workspace = true
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
 env_logger = "0.11"
-flora_game_library = { workspace = true }
-flora_gui_common = { workspace = true }
-flora_render = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tga", "webp"] }
+shocora_game_library = { workspace = true }
+shocora_gui_common = { workspace = true }
+shocora_render = { workspace = true }
 log = { workspace = true }
 rfd = "0.15"
 wiiu_emu = { workspace = true }
+
+[build-dependencies]
+embed-resource = "3"
 
 [lints]
 workspace = true

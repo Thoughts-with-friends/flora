@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn open_read_stat_and_list() {
-        let root = std::env::temp_dir().join(format!("flora-fsapi-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("shocora-fsapi-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("data")).unwrap();
         fs::write(root.join("data/a.bin"), b"0123456789").unwrap();

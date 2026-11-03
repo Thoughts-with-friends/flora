@@ -54,7 +54,7 @@ impl std::fmt::Debug for HleExport {
 
 /// Runs HLE function `index` for the core in `ctx`.
 ///
-/// Calls to imports flora does not implement return 0 and are logged once.
+/// Calls to imports shocora does not implement return 0 and are logged once.
 ///
 /// # Errors
 /// Propagates the function's failure.
@@ -80,7 +80,7 @@ pub fn dispatch(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
 }
 
 fn call(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
-    ctx.os.gx2.active_core = (ctx.cpu.core_id() as usize).min(2);
+    ctx.os.gx2.active_thread = ctx.os.coreinit.threads.current;
     ctx.os.registry.note_call(index);
     if ctx.os.registry.is_traced(index) {
         let thread = ctx.os.coreinit.threads.current;
@@ -112,7 +112,7 @@ fn call(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
     result
 }
 
-/// Callers listed per call of a function in `FLORA_TRACE_HLE`.
+/// Callers listed per call of a function in `SHOCORA_TRACE_HLE`.
 const TRACED_CALLERS: usize = 10;
 
 fn call_entry(ctx: &mut HleContext<'_>, index: u32) -> HleResult {

@@ -49,6 +49,11 @@ impl Gpu {
         self.cp.execute(words, &mut ctx)
     }
 
+    /// Makes the host renderer forget everything of the previous boot.
+    pub fn reset_renderer(&mut self) {
+        self.latte.commands.push(RenderCommand::Reset);
+    }
+
     /// Blanks both screens (boot / shutdown).
     pub fn blank_screens(&mut self) {
         for screen in Screen::ALL {

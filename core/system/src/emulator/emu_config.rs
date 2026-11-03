@@ -11,7 +11,7 @@ pub struct Config {
     pub save_dir: PathBuf,
     /// Translate guest code; off means the (slow, precise-fault) interpreter only.
     pub jit: bool,
-    /// Measure host time per HLE function (`FLORA_PROFILE`).
+    /// Measure host time per HLE function (`SHOCORA_PROFILE`).
     pub profile: bool,
     /// Keep real time: [Emulator::run_frame](crate::Emulator::run_frame) returns at the next
     /// vertical blank. Off, it returns as soon as no guest thread can run.
@@ -30,7 +30,7 @@ impl Default for Config {
             frame_time: Duration::from_micros(16_683),
             save_dir: PathBuf::from("save"),
             jit: true,
-            profile: std::env::var_os("FLORA_PROFILE").is_some(),
+            profile: std::env::var_os("SHOCORA_PROFILE").is_some(),
             paced: true,
             fonts_dir: None,
             swap_interval: None,

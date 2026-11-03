@@ -725,6 +725,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,6 +1272,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-resource"
+version = "3.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6168487b5e7eb2673e6efe1200b1848016e436a6ca0b8031bf04bd9d493a249f"
+dependencies = [
+ "cc",
+ "memchr",
+ "rustc_version",
+ "toml 1.1.8+spec-1.1.0",
+ "vswhom",
+ "winreg",
+]
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1449,70 +1469,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flora_egui"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "env_logger",
- "flora_game_library",
- "flora_gui_common",
- "flora_render",
- "log",
- "rfd",
- "wiiu_emu",
-]
-
-[[package]]
-name = "flora_game_library"
-version = "0.1.0"
-dependencies = [
- "log",
- "serde",
- "serde_json",
- "wiiu_title",
-]
-
-[[package]]
-name = "flora_gui_common"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "flora_render",
- "gilrs",
- "log",
- "serde",
- "toml",
- "wiiu_emu",
- "wiiu_peripherals",
-]
-
-[[package]]
-name = "flora_render"
-version = "0.1.0"
-dependencies = [
- "egui-wgpu",
- "log",
- "pollster 0.4.0",
- "serde",
- "wiiu_gpu",
-]
-
-[[package]]
-name = "flora_tests"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "flora_game_library",
- "flora_render",
- "png",
- "pollster 0.4.0",
- "wiiu_cafe_os",
- "wiiu_emu",
- "wiiu_gpu",
- "wiiu_rpl",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1672,6 +1628,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+]
+
+[[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
 ]
 
 [[package]]
@@ -2031,10 +1997,25 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -3629,6 +3610,72 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "shocora_egui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "embed-resource",
+ "env_logger",
+ "image",
+ "log",
+ "rfd",
+ "shocora_game_library",
+ "shocora_gui_common",
+ "shocora_render",
+ "wiiu_emu",
+]
+
+[[package]]
+name = "shocora_game_library"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "wiiu_title",
+]
+
+[[package]]
+name = "shocora_gui_common"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "gilrs",
+ "log",
+ "serde",
+ "shocora_render",
+ "toml 0.9.12+spec-1.1.0",
+ "wiiu_emu",
+ "wiiu_peripherals",
+]
+
+[[package]]
+name = "shocora_render"
+version = "0.1.0"
+dependencies = [
+ "egui-wgpu",
+ "log",
+ "pollster 0.4.0",
+ "serde",
+ "wiiu_gpu",
+]
+
+[[package]]
+name = "shocora_tests"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "png",
+ "pollster 0.4.0",
+ "shocora_game_library",
+ "shocora_render",
+ "wiiu_cafe_os",
+ "wiiu_emu",
+ "wiiu_gpu",
+ "wiiu_rpl",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3902,6 +3949,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4127,6 +4189,26 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vswhom"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be979b7f07507105799e854203b470ff7c78a1639e330a58f183b5fea574608b"
+dependencies = [
+ "libc",
+ "vswhom-sys",
+]
+
+[[package]]
+name = "vswhom-sys"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "walkdir"
@@ -5027,6 +5109,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winreg"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

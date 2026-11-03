@@ -32,19 +32,19 @@ fn free(ctx: &mut HleContext<'_>, handle: Option<u32>, ptr: GuestPtr<u8>) {
 }
 
 /// Target of the `MEMAllocFromDefaultHeapEx` function pointer.
-#[hle_export(lib = "coreinit", name = "__flora_DefaultHeapAllocEx")]
+#[hle_export(lib = "coreinit", name = "__shocora_DefaultHeapAllocEx")]
 fn default_alloc_ex(ctx: &mut HleContext<'_>, size: u32, align: i32) -> GuestPtr<u8> {
     alloc(ctx, None, size, align)
 }
 
 /// Target of the `MEMAllocFromDefaultHeap` function pointer.
-#[hle_export(lib = "coreinit", name = "__flora_DefaultHeapAlloc")]
+#[hle_export(lib = "coreinit", name = "__shocora_DefaultHeapAlloc")]
 fn default_alloc(ctx: &mut HleContext<'_>, size: u32) -> GuestPtr<u8> {
     alloc(ctx, None, size, 0x40)
 }
 
 /// Target of the `MEMFreeToDefaultHeap` function pointer.
-#[hle_export(lib = "coreinit", name = "__flora_DefaultHeapFree")]
+#[hle_export(lib = "coreinit", name = "__shocora_DefaultHeapFree")]
 fn default_free(ctx: &mut HleContext<'_>, ptr: GuestPtr<u8>) {
     free(ctx, None, ptr);
 }
@@ -143,13 +143,13 @@ mod tests {
         let mut env = TestEnv::new();
         let base = env.call("coreinit", "MEMGetBaseHeapHandle", &[1]);
         assert_eq!(base, HEAP_START);
-        let a = env.call("coreinit", "__flora_DefaultHeapAllocEx", &[0x100, 0x40]);
+        let a = env.call("coreinit", "__shocora_DefaultHeapAllocEx", &[0x100, 0x40]);
         assert_eq!(a % 0x40, 0);
         assert_eq!(env.call("coreinit", "MEMGetSizeForMBlockExpHeap", &[a]), 0x100);
         let b =
             env.call("coreinit", "MEMAllocFromExpHeapEx", &[base, 0x10, (-4_i32).cast_unsigned()]);
         assert!(b > a);
-        env.call("coreinit", "__flora_DefaultHeapFree", &[a]);
+        env.call("coreinit", "__shocora_DefaultHeapFree", &[a]);
 
         let heap = env.call("coreinit", "MEMCreateExpHeapEx", &[SCRATCH, 0x1000, 0]);
         let c = env.call("coreinit", "MEMAllocFromExpHeapEx", &[heap, 0x20, 4]);

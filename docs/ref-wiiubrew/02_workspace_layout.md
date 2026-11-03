@@ -4,7 +4,7 @@ Rule: **`core/*` knows nothing about windows, file pickers, graphics APIs or
 audio devices.** Host integration lives in `gui/*`.
 
 ```text
-gui/egui (flora_egui) ─► gui/common (flora_gui_common) ─► gui/render (flora_render)
+gui/egui (shocora_egui) ─► gui/common (shocora_gui_common) ─► gui/render (shocora_render)
                                   │
                                   ▼
                         core/system (wiiu_emu)
@@ -32,9 +32,9 @@ gui/egui (flora_egui) ─► gui/common (flora_gui_common) ─► gui/render (fl
 | `wiiu_cafe_os`     | core/cafe_os       | HLE libraries, registry/stubs, process boot                 |
 | `wiiu_hle_macros`  | core/hle_macros    | `#[hle_export]`                                             |
 | `wiiu_emu`         | core/system        | `Emulator`: wiring, frame loop, title loading               |
-| `flora_render`     | gui/render         | `WgpuRenderer`, `GlowRenderer`, `GraphicsApi`               |
-| `flora_gui_common` | gui/common         | Emulation thread, config, key bindings                      |
-| `flora_egui`       | gui/egui           | The application                                             |
+| `shocora_render`     | gui/render         | `WgpuRenderer`, `GlowRenderer`, `GraphicsApi`               |
+| `shocora_gui_common` | gui/common         | Emulation thread, config, key bindings                      |
+| `shocora_egui`       | gui/egui           | The application                                             |
 | `xtask`            | xtask              | `cargo xtask build/run/test`                                |
 
 ## 2.1 Writing an HLE function
@@ -54,7 +54,7 @@ error. Add the generated constant (`OS_GET_CORE_ID`) to the library's
 ## 2.2 Building
 
 ```text
-cargo xtask run -- path/to/title          # default graphics API from flora.toml
+cargo xtask run -- path/to/title          # default graphics API from shocora.toml
 cargo xtask run --graphics vulkan -- game.rpx
 cargo xtask run --graphics opengl
 cargo xtask test

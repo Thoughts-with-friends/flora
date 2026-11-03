@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn save_files_are_written_below_the_account_folder() {
-        let root = std::env::temp_dir().join(format!("flora-save-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("shocora-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut vfs = Vfs::new();
         vfs.mount("/vol/save", HostDirectory::writable(&root)).unwrap();

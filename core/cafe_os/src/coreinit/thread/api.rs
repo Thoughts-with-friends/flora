@@ -220,7 +220,7 @@ fn os_exit_thread(ctx: &mut HleContext<'_>, value: i32) -> Result<(), HleError> 
 }
 
 /// A thread's entry point returned (`lr` of every created thread).
-#[hle_export(lib = "flora", name = "__flora_ThreadReturn")]
+#[hle_export(lib = "shocora", name = "__shocora_ThreadReturn")]
 fn thread_return(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
     let value = ctx.cpu.gpr[3].cast_signed();
     exit_current(ctx, value)

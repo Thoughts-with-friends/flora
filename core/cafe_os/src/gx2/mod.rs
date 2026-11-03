@@ -35,15 +35,18 @@ pub struct DisplayList {
 
 /// Host-side copy of the GX2 command buffer, plus the state of the library.
 ///
-/// Every core records on its own, like the per-core write gatherers of the
-/// real library: a worker building a display list must not catch packets of
-/// the thread rendering on another core.
+/// All threads feed one command stream, so that a flush or a wait for the GPU from
+/// any of them covers everything issued before it: titles rewrite buffers as soon as
+/// that wait returns. Display lists belong to a thread: guest threads share one host
+/// core here, so workers the console would run on other cores interrupt each other's
+/// recording, and packets must not land in the wrong list.
 #[derive(Debug)]
 pub struct Gx2State {
-    commands: [Vec<u32>; 3],
-    lists: [Option<DisplayList>; 3],
-    /// Core of the HLE call being executed.
-    pub active_core: usize,
+    commands: Vec<u32>,
+    /// Display lists being recorded, by the thread recording them.
+    lists: std::collections::HashMap<u32, DisplayList>,
+    /// Thread of the HLE call being executed.
+    pub active_thread: u32,
     pub initialized: bool,
     /// Core that called `GX2Init`.
     pub main_core: u32,
@@ -73,9 +76,9 @@ pub struct Gx2State {
 impl Default for Gx2State {
     fn default() -> Self {
         Self {
-            commands: [Vec::new(), Vec::new(), Vec::new()],
-            lists: [None, None, None],
-            active_core: 1,
+            commands: Vec::new(),
+            lists: std::collections::HashMap::new(),
+            active_thread: 0,
             initialized: false,
             main_core: 0,
             tv_enabled: false,
@@ -98,10 +101,9 @@ impl Default for Gx2State {
 
 impl Gx2State {
     fn sink(&mut self) -> &mut Vec<u32> {
-        let core = self.active_core;
-        match &mut self.lists[core] {
+        match self.lists.get_mut(&self.active_thread) {
             Some(list) => &mut list.words,
-            None => &mut self.commands[core],
+            None => &mut self.commands,
         }
     }
 
@@ -138,15 +140,15 @@ impl Gx2State {
     }
 
     pub(crate) fn begin_display_list(&mut self, address: u32, capacity: u32) {
-        self.lists[self.active_core] = Some(DisplayList { address, capacity, words: Vec::new() });
+        self.lists.insert(self.active_thread, DisplayList { address, capacity, words: Vec::new() });
     }
 
     pub(crate) fn end_display_list(&mut self) -> Option<DisplayList> {
-        self.lists[self.active_core].take()
+        self.lists.remove(&self.active_thread)
     }
 
     pub(crate) fn recording(&self) -> bool {
-        self.lists[self.active_core].is_some()
+        self.lists.contains_key(&self.active_thread)
     }
 }
 
@@ -160,26 +162,21 @@ pub(crate) const fn physical(address: u32) -> u32 {
 
 /// Submits everything queued so far to Latte.
 pub(crate) fn flush(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
-    let core = ctx.os.gx2.active_core;
-    let commands = std::mem::take(&mut ctx.os.gx2.commands[core]);
+    let commands = std::mem::take(&mut ctx.os.gx2.commands);
     if !commands.is_empty() {
         ctx.os.gx2.timestamp += 1;
         ctx.gpu.submit(ctx.memory, &commands)?;
         // Keep the allocation for the next frame.
         let mut recycled = commands;
         recycled.clear();
-        ctx.os.gx2.commands[core] = recycled;
+        ctx.os.gx2.commands = recycled;
     }
     Ok(())
 }
 
 /// Avoids unbounded command buffers in titles that rarely flush.
 pub(crate) fn flush_if_large(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
-    if ctx.os.gx2.commands[ctx.os.gx2.active_core].len() >= FLUSH_THRESHOLD {
-        flush(ctx)
-    } else {
-        Ok(())
-    }
+    if ctx.os.gx2.commands.len() >= FLUSH_THRESHOLD { flush(ctx) } else { Ok(()) }
 }
 
 pub const EXPORTS: &[HleExport] = &[

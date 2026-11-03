@@ -1,5 +1,5 @@
 [package]
-name = "flora_render"
+name = "shocora_render"
 description = "Host renderer for Latte render commands, on wgpu (Vulkan/DX12/Metal/GL)"
 authors.workspace = true
 categories.workspace = true
@@ -14,11 +14,9 @@ version.workspace = true
 [dependencies]
 egui-wgpu = "0.37"
 log = { workspace = true }
+pollster = "0.4"
 serde = { workspace = true }
 wiiu_gpu = { workspace = true }
-
-[dev-dependencies]
-pollster = "0.4"
 
 [features]
 default = ["xbrz"]

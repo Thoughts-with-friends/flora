@@ -1,4 +1,4 @@
-//! Network-service and account libraries. flora is offline: accounts report a
+//! Network-service and account libraries. shocora is offline: accounts report a
 //! single local user and everything else stays at its "not connected" default
 //! (unimplemented imports return 0, which `nn::Result` reads as success).
 use wiiu_hle_macros::hle_export;
@@ -11,8 +11,8 @@ use crate::{
 /// `nn::act` slot of the only account.
 const ACCOUNT_SLOT: u8 = 1;
 /// Identifies the local user to titles that key data by account.
-const ACCOUNT_UUID: [u8; 16] = *b"flora local user";
-const ACCOUNT_ID: &str = "flora";
+const ACCOUNT_UUID: [u8; 16] = *b"shocora localusr";
+const ACCOUNT_ID: &str = "shocora";
 
 #[hle_export(lib = "nn_act", name = "GetSlotNo__Q2_2nn3actFv")]
 fn act_get_slot_no(_ctx: &mut HleContext<'_>) -> u8 {

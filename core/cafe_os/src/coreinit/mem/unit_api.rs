@@ -81,13 +81,13 @@ fn mem_calc_heap_size_for_unit_heap(
 }
 
 /// `MEMAllocator::funcs`: `(*alloc)(allocator, size)`.
-#[hle_export(lib = "coreinit", name = "__flora_AllocatorDefaultAlloc")]
+#[hle_export(lib = "coreinit", name = "__shocora_AllocatorDefaultAlloc")]
 fn allocator_default_alloc(ctx: &mut HleContext<'_>, _allocator: u32, size: u32) -> u32 {
     ctx.os.coreinit.heaps.default_heap_mut().and_then(|heap| heap.alloc(size, 0x40)).unwrap_or(0)
 }
 
 /// `MEMAllocator::funcs`: `(*free)(allocator, block)`.
-#[hle_export(lib = "coreinit", name = "__flora_AllocatorDefaultFree")]
+#[hle_export(lib = "coreinit", name = "__shocora_AllocatorDefaultFree")]
 fn allocator_default_free(ctx: &mut HleContext<'_>, _allocator: u32, block: u32) {
     if let Some(heap) = ctx.os.coreinit.heaps.default_heap_mut() {
         heap.free(block);

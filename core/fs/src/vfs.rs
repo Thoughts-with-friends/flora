@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn longest_mount_wins_and_reads_files() {
-        let root = std::env::temp_dir().join(format!("flora-vfs-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("shocora-vfs-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("content/sub")).unwrap();
         fs::create_dir_all(root.join("save")).unwrap();

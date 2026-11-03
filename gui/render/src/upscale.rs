@@ -125,7 +125,7 @@ impl std::fmt::Debug for Upscaler {
 
 fn create_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("flora xBRZ"),
+        label: Some("shocora xBRZ"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -138,16 +138,16 @@ fn create_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGr
         }],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("flora xBRZ"),
+        label: Some("shocora xBRZ"),
         bind_group_layouts: &[Some(&layout)],
         immediate_size: 0,
     });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("flora xBRZ"),
+        label: Some("shocora xBRZ"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("flora xBRZ"),
+        label: Some("shocora xBRZ"),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &module,
@@ -199,8 +199,9 @@ impl Upscaler {
         if presented.is_empty() {
             return;
         }
-        let mut encoder = device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flora xBRZ") });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("shocora xBRZ"),
+        });
         for screen in presented {
             if let Some(target) = targets.get(screen) {
                 self.upscale(device, &mut encoder, *screen, target, factor, shown, generation);
@@ -235,7 +236,7 @@ impl Upscaler {
         let stale = self.images.get(&screen).is_none_or(|i| i.width != width || i.height != height);
         if stale {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("flora upscaled screen"),
+                label: Some("shocora upscaled screen"),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -255,7 +256,7 @@ impl Upscaler {
         let Some(image) = self.images.get(&screen) else { return };
         let (pipeline, layout) = self.pipeline.get_or_insert_with(|| create_pipeline(device));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flora xBRZ"),
+            label: Some("shocora xBRZ"),
             layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -263,7 +264,7 @@ impl Upscaler {
             }],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("flora xBRZ"),
+            label: Some("shocora xBRZ"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &image.view,
                 depth_slice: None,

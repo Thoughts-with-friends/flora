@@ -1,29 +1,33 @@
 //! Boots a title without a window and reports what happened.
 //!
 //! ```text
-//! cargo run --release -p flora_tests --example headless -- <TITLE_DIR | FILE.rpx> [FRAMES]
+//! cargo run --release -p shocora_tests --example headless -- <TITLE_DIR | FILE.rpx> [FRAMES]
 //! ```
 //!
 //! Environment:
-//! * `FLORA_INTERP`: use the interpreter (precise faults) instead of the JIT.
-//! * `FLORA_DISASM="addr,count;addr,count"`: extra code listings at the end.
-//! * `FLORA_SHOTS="dir,every"`: render on the GPU and save the TV/GamePad image
+//! * `SHOCORA_INTERP`: use the interpreter (precise faults) instead of the JIT.
+//! * `SHOCORA_DISASM="addr,count;addr,count"`: extra code listings at the end.
+//! * `SHOCORA_SHOTS="dir,every"`: render on the GPU and save the TV/GamePad image
 //!   every `every` flips. Files stay outside the repository unless you say otherwise.
-//! * `FLORA_PRESS="frame,button,frames;..."`: scripted GamePad input.
-//! * `FLORA_UNPACED`: do not wait for real time between frames.
-//! * `FLORA_PROFILE`: flips per second and where the host time goes. `FLORA_PROFILE=flips`
+//! * `SHOCORA_PRESS="frame,button,frames;..."`: scripted GamePad input.
+//! * `SHOCORA_UNPACED`: do not wait for real time between frames.
+//! * `SHOCORA_PROFILE`: flips per second and where the host time goes. `SHOCORA_PROFILE=flips`
 //!   leaves out the timers around every HLE call, which cost time themselves.
-//! * `FLORA_XBRZ=factor`: upscale the screens (with `FLORA_SHOTS`).
-//! * `FLORA_RENDER_THREAD`: render on a thread of its own, as the GUI does (no screenshots).
-//! * `FLORA_SWAP_INTERVAL=n`: vertical blanks per flip, whatever the title asks for.
-//! * `FLORA_BACKEND=auto|vulkan|dx12|gl`: host API; `auto` chooses like the GUI (default `vulkan`).
-//! * `FLORA_WAV=file`: saves what the TV plays. Stays outside the repository unless you say otherwise.
+//! * `SHOCORA_XBRZ=factor`: upscale the screens (with `SHOCORA_SHOTS`).
+//! * `SHOCORA_RENDER_THREAD`: render on a thread of its own, as the GUI does (no screenshots).
+//! * `SHOCORA_SWAP_INTERVAL=n`: vertical blanks per flip, whatever the title asks for.
+//! * `SHOCORA_BACKEND=auto|vulkan|dx12|gl`: host API; `auto` chooses like the GUI (default `vulkan`).
+//! * `SHOCORA_WAV=file`: saves what the TV plays. Stays outside the repository unless you say otherwise.
+//! * `SHOCORA_CAPTURE="flip,dir,min_pixels"` (with `SHOCORA_SHOTS`): one frame draw by draw, then exit.
+//! * `SHOCORA_TRACE_UBO="first_flip,last_flip,file"`: uniform blocks of every draw, then exit.
+//! * `SHOCORA_RESET_AT=frame`: reboots the title at that frame, like the GUI's Reset.
+//! * `SHOCORA_TOUCH="frame,x,y,frames"`: touches the GamePad's screen (854 x 480 pixels).
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use flora_render::{
+use shocora_render::{
     LatteRenderer, RenderBackend, RenderCommand, Screen, UpscaleConfig, UpscaleMethod,
     request_device, wgpu,
 };
@@ -51,7 +55,7 @@ fn parse_presses(text: &str) -> Vec<Press> {
 }
 
 fn create_renderer() -> Result<LatteRenderer, Box<dyn std::error::Error>> {
-    let backends = match std::env::var("FLORA_BACKEND").as_deref() {
+    let backends = match std::env::var("SHOCORA_BACKEND").as_deref() {
         Ok("auto") => wgpu::Backends::PRIMARY | wgpu::Backends::GL,
         Ok("dx12") => wgpu::Backends::DX12,
         Ok("gl") => wgpu::Backends::GL,
@@ -110,6 +114,107 @@ fn save_wav(path: &Path, samples: &[i16]) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Runs one frame draw by draw: logs each draw and how many pixels of its first color target it
+/// changed, saves the target after draws changing at least `min_pixels`, and writes the shaders.
+fn capture_frame(
+    renderer: &mut LatteRenderer,
+    commands: &[RenderCommand],
+    dir: &Path,
+    min_pixels: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::{collections::HashMap, fmt::Write as _};
+    std::fs::create_dir_all(dir)?;
+    let mut last: HashMap<_, Vec<u8>> = HashMap::new();
+    let mut log = String::new();
+    for (index, command) in commands.iter().enumerate() {
+        // A surface as the frame's first readers see it.
+        if let RenderCommand::Draw(draw) = command {
+            for texture in &draw.textures {
+                if let Some((width, height, rgba)) = renderer.read_surface(texture.key) {
+                    let name = format!(
+                        "tex{index:05}_{:08x}_{width}x{height}_{:?}.png",
+                        texture.key.address, texture.key.format
+                    );
+                    save_png(&dir.join(name), width, height, &rgba)?;
+                }
+            }
+        }
+        // What a target holds before the frame's first draw to it.
+        if let RenderCommand::Draw(draw) = command {
+            if let Some((key, _)) = draw.color_targets.iter().flatten().next() {
+                if !last.contains_key(key) {
+                    if let Some((_, _, rgba)) = renderer.read_surface(*key) {
+                        last.insert(*key, rgba);
+                    }
+                }
+            }
+        }
+        renderer.execute(std::slice::from_ref(command));
+        let RenderCommand::Draw(draw) = command else {
+            if !matches!(command, RenderCommand::ArenaWrite { .. } | RenderCommand::Upload(_)) {
+                writeln!(log, "{index}: {command:?}")?;
+            }
+            continue;
+        };
+        for module in [&draw.vertex, &draw.pixel] {
+            std::fs::write(dir.join(format!("shader_{}.wgsl", module.id)), &module.wgsl)?;
+        }
+        let target = draw.color_targets.iter().flatten().next().map(|(key, _)| *key);
+        let mut changed = None;
+        if let Some((key, (width, height, rgba))) =
+            target.and_then(|key| renderer.read_surface(key).map(|image| (key, image)))
+        {
+            let before = last.get(&key);
+            let count = rgba
+                .chunks_exact(4)
+                .enumerate()
+                .filter(|(pixel, value)| {
+                    before.is_none_or(|b| b[pixel * 4..pixel * 4 + 4] != **value)
+                })
+                .count() as u32;
+            changed = Some(count);
+            if count >= min_pixels {
+                let name = format!("d{index:05}_{:08x}.png", key.address);
+                save_png(&dir.join(name), width, height, &rgba)?;
+            }
+            last.insert(key, rgba);
+        }
+        writeln!(
+            log,
+            "{index}: draw vs{} ps{} n{} i{} {:?} changed {changed:?} target {target:?} depth {:?} \
+             masks {:?} blend {:?} test {} write {} cmp {} cull {}/{} cw {} vp {:?} sc {:?}\n  tex {:?}",
+            draw.vertex.id,
+            draw.pixel.id,
+            draw.count,
+            draw.instances,
+            draw.state.topology,
+            draw.depth_target,
+            &draw.state.color_masks[..2],
+            draw.state.blend[0],
+            draw.state.depth_test,
+            draw.state.depth_write,
+            draw.state.depth_compare,
+            draw.state.cull_front,
+            draw.state.cull_back,
+            draw.state.front_face_cw,
+            draw.viewport,
+            draw.scissor,
+            draw.textures
+                .iter()
+                .map(|t| (t.binding, t.key, t.base_level, t.level_count, t.sampler))
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    std::fs::write(dir.join("draws.txt"), log)?;
+    renderer.submit();
+    for screen in Screen::ALL {
+        if let Some((width, height, rgba)) = renderer.read_screen(screen) {
+            save_png(&dir.join(format!("{screen:?}.png")), width, height, &rgba)?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let mut args = std::env::args_os().skip(1);
@@ -117,10 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frames: u64 = args.next().and_then(|f| f.to_str()?.parse().ok()).unwrap_or(60);
 
     let config = Config {
-        jit: std::env::var_os("FLORA_INTERP").is_none(),
-        paced: std::env::var_os("FLORA_UNPACED").is_none(),
-        swap_interval: std::env::var("FLORA_SWAP_INTERVAL").ok().and_then(|n| n.parse().ok()),
-        profile: std::env::var("FLORA_PROFILE").is_ok_and(|value| value != "flips"),
+        jit: std::env::var_os("SHOCORA_INTERP").is_none(),
+        paced: std::env::var_os("SHOCORA_UNPACED").is_none(),
+        swap_interval: std::env::var("SHOCORA_SWAP_INTERVAL").ok().and_then(|n| n.parse().ok()),
+        profile: std::env::var("SHOCORA_PROFILE").is_ok_and(|value| value != "flips"),
         ..Config::default()
     };
     let mut emu = Emulator::new(config)?;
@@ -130,38 +235,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("rpx:   {}", title.rpx_path.display());
     }
 
-    let shots = std::env::var("FLORA_SHOTS").ok();
+    let shots = std::env::var("SHOCORA_SHOTS").ok();
     let (shot_dir, shot_every) = shots
         .as_deref()
         .and_then(|s| s.split_once(','))
         .map_or((None, 60), |(dir, every)| (Some(PathBuf::from(dir)), every.parse().unwrap_or(60)));
     let mut renderer = shot_dir.as_ref().map(|_| create_renderer()).transpose()?;
-    if let (Some(renderer), Some(factor)) = (&renderer, std::env::var("FLORA_XBRZ").ok()) {
+    if let (Some(renderer), Some(factor)) = (&renderer, std::env::var("SHOCORA_XBRZ").ok()) {
         let factor = factor.parse().unwrap_or(2);
         renderer.upscale_setting().set(UpscaleConfig { method: UpscaleMethod::Xbrz, factor });
     }
     if let Some(dir) = &shot_dir {
         std::fs::create_dir_all(dir)?;
     }
-    let (render_thread, upscale) = match std::env::var_os("FLORA_RENDER_THREAD") {
+    let (render_thread, upscale) = match std::env::var_os("SHOCORA_RENDER_THREAD") {
         Some(_) => {
             let renderer = create_renderer()?;
             let upscale = renderer.upscale_setting();
-            if let Some(factor) = std::env::var("FLORA_XBRZ").ok().and_then(|f| f.parse().ok()) {
+            if let Some(factor) = std::env::var("SHOCORA_XBRZ").ok().and_then(|f| f.parse().ok()) {
                 upscale.set(UpscaleConfig { method: UpscaleMethod::Xbrz, factor });
             }
-            (Some(flora_render::RenderThread::spawn(renderer)?), Some(upscale))
+            (Some(shocora_render::RenderThread::spawn(renderer)?), Some(upscale))
         }
         None => (None, None),
     };
     let render_sender = render_thread.as_ref().and_then(|thread| thread.sender());
-    let presses = parse_presses(&std::env::var("FLORA_PRESS").unwrap_or_default());
+    let presses = parse_presses(&std::env::var("SHOCORA_PRESS").unwrap_or_default());
+    // SHOCORA_CAPTURE="flip,dir,min_pixels": see `capture_frame`.
+    let capture = std::env::var("SHOCORA_CAPTURE").ok().and_then(|text| {
+        let mut parts = text.split(',');
+        let flip = parts.next()?.parse::<u64>().ok()?;
+        let dir = PathBuf::from(parts.next()?);
+        Some((flip, dir, parts.next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(64)))
+    });
 
+    let ubo_trace = std::env::var("SHOCORA_TRACE_UBO").ok().and_then(|text| {
+        let mut parts = text.split(',');
+        Some((
+            parts.next()?.parse::<u64>().ok()?,
+            parts.next()?.parse::<u64>().ok()?,
+            PathBuf::from(parts.next()?),
+        ))
+    });
+    let mut ubo_arena = std::collections::HashMap::new();
+    let mut ubo_log = String::new();
     let start = Instant::now();
     let mut flips = 0_u64;
     let mut last_report = Instant::now();
     let mut arena = std::collections::HashMap::new();
-    let profile = std::env::var_os("FLORA_PROFILE").is_some();
+    let profile = std::env::var_os("SHOCORA_PROFILE").is_some();
     let (mut run_time, mut render_time) = (Duration::ZERO, Duration::ZERO);
     let (mut second_start, mut second_flips) = (Instant::now(), 0_u64);
     let mut flip_rates = Vec::new();
@@ -170,14 +292,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_flip = Instant::now();
     let mut upscaled_rates = Vec::new();
     let mut upscaled_before = 0;
-    let wav = std::env::var_os("FLORA_WAV").map(PathBuf::from);
+    let wav = std::env::var_os("SHOCORA_WAV").map(PathBuf::from);
     let mut sound = Vec::new();
     for frame in 0..frames {
         let held = presses
             .iter()
             .filter(|p| frame >= p.frame && frame < p.frame + p.frames)
             .fold(0, |bits, p| bits | p.button);
-        emu.set_gamepad(GamePadState::from_button_bits(held));
+        let mut pad = GamePadState::from_button_bits(held);
+        // SHOCORA_TOUCH="frame,x,y,frames": a finger on the GamePad's screen.
+        pad.touch = std::env::var("SHOCORA_TOUCH").ok().and_then(|text| {
+            let parts: Vec<u64> = text.split(',').filter_map(|n| n.parse().ok()).collect();
+            let [at, x, y, length] = parts[..] else { return None };
+            (frame >= at && frame < at + length).then_some((x as u16, y as u16))
+        });
+        emu.set_gamepad(pad);
+        // SHOCORA_RESET_AT=frame: the reset the GUI offers.
+        if std::env::var("SHOCORA_RESET_AT").ok().and_then(|at| at.parse().ok()) == Some(frame) {
+            emu.reset()?;
+            println!("reset at frame {frame}");
+        }
         let frame_start = Instant::now();
         emu.run_frame();
         run_time += frame_start.elapsed();
@@ -198,15 +332,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => commands,
         };
-        if std::env::var_os("FLORA_TRACE_DRAWS").is_some() {
+        if std::env::var_os("SHOCORA_TRACE_DRAWS").is_some() {
             for command in &commands {
                 if let RenderCommand::ArenaWrite { offset, bytes } = command {
                     arena.insert(*offset, std::sync::Arc::clone(bytes));
                 }
             }
         }
-        // FLORA_TRACE_DRAWS="first_frame,count": prints draws and their shaders.
-        if let Some((first, count)) = std::env::var("FLORA_TRACE_DRAWS").ok().and_then(|s| {
+        // SHOCORA_TRACE_DRAWS="first_frame,count": prints draws and their shaders.
+        if let Some((first, count)) = std::env::var("SHOCORA_TRACE_DRAWS").ok().and_then(|s| {
             let (a, b) = s.split_once(',')?;
             Some((a.parse::<u64>().ok()?, b.parse::<usize>().ok()?))
         }) {
@@ -312,23 +446,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ))
                                     .collect::<Vec<_>>(),
                             );
-                            if std::env::var_os("FLORA_TRACE_WGSL").is_some() {
+                            if std::env::var_os("SHOCORA_TRACE_WGSL").is_some() {
                                 println!("{}\n{}", draw.vertex.wgsl, draw.pixel.wgsl);
                             }
                         }
                         other => println!("{other:?}"),
                     }
                 }
-                // FLORA_TRACE_SPAN: frames to keep tracing after the first one.
-                let span = std::env::var("FLORA_TRACE_SPAN")
+                // SHOCORA_TRACE_SPAN: frames to keep tracing after the first one.
+                let span = std::env::var("SHOCORA_TRACE_SPAN")
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
                 if !commands.is_empty() && frame >= first + span {
                     let Some(renderer) = &mut renderer else { return Ok(()) };
                     renderer.execute(&commands);
-                    // FLORA_TRACE_TEX=dir saves the 8-bit textures the traced draws read.
-                    if let Some(dir) = std::env::var_os("FLORA_TRACE_TEX") {
+                    // SHOCORA_TRACE_TEX=dir saves the 8-bit textures the traced draws read.
+                    if let Some(dir) = std::env::var_os("SHOCORA_TRACE_TEX") {
                         let keys: std::collections::HashSet<_> = commands
                             .iter()
                             .filter_map(|c| {
@@ -372,13 +506,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // SHOCORA_TRACE_UBO="first_flip,last_flip,file": uniform blocks of every draw, per flip.
+        if let Some((first, last, file)) = &ubo_trace {
+            use std::fmt::Write as _;
+            for command in &commands {
+                match command {
+                    RenderCommand::ArenaWrite { offset, bytes } => {
+                        ubo_arena.insert(*offset, std::sync::Arc::clone(bytes));
+                    }
+                    RenderCommand::Draw(draw) if flips >= *first && flips <= *last => {
+                        let Some(params) = ubo_arena.get(&draw.params_offset) else { continue };
+                        let word = |i: usize| {
+                            u32::from_le_bytes([
+                                params[i * 4],
+                                params[i * 4 + 1],
+                                params[i * 4 + 2],
+                                params[i * 4 + 3],
+                            ])
+                        };
+                        let _ = write!(
+                            ubo_log,
+                            "{flips} vs{} ps{} n{}",
+                            draw.vertex.id, draw.pixel.id, draw.count
+                        );
+                        for block in 0..16 {
+                            let Some(data) = ubo_arena.get(&word(8 + block)) else { continue };
+                            let floats: Vec<String> = data
+                                .chunks_exact(4)
+                                .take(16)
+                                .map(|b| {
+                                    format!("{:.3}", f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                })
+                                .collect();
+                            let _ =
+                                write!(ubo_log, " | b{block}:{} {}", data.len(), floats.join(","));
+                        }
+                        ubo_log.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+            if flips > *last {
+                std::fs::write(file, &ubo_log)?;
+                return Ok(());
+            }
+        }
+        if let (Some(renderer), Some((flip, dir, min_pixels))) = (&mut renderer, &capture) {
+            if flips >= *flip && new_flips > 0 {
+                capture_frame(renderer, &commands, dir, *min_pixels)?;
+                return Ok(());
+            }
+        }
         if let Some(renderer) = &mut renderer {
             let render_start = Instant::now();
             renderer.execute(&commands);
             renderer.submit();
             render_time += render_start.elapsed();
-            // FLORA_SHOTS_FROM: first flip worth a screenshot.
-            let shots_from = std::env::var("FLORA_SHOTS_FROM")
+            // SHOCORA_SHOTS_FROM: first flip worth a screenshot.
+            let shots_from = std::env::var("SHOCORA_SHOTS_FROM")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
@@ -393,7 +578,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             save_png(&dir.join(name), width, height, &rgba)?;
                         }
                     }
-                    if std::env::var_os("FLORA_DUMP_TARGETS").is_some() {
+                    if std::env::var_os("SHOCORA_DUMP_TARGETS").is_some() {
                         for (key, draws) in renderer.take_target_log() {
                             println!(
                                 "  target {:#010x} {}x{} {:?}: {draws} draws",
@@ -464,7 +649,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         for (gap, frame, run, send) in gaps.iter().rev().take(6) {
-            println!("  {gap:>10.2?} before frame {frame}: run_frame {run:.2?}, waiting for the renderer {send:.2?}");
+            println!(
+                "  {gap:>10.2?} before frame {frame}: run_frame {run:.2?}, waiting for the renderer {send:.2?}"
+            );
         }
         let stats = emu.stats();
         println!(
@@ -507,9 +694,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     for spec in
-        std::env::var("FLORA_DISASM").unwrap_or_default().split(';').filter(|s| !s.is_empty())
+        std::env::var("SHOCORA_DISASM").unwrap_or_default().split(';').filter(|s| !s.is_empty())
     {
-        let (at, count) = spec.split_once(',').ok_or("FLORA_DISASM: expected addr,count")?;
+        let (at, count) = spec.split_once(',').ok_or("SHOCORA_DISASM: expected addr,count")?;
         let (at, count) = (u32::from_str_radix(at.trim_start_matches("0x"), 16)?, count.parse()?);
         println!("listing {at:#010x}:");
         for line in emu.disassemble_around(at, 0, count) {

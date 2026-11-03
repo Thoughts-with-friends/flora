@@ -252,6 +252,8 @@ mod vertex_shader {
     pub const OUT_CNTL: u32 = 0x38;
     pub const SEMANTIC_COUNT: u32 = 0x40;
     pub const SEMANTICS: u32 = 0x44;
+    pub const USES_STREAM_OUT: u32 = 0x110;
+    pub const STREAM_OUT_STRIDES: u32 = 0x114;
     pub const SIZE: u32 = 0xD0;
     pub const PROGRAM: u32 = 0xD4;
     pub const MODE: u32 = 0xD8;
@@ -332,6 +334,12 @@ fn gx2_set_vertex_shader(ctx: &mut HleContext<'_>, shader: u32) -> Result<(), Hl
         if !ids.is_empty() {
             ctx.os.gx2.set_context(reg::SPI_VS_OUT_ID_0, &ids);
         }
+        if ctx.memory.read_u32(shader + f::USES_STREAM_OUT)? != 0 {
+            for buffer in 0..STREAM_OUT_BUFFERS {
+                let stride = ctx.memory.read_u32(shader + f::STREAM_OUT_STRIDES + 4 * buffer)?;
+                ctx.os.gx2.set_context(reg::VGT_STRMOUT_VTX_STRIDE_0 + buffer * 4, &[stride >> 2]);
+            }
+        }
     }
     let semantic_count = ctx.memory.read_u32(shader + f::SEMANTIC_COUNT)?.min(32);
     if semantic_count > 0 {
@@ -410,6 +418,90 @@ fn gx2_set_shader_mode_ex(
 #[hle_export(lib = "gx2", name = "GX2SetShaderMode")]
 fn gx2_set_shader_mode(ctx: &mut HleContext<'_>, mode: u32) {
     set_shader_mode(&mut ctx.os.gx2, mode);
+}
+
+// ---- Stream-out --------------------------------------------------------------
+
+/// `GX2_MAX_STREAMOUT_BUFFERS`.
+const STREAM_OUT_BUFFERS: u32 = 4;
+
+/// `GX2StreamOutBuffer`.
+mod stream_out {
+    pub const SIZE: u32 = 0x00;
+    pub const DATA: u32 = 0x04;
+    pub const R_BUFFER: u32 = 0x0C;
+    pub const CONTEXT: u32 = 0x1C;
+}
+
+#[hle_export(lib = "gx2", name = "GX2SetStreamOutBuffer")]
+fn gx2_set_stream_out_buffer(
+    ctx: &mut HleContext<'_>,
+    index: u32,
+    buffer: u32,
+) -> Result<(), HleError> {
+    if index >= STREAM_OUT_BUFFERS {
+        return Ok(());
+    }
+    let data = ctx.memory.read_u32(buffer + stream_out::DATA)?;
+    let (address, size) = if data == 0 {
+        let r = read_rbuffer(ctx, buffer + stream_out::R_BUFFER)?;
+        (r.address, r.size)
+    } else {
+        (data, ctx.memory.read_u32(buffer + stream_out::SIZE)?)
+    };
+    ctx.os.gx2.set_context(reg::VGT_STRMOUT_BUFFER_SIZE_0 + index * 4, &[size >> 2]);
+    ctx.os.gx2.set_context(reg::VGT_STRMOUT_BUFFER_BASE_0 + index * 4, &[physical(address) >> 8]);
+    Ok(())
+}
+
+#[hle_export(lib = "gx2", name = "GX2RSetStreamOutBuffer")]
+fn gx2r_set_stream_out_buffer(
+    ctx: &mut HleContext<'_>,
+    index: u32,
+    buffer: u32,
+) -> Result<(), HleError> {
+    gx2_set_stream_out_buffer(ctx, index, buffer)
+}
+
+#[hle_export(lib = "gx2", name = "GX2SetStreamOutEnable")]
+fn gx2_set_stream_out_enable(ctx: &mut HleContext<'_>, enable: u32) {
+    ctx.os.gx2.set_context(reg::VGT_STRMOUT_EN, &[enable & 1]);
+}
+
+/// `mode` 0 continues from the offset saved in the buffer's context, 1 starts over.
+#[hle_export(lib = "gx2", name = "GX2SetStreamOutContext")]
+fn gx2_set_stream_out_context(
+    ctx: &mut HleContext<'_>,
+    index: u32,
+    buffer: u32,
+    mode: u32,
+) -> Result<(), HleError> {
+    if index >= STREAM_OUT_BUFFERS || mode > 1 {
+        return Ok(());
+    }
+    let context = ctx.memory.read_u32(buffer + stream_out::CONTEXT)?;
+    let source = if mode == 0 { 2 << 1 } else { 0 };
+    ctx.os
+        .gx2
+        .emit(opcode::STRMOUT_BUFFER_UPDATE, &[source | (index << 8), 0, 0, physical(context), 0]);
+    Ok(())
+}
+
+#[hle_export(lib = "gx2", name = "GX2SaveStreamOutContext")]
+fn gx2_save_stream_out_context(
+    ctx: &mut HleContext<'_>,
+    index: u32,
+    buffer: u32,
+) -> Result<(), HleError> {
+    if index >= STREAM_OUT_BUFFERS {
+        return Ok(());
+    }
+    let context = ctx.memory.read_u32(buffer + stream_out::CONTEXT)?;
+    ctx.os.gx2.emit(
+        opcode::STRMOUT_BUFFER_UPDATE,
+        &[1 | (3 << 1) | (index << 8), physical(context), 0, 0, 0],
+    );
+    Ok(())
 }
 
 // ---- Textures --------------------------------------------------------------
@@ -679,4 +771,9 @@ pub const EXPORTS: &[HleExport] = &[
     GX2_SET_GEOMETRY_SAMPLER,
     GX2_SET_PIXEL_SAMPLER_BORDER_COLOR,
     GX2_SET_VERTEX_SAMPLER_BORDER_COLOR,
+    GX2_SET_STREAM_OUT_BUFFER,
+    GX2R_SET_STREAM_OUT_BUFFER,
+    GX2_SET_STREAM_OUT_ENABLE,
+    GX2_SET_STREAM_OUT_CONTEXT,
+    GX2_SAVE_STREAM_OUT_CONTEXT,
 ];

@@ -1,5 +1,5 @@
 [package]
-name = "flora_tests"
+name = "shocora_tests"
 description = "Developer tools and ROM smoke tests; nothing in core/ or gui/ depends on this crate"
 authors.workspace = true
 categories.workspace = true
@@ -17,8 +17,8 @@ path = "lib.rs"
 
 [dependencies]
 env_logger = "0.11"
-flora_game_library = { workspace = true }
-flora_render = { workspace = true }
+shocora_game_library = { workspace = true }
+shocora_render = { workspace = true }
 png = "0.18"
 pollster = "0.4"
 wiiu_cafe_os = { workspace = true }

@@ -16,7 +16,7 @@
 
 ## 1.2 Strategy: high-level emulation of the OS
 
-Like Cemu, flora does not boot the Wii U firmware. Only the game's own
+Like Cemu, shocora does not boot the Wii U firmware. Only the game's own
 PowerPC code is executed; every system library it imports (`coreinit.rpl`,
 `gx2.rpl`, …) and IOSU itself are reimplemented in Rust.
 
@@ -46,7 +46,7 @@ CPU crate knows about HLE.
 `Emulator::run_frame` runs core 1 until the guest waits for vsync
 (`GX2WaitForVsync`, `GX2SwapScanBuffers`), yields, exits, crashes or uses the
 per-frame instruction budget. The front end calls it ~60 times per second on
-a dedicated thread (`flora_gui_common::console`).
+a dedicated thread (`shocora_gui_common::console`).
 
 ## 1.5 Graphics path
 
@@ -54,7 +54,7 @@ a dedicated thread (`flora_gui_common::console`).
 GX2ClearColor / GX2CopyColorBufferToScanBuffer / GX2SwapScanBuffers
    └─► PM4 packets (incl. emulator-private HLE opcodes 0xE0..)
          └─► wiiu_gpu::command::executor ──► Display ──► RenderCommand
-               └─► flora_render: WgpuRenderer (wgpu: DX12/Metal/Vulkan/GL)
+               └─► shocora_render: WgpuRenderer (wgpu: DX12/Metal/Vulkan/GL)
                                  GlowRenderer (native OpenGL)
 ```
 

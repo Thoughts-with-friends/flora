@@ -4,15 +4,26 @@
 /// A control-flow instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cf {
-    Tex { addr: u32, count: u32 },
+    Tex {
+        addr: u32,
+        count: u32,
+    },
     Alu(AluClause),
     LoopStart,
     LoopEnd,
     LoopBreak,
-    Else { pop: u32 },
-    Pop { pop: u32 },
-    Jump { pop: u32 },
+    Else {
+        pop: u32,
+    },
+    Pop {
+        pop: u32,
+    },
+    Jump {
+        pop: u32,
+    },
     Export(Export),
+    /// `MEM_STREAM*_WRITE`: stores registers in a stream-out buffer.
+    StreamWrite(StreamWrite),
     Unsupported(u32),
 }
 
@@ -49,6 +60,17 @@ pub struct Export {
     pub sel: [u32; 4],
 }
 
+/// `MEM_STREAM*_WRITE`: components of one register for a stream-out buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamWrite {
+    pub buffer: u32,
+    /// In dwords from the start of the vertex.
+    pub array_base: u32,
+    pub array_size: u32,
+    pub component_mask: u32,
+    pub gpr: u32,
+}
+
 const CF_NOP: u32 = 0x00;
 const CF_TEX: u32 = 0x01;
 const CF_VTX: u32 = 0x02;
@@ -63,6 +85,8 @@ const CF_ELSE: u32 = 0x0D;
 const CF_POP: u32 = 0x0E;
 const CF_CALL_FS: u32 = 0x13;
 const CF_RETURN: u32 = 0x14;
+const CF_MEM_STREAM0_WRITE: u32 = 0x20;
+const CF_MEM_STREAM3_WRITE: u32 = 0x23;
 const CF_EXPORT: u32 = 0x27;
 const CF_EXPORT_DONE: u32 = 0x28;
 
@@ -131,6 +155,15 @@ pub fn parse_cf(code: &[u8]) -> Vec<Cf> {
                 burst: ((word1 >> 17) & 0xF) + 1,
                 sel: [word1 & 7, (word1 >> 3) & 7, (word1 >> 6) & 7, (word1 >> 9) & 7],
             })),
+            CF_MEM_STREAM0_WRITE..=CF_MEM_STREAM3_WRITE => {
+                list.push(Cf::StreamWrite(StreamWrite {
+                    buffer: inst - CF_MEM_STREAM0_WRITE,
+                    array_base: word0 & 0x1FFF,
+                    array_size: (word1 & 0xFFF) + 1,
+                    component_mask: (word1 >> 12) & 0xF,
+                    gpr: (word0 >> 15) & 0x7F,
+                }));
+            }
             other => list.push(Cf::Unsupported(other)),
         }
         if end {

@@ -129,7 +129,7 @@ fn compile_enter(module: &mut JITModule, isa: &OwnedTargetIsa) -> EnterFn {
     signature.params.extend([AbiParam::new(pointer); 4]);
     signature.returns.push(AbiParam::new(I32));
     let id = module
-        .declare_function("flora_enter_block", Linkage::Local, &signature)
+        .declare_function("shocora_enter_block", Linkage::Local, &signature)
         .expect("a fresh module has no such function");
     let mut context = module.make_context();
     context.func.signature = signature;
@@ -167,7 +167,7 @@ fn spawn_workers(
     let jobs = Arc::new(Mutex::new(jobs));
     for _ in 0..count {
         let (isa, jobs, finished) = (Arc::clone(isa), Arc::clone(&jobs), finished.clone());
-        let spawned = std::thread::Builder::new().name("flora-jit".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("shocora-jit".into()).spawn(move || {
             let mut worker = emit::Worker::new(Arc::clone(&isa), pages);
             loop {
                 let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
@@ -194,14 +194,14 @@ impl Jit {
     /// Creates an empty code cache for the host CPU.
     ///
     /// # Panics
-    /// If Cranelift does not support the host (flora only targets ones it does).
+    /// If Cranelift does not support the host (shocora only targets ones it does).
     #[allow(
         clippy::expect_used,
-        reason = "no host without Cranelift support can run flora at usable speed"
+        reason = "no host without Cranelift support can run shocora at usable speed"
     )]
     pub fn new() -> Self {
         let mut flags = settings::builder();
-        let level = if std::env::var_os("FLORA_JIT_NONE").is_some() { "none" } else { "speed" };
+        let level = if std::env::var_os("SHOCORA_JIT_NONE").is_some() { "none" } else { "speed" };
         flags.set("opt_level", level).expect("known flag");
         flags.set("use_colocated_libcalls", "false").expect("known flag");
         flags.set("is_pic", "false").expect("known flag");
@@ -231,7 +231,7 @@ impl Jit {
             jobs,
             finished,
             generation: 0,
-            synchronous: std::env::var_os("FLORA_JIT_SYNC").is_some(),
+            synchronous: std::env::var_os("SHOCORA_JIT_SYNC").is_some(),
             compiled_blocks: 0,
             compile_nanos: 0,
         }

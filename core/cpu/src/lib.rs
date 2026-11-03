@@ -25,7 +25,7 @@ pub use interpreter::{CpuError, StepEvent, run, step};
 pub use jit::Jit;
 pub use state::{CpuState, Fpr};
 
-/// Primary opcode 1 is unused on Espresso; flora uses it for HLE calls.
+/// Primary opcode 1 is unused on Espresso; shocora uses it for HLE calls.
 /// The low 26 bits carry the HLE function index.
 pub const HLE_CALL_PRIMARY_OPCODE: u32 = 1;
 

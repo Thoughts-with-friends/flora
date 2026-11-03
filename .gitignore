@@ -1,6 +1,6 @@
 /target
 *.log
-/flora.toml
+/shocora.toml
 /roms.json
 /shader_cache/
 

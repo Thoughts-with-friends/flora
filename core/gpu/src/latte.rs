@@ -1,3 +1,5 @@
+//! GPU: AMD Radeon, package codenamed "Latte".
+//! Core clock is 549.999 MHz.
 //! Turns register state into host work: render targets, shaders, textures,
 //! vertex data and pipeline state of a draw.
 #![allow(
@@ -17,9 +19,9 @@ use crate::{
     command::opcode::SURFACE_WORDS,
     regs::{RegisterFile, base, config, context as reg, resource},
     render::{
-        AddressMode, BindingKind, BlendState, BoundTexture, DepthClear, DrawCommand, HostFormat,
-        MipData, PipelineState, RenderCommand, SamplerDesc, ShaderModule, StencilFace, SurfaceKey,
-        TextureUpload, Topology,
+        AddressMode, BindingKind, BlendState, BorderColor, BoundTexture, DepthClear, DrawCommand,
+        HostFormat, MipData, PipelineState, RenderCommand, SamplerDesc, ShaderModule, StencilFace,
+        StreamCopy, SurfaceKey, TextureUpload, Topology,
     },
     shader::{self, PixelInputs, TEXTURE_UNITS, TextureDim, TextureKind, TextureSignature},
     tiling::{Layout, detile, swizzle_from_address},
@@ -27,10 +29,14 @@ use crate::{
 
 /// Size of the arena every vertex, index and uniform byte goes through.
 pub const ARENA_SIZE: u32 = 0x2000_0000;
+/// The end of the arena holds stream-out results, which outlive the rest.
+pub const STREAM_REGION_SIZE: u32 = 0x400_0000;
+/// Where the stream region starts.
+pub const STREAM_REGION_BASE: u32 = ARENA_SIZE - STREAM_REGION_SIZE;
 /// Alignment of draw parameter blocks (`min_storage_buffer_offset_alignment`).
 const PARAMS_ALIGN: u32 = 256;
 /// Size of `DrawParams` in the shader prelude.
-const PARAMS_SIZE: usize = 32 + 4 * 16 * 4;
+const PARAMS_SIZE: usize = 32 + 4 * 16 * 4 + 36;
 /// Texture contents are re-checked once per this many frames at most.
 const TEXTURE_RECHECK_FRAMES: u64 = 2;
 /// Bytes hashed per step when checking whether a texture changed.
@@ -281,6 +287,17 @@ struct KnownTexture {
     last_check: u64,
 }
 
+/// A guest buffer written by stream-out, whose contents only the host has.
+#[derive(Debug, Clone, Copy)]
+struct StreamBuffer {
+    physical: u32,
+    size: u32,
+    /// Byte offset in the stream region.
+    offset: u32,
+    /// Guest bytes when last streamed to: a change means the CPU wrote new data there.
+    guest_hash: u64,
+}
+
 /// A program that has been translated, by source hash and dependencies.
 #[derive(Debug)]
 struct ProgramPair {
@@ -315,6 +332,8 @@ pub struct Latte {
     /// Hash of a shader program, valid for a guest address.
     code_cache: HashMap<(u32, u32), (u64, Arc<[u8]>, u64)>,
     next_module_id: u64,
+    stream_buffers: Vec<StreamBuffer>,
+    stream_cursor: u32,
     pub skipped_draws: u64,
 }
 
@@ -335,6 +354,8 @@ impl Default for Latte {
             key_buffer: Vec::new(),
             code_cache: HashMap::new(),
             next_module_id: 1,
+            stream_buffers: Vec::new(),
+            stream_cursor: 0,
             skipped_draws: 0,
         }
     }
@@ -367,7 +388,7 @@ impl Latte {
 
     fn arena_reserve(&mut self, size: u32, align: u32) -> u32 {
         let mut offset = self.arena_cursor.next_multiple_of(align);
-        if u64::from(offset) + u64::from(size) > u64::from(ARENA_SIZE) {
+        if u64::from(offset) + u64::from(size) > u64::from(STREAM_REGION_BASE) {
             self.commands.push(RenderCommand::ArenaWrap);
             self.arena_entries.clear();
             offset = 0;
@@ -822,11 +843,13 @@ impl Latte {
         let vs_module = Arc::new(ShaderModule {
             id: self.next_module_id,
             bindings: make_bindings(&vertex, &vs_signatures, 0),
+            stream_out: vertex.stream_out,
             wgsl: vertex.wgsl,
         });
         let ps_module = Arc::new(ShaderModule {
             id: self.next_module_id + 1,
             bindings: make_bindings(&pixel, &ps_signatures, TEXTURE_UNITS as u32),
+            stream_out: false,
             wgsl: pixel.wgsl,
         });
         self.next_module_id += 2;
@@ -949,15 +972,97 @@ impl Latte {
         self.arena_store(bytes, 16)
     }
 
+    /// Where a stream-out buffer lives in the stream region, reserving room the first time.
+    fn stream_buffer(&mut self, physical: u32, size: u32) -> Option<usize> {
+        if let Some(index) =
+            self.stream_buffers.iter().position(|b| b.physical == physical && b.size == size)
+        {
+            return Some(index);
+        }
+        let aligned = size.next_multiple_of(256);
+        if aligned > STREAM_REGION_SIZE {
+            log::warn!("stream-out buffer of {size:#x} bytes does not fit");
+            return None;
+        }
+        if self.stream_cursor + aligned > STREAM_REGION_SIZE {
+            // Full: the oldest buffers give way.
+            self.stream_buffers.clear();
+            self.stream_cursor = 0;
+        }
+        let offset = self.stream_cursor;
+        self.stream_cursor += aligned;
+        self.stream_buffers.push(StreamBuffer { physical, size, offset, guest_hash: 0 });
+        Some(self.stream_buffers.len() - 1)
+    }
+
+    /// Arena offset of attribute data the GPU produced itself, unless the CPU replaced it.
+    fn streamed_attribute(&mut self, memory: &Memory, physical: u32) -> Option<u32> {
+        let index = self
+            .stream_buffers
+            .iter()
+            .position(|b| physical >= b.physical && physical - b.physical < b.size)?;
+        let buffer = self.stream_buffers[index];
+        let effective = wiiu_mem_addr::physical_to_effective(buffer.physical)?;
+        let guest = memory.slice(effective, buffer.size).ok()?;
+        if sampled_hash(guest) != buffer.guest_hash {
+            self.stream_buffers.remove(index);
+            return None;
+        }
+        Some(STREAM_REGION_BASE + buffer.offset + (physical - buffer.physical))
+    }
+
+    /// Sets up the stream-out writes of a draw of `vertices` vertices per instance.
+    fn stream_out_setup(
+        &mut self,
+        memory: &Memory,
+        regs: &mut RegisterFile,
+        params: &mut [u32],
+        vertices: u32,
+        instances: u32,
+        base_vertex: u32,
+    ) -> Vec<StreamCopy> {
+        let mut copies = Vec::new();
+        params[80] = vertices;
+        for index in 0..4 {
+            let at = |register: u32| register + index * 4;
+            let stride = regs.get(at(reg::VGT_STRMOUT_VTX_STRIDE_0));
+            let physical = regs.get(at(reg::VGT_STRMOUT_BUFFER_BASE_0)) << 8;
+            let size = regs.get(at(reg::VGT_STRMOUT_BUFFER_SIZE_0)) << 2;
+            let written = regs.get(at(reg::VGT_STRMOUT_BUFFER_OFFSET_0));
+            if stride == 0 || physical == 0 || size == 0 {
+                continue;
+            }
+            let Some(buffer) = self.stream_buffer(physical, size) else { continue };
+            let guest_hash = wiiu_mem_addr::physical_to_effective(physical)
+                .and_then(|effective| memory.slice(effective, size).ok())
+                .map_or(0, sampled_hash);
+            self.stream_buffers[buffer].guest_hash = guest_hash;
+            let start = self.stream_buffers[buffer].offset + written.min(size);
+            let total = u64::from(vertices) * u64::from(instances) * u64::from(stride) * 4;
+            let range = total.min(u64::from(size - written.min(size))) as u32;
+            // The shader indexes by vertex number, which includes the base vertex.
+            params[72 + index as usize] =
+                (start / 4).wrapping_sub(base_vertex.wrapping_mul(stride));
+            params[76 + index as usize] = stride;
+            if range > 0 {
+                copies.push(StreamCopy { offset: start, size: range });
+            }
+            regs.set(at(reg::VGT_STRMOUT_BUFFER_OFFSET_0), written.wrapping_add(range));
+        }
+        copies
+    }
+
     /// Executes a draw from the current registers.
-    pub fn draw(&mut self, memory: &Memory, regs: &RegisterFile, draw: &DrawRequest<'_>) {
+    pub fn draw(&mut self, memory: &Memory, regs: &mut RegisterFile, draw: &DrawRequest<'_>) {
         if regs.get(reg::VGT_GS_MODE) & 3 != 0 {
             // Geometry shaders have no host equivalent yet.
             self.skipped_draws += 1;
             return;
         }
-        if regs.get(reg::PA_CL_CLIP_CNTL) & (1 << 22) != 0 {
-            // DX_RASTERIZATION_KILL: only stream out or queries could observe it.
+        // DX_RASTERIZATION_KILL: only stream-out can observe such a draw.
+        let killed = regs.get(reg::PA_CL_CLIP_CNTL) & (1 << 22) != 0;
+        let streaming = regs.get(reg::VGT_STRMOUT_EN) & 1 != 0;
+        if killed && !streaming {
             return;
         }
         let program_size = |start: u32| regs.get(start + 1) << 3;
@@ -974,6 +1079,10 @@ impl Latte {
         };
         let attributes = self.fetch_attributes(fetch.0, &fetch.1);
         let pair = self.program_pair(regs, vs, ps, fetch);
+        let stream_only = killed && pair.vertex.stream_out;
+        if killed && !stream_only {
+            return;
+        }
 
         let mut textures = Vec::new();
         self.bind_textures(
@@ -986,16 +1095,18 @@ impl Latte {
             &pair.vs_textures,
             &pair.vs_samplers,
         );
-        self.bind_textures(
-            memory,
-            regs,
-            &mut textures,
-            resource::PS_TEXTURE,
-            TEXTURE_UNITS as u32,
-            0,
-            &pair.ps_textures,
-            &pair.ps_samplers,
-        );
+        if !stream_only {
+            self.bind_textures(
+                memory,
+                regs,
+                &mut textures,
+                resource::PS_TEXTURE,
+                TEXTURE_UNITS as u32,
+                0,
+                &pair.ps_textures,
+                &pair.ps_samplers,
+            );
+        }
 
         // Render targets.
         let cb_target_mask = regs.get(reg::CB_TARGET_MASK);
@@ -1008,7 +1119,11 @@ impl Latte {
             let words = self.color_targets[target];
             let mask =
                 ((cb_target_mask >> (4 * target)) & (cb_shader_mask >> (4 * target)) & 0xF) as u8;
-            if !color_enabled || !words.is_valid() || pair.color_exports & (1 << target) == 0 {
+            if stream_only
+                || !color_enabled
+                || !words.is_valid()
+                || pair.color_exports & (1 << target) == 0
+            {
                 continue;
             }
             let key = Self::key_of_target(&words, false);
@@ -1020,7 +1135,7 @@ impl Latte {
         let depth_words = self.depth_target;
         let depth_control = regs.get(reg::DB_DEPTH_CONTROL);
         let wants_depth = depth_control & 0b111 != 0;
-        let depth_target = (depth_words.is_valid() && wants_depth).then(|| {
+        let depth_target = (depth_words.is_valid() && wants_depth && !stream_only).then(|| {
             let key = Self::key_of_target(&depth_words, true);
             self.note_target(key);
             state.depth_format = Some(key.format);
@@ -1031,7 +1146,10 @@ impl Latte {
             state.depth_write = false;
             state.stencil_test = false;
         }
-        if color_targets.iter().all(Option::is_none) && depth_target.is_none() {
+        if stream_only {
+            // The host wants something to render to: a small depth surface it keeps itself.
+            state.depth_format = Some(HostFormat::Depth32Float);
+        } else if color_targets.iter().all(Option::is_none) && depth_target.is_none() {
             self.skipped_draws += 1;
             return;
         }
@@ -1119,6 +1237,11 @@ impl Latte {
             if physical == 0 {
                 continue;
             }
+            if let Some(offset) = self.streamed_attribute(memory, physical) {
+                params[40 + buffer] = offset;
+                params[56 + buffer] = stride;
+                continue;
+            }
             let Some(effective) = wiiu_mem_addr::physical_to_effective(physical) else { continue };
             let per_instance =
                 attributes.iter().any(|a| a.buffer as usize == buffer && a.rate != 0);
@@ -1137,6 +1260,18 @@ impl Latte {
         params[5] = regs.get(reg::VGT_INSTANCE_STEP_RATE_0);
         params[6] = regs.get(reg::VGT_INSTANCE_STEP_RATE_0 + 1);
         params[7] = draw.base_instance;
+        let stream_copies = if streaming && pair.vertex.stream_out {
+            self.stream_out_setup(
+                memory,
+                regs,
+                &mut params,
+                draw.count,
+                draw.instances.max(1),
+                draw.base_vertex,
+            )
+        } else {
+            Vec::new()
+        };
         let params_bytes: Vec<u8> = params.iter().flat_map(|w| w.to_le_bytes()).collect();
         let params_offset = self.arena_write_unique(&params_bytes, PARAMS_ALIGN);
 
@@ -1148,8 +1283,10 @@ impl Latte {
         let stencil_reference = (regs.get(reg::DB_STENCILREFMASK) & 0xFF) as u8;
         let blend_constant =
             std::array::from_fn(|i| f32::from_bits(regs.get(reg::CB_BLEND_RED + i as u32)));
-        state.topology = topology_of(mode);
+        state.topology = if stream_only { Topology::Points } else { topology_of(mode) };
         let command = DrawCommand {
+            stream_only,
+            stream_copies,
             vertex: Arc::clone(&pair.vertex),
             pixel: Arc::clone(&pair.pixel),
             state,
@@ -1393,20 +1530,58 @@ fn read_sampler(regs: &RegisterFile, index: u32, signature: TextureSignature) ->
     let word1 = regs.get(base::SAMPLER + index * 3 + 1);
     let non_filterable = signature.kind != TextureKind::Float;
     let filter = |bits: u32| !non_filterable && matches!(bits & 7, 1 | 5);
+    let (mag_linear, min_linear) = (filter((word0 >> 9) & 7), filter((word0 >> 12) & 7));
+    let min_lod = (word1 & 0x3FF) as u16;
+    let mip_filter = (word0 >> 17) & 3;
+    // Without a mip filter only the first level of the range is read.
+    let max_lod = if mip_filter == 0 { min_lod } else { ((word1 >> 10) & 0x3FF) as u16 };
+    let aniso_ratio = (word0 >> 19) & 7;
+    let anisotropy =
+        if mag_linear && min_linear && mip_filter != 0 && aniso_ratio != 0 && !signature.comparison
+        {
+            1_u8 << aniso_ratio.min(4)
+        } else {
+            0
+        };
     SamplerDesc {
         address: [
             address_mode(word0 & 7),
             address_mode((word0 >> 3) & 7),
             address_mode((word0 >> 6) & 7),
         ],
-        mag_linear: filter((word0 >> 9) & 7),
-        min_linear: filter((word0 >> 12) & 7),
-        mip_linear: !non_filterable && (word0 >> 17) & 3 == 2,
-        anisotropy: 0,
-        min_lod: (word1 & 0x3FF) as u16,
-        max_lod: ((word1 >> 10) & 0x3FF) as u16,
+        mag_linear,
+        min_linear,
+        mip_linear: !non_filterable && mip_filter == 2,
+        anisotropy,
+        min_lod,
+        max_lod,
         compare: signature.comparison.then_some(((word0 >> 26) & 7) as u8),
+        border: border_color(regs, index, (word0 >> 22) & 3),
         non_filterable,
+    }
+}
+
+/// The nearest host border color. Type 3 takes it from the unit's registers.
+fn border_color(regs: &RegisterFile, index: u32, kind: u32) -> BorderColor {
+    match kind {
+        0 => BorderColor::TransparentBlack,
+        1 => BorderColor::OpaqueBlack,
+        2 => BorderColor::OpaqueWhite,
+        _ => {
+            let base = if index < 18 {
+                config::TD_PS_SAMPLER0_BORDER_RED + index * 4
+            } else {
+                config::TD_VS_SAMPLER0_BORDER_RED + (index - 18) * 4
+            };
+            let channel = |i: u32| f32::from_bits(regs.get(base + i));
+            if channel(3) < 0.5 {
+                BorderColor::TransparentBlack
+            } else if channel(0) >= 0.5 {
+                BorderColor::OpaqueWhite
+            } else {
+                BorderColor::OpaqueBlack
+            }
+        }
     }
 }
 

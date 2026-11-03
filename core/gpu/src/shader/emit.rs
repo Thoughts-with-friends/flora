@@ -6,8 +6,8 @@ use std::{collections::BTreeSet, fmt::Write as _};
 use super::{
     TEXTURE_UNITS, TextureDim, TextureKind, TextureSignature, TranslatedShader, WGSL_PRELUDE,
     cf::{
-        AluClause, AluGroup, AluKind, AluOp, Cf, Export, TexOp, VFETCH, parse_alu, parse_cf,
-        parse_tex,
+        AluClause, AluGroup, AluKind, AluOp, Cf, Export, StreamWrite, TexOp, VFETCH, parse_alu,
+        parse_cf, parse_tex,
     },
     fetch::{Attribute, format},
 };
@@ -91,6 +91,8 @@ struct Translator<'a> {
     param_exports: BTreeSet<u32>,
     loop_depth: u32,
     uses_stack: bool,
+    /// Writes stream-out buffers (`MEM_STREAM*_WRITE`).
+    stream_out: bool,
 }
 
 impl<'a> Translator<'a> {
@@ -116,6 +118,7 @@ impl<'a> Translator<'a> {
             param_exports: BTreeSet::new(),
             loop_depth: 0,
             uses_stack: false,
+            stream_out: false,
         }
     }
 
@@ -366,15 +369,20 @@ impl<'a> Translator<'a> {
             0x12 => (float(format!("ceil({fa})")), true),
             0x13 => (float(format!("round({fa})")), true),
             0x14 => (float(format!("floor({fa})")), true),
+            // The address registers hold -256..=255.
             0x15 | 0x16 => {
-                let line = format!("AR.{} = i32(floor({fa}));", CHANNEL[op.dest_elem as usize]);
+                let line = format!(
+                    "AR.{} = i32(clamp(floor({fa}), -256.0, 255.0));",
+                    CHANNEL[op.dest_elem as usize]
+                );
                 self.line(&line);
-                (float(format!("floor({fa})")), true)
+                (float(format!("clamp(floor({fa}), -256.0, 255.0)")), true)
             }
             0x18 => {
-                let line = format!("AR.{} = {ia};", CHANNEL[op.dest_elem as usize]);
+                let line =
+                    format!("AR.{} = clamp({ia}, -256, 255);", CHANNEL[op.dest_elem as usize]);
                 self.line(&line);
-                (a, false)
+                (format!("bitcast<u32>(clamp({ia}, -256, 255))"), false)
             }
             0x19 => return self.modifiers(op, a, op.omod != 0 || op.clamp),
             0x1A => return None,
@@ -429,16 +437,21 @@ impl<'a> Translator<'a> {
             0x3E => (set_int(format!("{a} > {b}")), false),
             0x3F => (set_int(format!("{a} >= {b}")), false),
             0x61 => (float(format!("exp2({fa})")), true),
-            0x62 => (float(format!("max(log2({fa}), -1.8446742974e19)")), true),
-            0x63 => (float(format!("log2({fa})")), true),
-            0x64..=0x66 => (float(format!("1.0 / {fa}")), true),
-            0x67..=0x69 => (float(format!("1.0 / sqrt({fa})")), true),
+            0x62 => (float(format!("log_clamped({fa})")), true),
+            0x63 => (float(format!("log2(max({fa}, 0.0))")), true),
+            0x64 => (float(format!("recip_clamped({fa})")), true),
+            0x65 => (float(format!("recip_ff({fa})")), true),
+            0x66 => (float(format!("1.0 / {fa}")), true),
+            0x67 => (float(format!("recipsqrt_clamped({fa})")), true),
+            0x68 => (float(format!("recipsqrt_ff({fa})")), true),
+            0x69 => (float(format!("1.0 / sqrt({fa})")), true),
             0x6A => (float(format!("sqrt({fa})")), true),
             0x6B => (format!("bitcast<u32>(i32({fa}))"), false),
             0x6C => (float(format!("f32({ia})")), true),
             0x6D => (float(format!("f32({a})")), true),
-            0x6E => (float(format!("sin({fa})")), true),
-            0x6F => (float(format!("cos({fa})")), true),
+            // The angle comes in full turns.
+            0x6E => (float(format!("sin({fa} / 0.1591549367)")), true),
+            0x6F => (float(format!("cos({fa} / 0.1591549367)")), true),
             0x70 => (format!("bitcast<u32>({ia} >> ({b} & 31u))"), false),
             0x71 => (format!("({a} >> ({b} & 31u))"), false),
             0x72 => (format!("({a} << ({b} & 31u))"), false),
@@ -623,13 +636,16 @@ impl<'a> Translator<'a> {
             TextureDim::D3 => format!("vec3<f32>({x},{y},{z})"),
             TextureDim::Cube => format!("cube_direction(vec2<f32>({x},{y}), i32({z}))"),
         };
-        let offset = if signature.dim == TextureDim::D2
-            && (op.offset[0] != 0 || op.offset[1] != 0)
-            && matches!(op.opcode, tex::SAMPLE | tex::SAMPLE_LZ)
-        {
-            format!(", vec2<i32>({},{})", op.offset[0], op.offset[1])
-        } else {
-            String::new()
+        // Offsets come in half texels; the host takes whole ones. Cube maps have none.
+        let (off_x, off_y, off_z) = (op.offset[0] / 2, op.offset[1] / 2, op.offset[2] / 2);
+        let offset = match signature.dim {
+            TextureDim::D2 | TextureDim::D2Array if off_x != 0 || off_y != 0 => {
+                format!(", vec2<i32>({off_x},{off_y})")
+            }
+            TextureDim::D3 if off_x != 0 || off_y != 0 || off_z != 0 => {
+                format!(", vec3<i32>({off_x},{off_y},{off_z})")
+            }
+            _ => String::new(),
         };
         let in_pixel = self.stage == Stage::Pixel;
         match op.opcode {
@@ -638,7 +654,7 @@ impl<'a> Translator<'a> {
             }
             tex::SAMPLE | tex::SAMPLE_LZ => {
                 if signature.kind == TextureKind::Depth {
-                    format!("textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0)")
+                    format!("textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0{offset})")
                 } else {
                     format!("textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0.0{offset})")
                 }
@@ -646,38 +662,42 @@ impl<'a> Translator<'a> {
             tex::SAMPLE_L => {
                 if signature.kind == TextureKind::Depth {
                     format!(
-                        "textureSampleLevel({tex_name}, {sampler_name}, {coords}, i32({lod_arg}))"
+                        "textureSampleLevel({tex_name}, {sampler_name}, {coords}, i32({lod_arg}){offset})"
                     )
                 } else {
-                    format!("textureSampleLevel({tex_name}, {sampler_name}, {coords}, {lod_arg})")
+                    format!(
+                        "textureSampleLevel({tex_name}, {sampler_name}, {coords}, {lod_arg}{offset})"
+                    )
                 }
             }
             tex::SAMPLE_LB if in_pixel => {
-                format!("textureSampleBias({tex_name}, {sampler_name}, {coords}, {lod_arg})")
+                format!(
+                    "textureSampleBias({tex_name}, {sampler_name}, {coords}, {lod_arg}{offset})"
+                )
             }
             tex::SAMPLE_LB => {
-                format!("textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0.0)")
+                format!("textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0.0{offset})")
             }
             tex::SAMPLE_G => {
                 let (h, v) = match signature.dim {
                     TextureDim::D2 | TextureDim::D2Array => ("GRAD_H.xy", "GRAD_V.xy"),
                     _ => ("GRAD_H", "GRAD_V"),
                 };
-                format!("textureSampleGrad({tex_name}, {sampler_name}, {coords}, {h}, {v})")
+                format!("textureSampleGrad({tex_name}, {sampler_name}, {coords}, {h}, {v}{offset})")
             }
             tex::FETCH4 if signature.dim == TextureDim::D2 => {
-                format!("textureGather(0, {tex_name}, {sampler_name}, {coords})")
+                format!("textureGather(0, {tex_name}, {sampler_name}, {coords}{offset})")
             }
             tex::SAMPLE_C | tex::SAMPLE_C_L | tex::SAMPLE_C_LZ => {
                 let reference_slot = if op.opcode == tex::SAMPLE_C_L { 2 } else { 3 };
                 let reference = self.coord(op, reference_slot);
                 if in_pixel && op.opcode == tex::SAMPLE_C {
                     format!(
-                        "textureSampleCompare({tex_name}, {sampler_name}, {coords}, {reference})"
+                        "textureSampleCompare({tex_name}, {sampler_name}, {coords}, {reference}{offset})"
                     )
                 } else {
                     format!(
-                        "textureSampleCompareLevel({tex_name}, {sampler_name}, {coords}, {reference})"
+                        "textureSampleCompareLevel({tex_name}, {sampler_name}, {coords}, {reference}{offset})"
                     )
                 }
             }
@@ -828,9 +848,36 @@ impl<'a> Translator<'a> {
                     export(self, e);
                     self.line("}");
                 }
+                Cf::StreamWrite(write) => {
+                    if self.stage == Stage::Vertex {
+                        self.stream_write(write);
+                    }
+                }
                 Cf::Unsupported(kind) => log::warn!("unsupported CF instruction {kind:#x}"),
             }
         }
+    }
+
+    /// Stores components of a register in the host's copy of the stream-out buffer.
+    fn stream_write(&mut self, write: &StreamWrite) {
+        self.stream_out = true;
+        self.note_gpr(write.gpr);
+        let buffer = write.buffer;
+        self.line(&format!("if (exec_on && P.so_stride[{buffer}] != 0u) {{"));
+        self.line(&format!(
+            "let so_at = P.so_base[{buffer}] + (vertex_index + P.so_instance_vertices * instance_index) * P.so_stride[{buffer}] + {}u;",
+            write.array_base
+        ));
+        for component in 0..write.array_size.min(4) {
+            if write.component_mask & (1 << component) != 0 {
+                let line = format!(
+                    "so[so_at + {component}u] = R[{}].{};",
+                    write.gpr, CHANNEL[component as usize]
+                );
+                self.line(&line);
+            }
+        }
+        self.line("}");
     }
 
     fn pop(&mut self, count: u32) {
@@ -894,6 +941,9 @@ impl<'a> Translator<'a> {
     /// Texture and sampler declarations in `group(1)`; bindings follow the stage and unit.
     fn resource_declarations(&self) -> String {
         let mut text = String::new();
+        if self.stream_out {
+            text.push_str("@group(2) @binding(0) var<storage, read_write> so: array<u32>;\n");
+        }
         let stage_base = if self.stage == Stage::Vertex { 0 } else { TEXTURE_UNITS };
         for &unit in &self.used_textures {
             let signature = self.textures[usize::from(unit)];
@@ -929,6 +979,7 @@ impl<'a> Translator<'a> {
             textures: self.used_textures.into_iter().collect(),
             color_exports: self.color_exports,
             writes_depth: self.writes_depth,
+            stream_out: self.stream_out,
         }
     }
 }

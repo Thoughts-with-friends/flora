@@ -30,8 +30,8 @@ fn main() -> ExitCode {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut command = Command::new(cargo);
     match task.as_str() {
-        "build" => command.args(["build", "-p", "flora_egui"]),
-        "run" => command.args(["run", "-p", "flora_egui"]),
+        "build" => command.args(["build", "-p", "shocora_egui"]),
+        "run" => command.args(["run", "-p", "shocora_egui"]),
         "test" => command.args(["test", "--workspace"]),
         _ => {
             eprintln!("{USAGE}");

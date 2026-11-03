@@ -364,7 +364,7 @@ fn mp_run_task(ctx: &mut HleContext<'_>, entry: u32) -> Result<(), HleError> {
 }
 
 /// A task function returned.
-#[hle_export(lib = "flora", name = "__flora_MPTaskReturn")]
+#[hle_export(lib = "shocora", name = "__shocora_MPTaskReturn")]
 fn mp_task_return(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
     let me = ctx.os.coreinit.threads.current;
     let Some(run) = ctx.os.coreinit.mp.running.remove(&me) else {

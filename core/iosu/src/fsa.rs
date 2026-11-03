@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn file_and_directory_handles() {
-        let root = std::env::temp_dir().join(format!("flora-fsa-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("shocora-fsa-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("content")).unwrap();
         fs::write(root.join("content/a.bin"), b"abcdef").unwrap();

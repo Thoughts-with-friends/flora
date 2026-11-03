@@ -29,7 +29,7 @@ const MIN_STACK_SIZE: u32 = 0x4_0000;
 const HEAP_ALIGN: u32 = 0x1_0000;
 
 /// Library of emulator-internal entry points.
-pub const INTERNAL_LIBRARY: &str = "flora";
+pub const INTERNAL_LIBRARY: &str = "shocora";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootError {
@@ -70,7 +70,7 @@ pub struct MainEntry {
 }
 
 /// The main thread returned from its entry point.
-#[hle_export(lib = "flora", name = "__flora_MainThreadReturn")]
+#[hle_export(lib = "shocora", name = "__shocora_MainThreadReturn")]
 fn main_thread_return(ctx: &mut HleContext<'_>) {
     let code = ctx.cpu.gpr[3].cast_signed();
     log::info!("main thread returned {code}");
@@ -79,7 +79,7 @@ fn main_thread_return(ctx: &mut HleContext<'_>) {
 }
 
 /// A guest callback returned: resume the interrupted code.
-#[hle_export(lib = "flora", name = "__flora_CallbackReturn")]
+#[hle_export(lib = "shocora", name = "__shocora_CallbackReturn")]
 fn callback_return(ctx: &mut HleContext<'_>) {
     ctx.os.callbacks.finish(ctx.cpu);
     if ctx.os.current_thread_blocked() {
@@ -88,7 +88,7 @@ fn callback_return(ctx: &mut HleContext<'_>) {
 }
 
 /// `__preinit_user` returned: install the heaps it chose and enter the title.
-#[hle_export(lib = "flora", name = "__flora_PreinitReturn")]
+#[hle_export(lib = "shocora", name = "__shocora_PreinitReturn")]
 fn preinit_return(ctx: &mut HleContext<'_>) -> Result<(), crate::hle::HleError> {
     let Some(main) = ctx.os.pending_main.take() else {
         return Err(crate::hle::HleError::Fatal("__preinit_user returned twice".into()));

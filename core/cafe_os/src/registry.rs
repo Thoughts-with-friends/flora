@@ -47,7 +47,7 @@ pub enum Entry {
         name: &'static str,
         function: HleFn,
     },
-    /// Imported by the guest but not implemented by flora.
+    /// Imported by the guest but not implemented by shocora.
     Missing {
         library: String,
         name: String,
@@ -114,7 +114,7 @@ impl HleRegistry {
             Entry::Function { name, .. } => *name,
             Entry::Missing { name, .. } => name.as_str(),
         };
-        self.traced.push(std::env::var("FLORA_TRACE_HLE").is_ok_and(|list| {
+        self.traced.push(std::env::var("SHOCORA_TRACE_HLE").is_ok_and(|list| {
             list.split(',')
                 .any(|n| n.strip_suffix('*').map_or(n == name, |prefix| name.starts_with(prefix)))
         }));
@@ -154,7 +154,7 @@ impl HleRegistry {
         self.entries.get(index as usize).cloned()
     }
 
-    /// `FLORA_TRACE_HLE` lists comma-separated export names to log every call of.
+    /// `SHOCORA_TRACE_HLE` lists comma-separated export names to log every call of.
     pub fn is_traced(&self, index: u32) -> bool {
         self.traced.get(index as usize).copied().unwrap_or(false)
     }
@@ -172,8 +172,8 @@ impl HleRegistry {
     pub fn note_call(&mut self, index: u32) {
         if let Some(count) = self.call_counts.get_mut(index as usize) {
             *count += 1;
-            // FLORA_TRACE_FIRST logs the first call of every export.
-            if *count == 1 && std::env::var_os("FLORA_TRACE_FIRST").is_some() {
+            // SHOCORA_TRACE_FIRST logs the first call of every export.
+            if *count == 1 && std::env::var_os("SHOCORA_TRACE_FIRST").is_some() {
                 log::info!("first call: {}", self.name_of(index));
             }
         }

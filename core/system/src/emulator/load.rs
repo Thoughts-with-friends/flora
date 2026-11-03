@@ -9,7 +9,7 @@ use wiiu_iosu::Iosu;
 use wiiu_memory::Memory;
 use wiiu_title::{TitleInfo, TitleSource};
 
-use super::{CORE_COUNT, EmuStats, Emulator, MAIN_CORE, Status};
+use super::{BootSource, CORE_COUNT, EmuStats, Emulator, MAIN_CORE, Status};
 use crate::EmuError;
 
 impl Emulator {
@@ -28,7 +28,21 @@ impl Emulator {
             .map_or_else(|| "main.rpx".into(), |n| n.to_string_lossy().into_owned());
         self.boot(&name, &rpx, Iosu::new(vfs))?;
         self.title = Some(info);
+        self.boot_source = Some(BootSource::Title(path.to_owned()));
         Ok(())
+    }
+
+    /// Reboots what was booted last, like the console's reset; `false` if nothing was.
+    ///
+    /// # Errors
+    /// Fails if the title does not load any more.
+    pub fn reset(&mut self) -> Result<bool, EmuError> {
+        match self.boot_source.clone() {
+            Some(BootSource::Title(path)) => self.load_title(&path)?,
+            Some(BootSource::Rpx(name, rpx)) => self.load_rpx(&name, &rpx)?,
+            None => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Boots an in-memory RPX with no file system (tests, tools).
@@ -38,6 +52,7 @@ impl Emulator {
     pub fn load_rpx(&mut self, name: &str, rpx: &[u8]) -> Result<(), EmuError> {
         self.boot(name, rpx, Iosu::default())?;
         self.title = None;
+        self.boot_source = Some(BootSource::Rpx(name.to_owned(), rpx.to_vec()));
         Ok(())
     }
 
@@ -67,6 +82,7 @@ impl Emulator {
         self.os.gx2.forced_swap_interval = self.config.swap_interval;
         self.os.coreinit.shared_data.fonts_dir.clone_from(&self.config.fonts_dir);
         self.gpu = Gpu::new();
+        self.gpu.reset_renderer();
         self.iosu = iosu;
         self.stats = EmuStats::default();
         self.next_vsync = None;

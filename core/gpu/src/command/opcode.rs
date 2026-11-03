@@ -9,6 +9,7 @@ pub const DRAW_INDEX_AUTO: u8 = 0x2D;
 pub const DRAW_INDEX_IMMD: u8 = 0x2E;
 pub const NUM_INSTANCES: u8 = 0x2F;
 pub const INDIRECT_BUFFER: u8 = 0x32;
+pub const STRMOUT_BUFFER_UPDATE: u8 = 0x34;
 pub const WAIT_REG_MEM: u8 = 0x3C;
 pub const MEM_WRITE: u8 = 0x3D;
 pub const SURFACE_SYNC: u8 = 0x43;

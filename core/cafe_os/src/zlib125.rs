@@ -449,7 +449,7 @@ mod tests {
     fn inflate_streams_into_guest_memory() {
         let mut env = TestEnv::new();
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"hello hello hello flora").unwrap();
+        encoder.write_all(b"hello hello hello shocora").unwrap();
         let packed = encoder.finish().unwrap();
         let (stream, input, output) = (SCRATCH, SCRATCH + 0x100, SCRATCH + 0x400);
         env.memory.write_bytes(input, &packed).unwrap();
@@ -463,8 +463,8 @@ mod tests {
             env.call("zlib125", "inflate", &[stream, Z_FINISH]),
             Z_STREAM_END.cast_unsigned()
         );
-        assert_eq!(env.memory.read_u32(stream + 0x14).unwrap(), 23);
-        assert_eq!(env.memory.read_c_string(output, 23).unwrap(), "hello hello hello flora");
+        assert_eq!(env.memory.read_u32(stream + 0x14).unwrap(), 25);
+        assert_eq!(env.memory.read_c_string(output, 25).unwrap(), "hello hello hello shocora");
         env.memory.write_bytes(SCRATCH + 0x800, b"123456789").unwrap();
         assert_eq!(env.call("zlib125", "crc32", &[0, SCRATCH + 0x800, 9]), 0xCBF4_3926);
         assert_eq!(env.call("zlib125", "crc32", &[0xCBF4_3926, SCRATCH + 0x800, 0]), 0xCBF4_3926);
@@ -474,7 +474,7 @@ mod tests {
     fn gzip_trailer_is_consumed_even_across_calls() {
         let mut env = TestEnv::new();
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"gzip data for flora").unwrap();
+        encoder.write_all(b"gzip data for shocora").unwrap();
         let packed = encoder.finish().unwrap();
         let (stream, input, output) = (SCRATCH, SCRATCH + 0x100, SCRATCH + 0x400);
         env.memory.write_bytes(input, &packed).unwrap();
@@ -489,6 +489,6 @@ mod tests {
         env.memory.write_u32(stream + 0x04, 3).unwrap();
         assert_eq!(env.call("zlib125", "inflate", &[stream, 0]), Z_STREAM_END.cast_unsigned());
         assert_eq!(env.memory.read_u32(stream + 0x04).unwrap(), 0);
-        assert_eq!(env.memory.read_c_string(output, 19).unwrap(), "gzip data for flora");
+        assert_eq!(env.memory.read_c_string(output, 21).unwrap(), "gzip data for shocora");
     }
 }

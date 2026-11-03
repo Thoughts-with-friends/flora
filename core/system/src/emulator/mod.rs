@@ -50,8 +50,16 @@ pub struct EmuStats {
     pub gpu: GpuStats,
 }
 
+/// What a reset boots again.
+#[derive(Debug, Clone)]
+enum BootSource {
+    Title(std::path::PathBuf),
+    Rpx(String, Vec<u8>),
+}
+
 /// A Wii U.
 pub struct Emulator {
+    boot_source: Option<BootSource>,
     pub config: Config,
     memory: Memory,
     cores: Vec<CpuState>,
@@ -85,6 +93,7 @@ impl Emulator {
     /// Fails if the guest address space cannot be mapped.
     pub fn new(config: Config) -> Result<Self, EmuError> {
         Ok(Self {
+            boot_source: None,
             config,
             memory: Memory::with_game_layout()?,
             cores: (0..CORE_COUNT as u32).map(CpuState::new).collect(),
@@ -120,6 +129,12 @@ impl Emulator {
     /// Register state of core `index` (for the debugger).
     pub fn core(&self, index: usize) -> Option<&CpuState> {
         self.cores.get(index)
+    }
+
+    /// Vertical blanks per flip from now on, whatever the title asks for.
+    pub fn set_swap_interval(&mut self, interval: Option<u32>) {
+        self.config.swap_interval = interval;
+        self.os.gx2.forced_swap_interval = interval;
     }
 
     /// Feeds the latest GamePad sample.
@@ -194,5 +209,6 @@ impl Emulator {
         self.gpu.blank_screens();
         self.status = Status::Idle;
         self.title = None;
+        self.boot_source = None;
     }
 }

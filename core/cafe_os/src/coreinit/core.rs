@@ -59,7 +59,7 @@ fn os_is_debugger_initialized(_ctx: &mut HleContext<'_>) -> bool {
 }
 
 /// Shared no-op target for C runtime hook pointers (`__cpp_exception_init_ptr`, ...).
-#[hle_export(lib = "coreinit", name = "__flora_Nop")]
+#[hle_export(lib = "coreinit", name = "__shocora_Nop")]
 fn nop(_ctx: &mut HleContext<'_>) {}
 
 #[cfg(test)]

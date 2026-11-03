@@ -64,6 +64,8 @@ pub struct TranslatedShader {
     /// Pixel shaders: color targets written, as a bit mask.
     pub color_exports: u8,
     pub writes_depth: bool,
+    /// Writes stream-out buffers.
+    pub stream_out: bool,
 }
 
 /// `group(0)`: arena and per-draw parameters, shared by every shader.
@@ -82,6 +84,9 @@ struct DrawParams {
     ps_ubo: array<u32, 16>,
     attr_base: array<u32, 16>,
     attr_stride: array<u32, 16>,
+    so_base: array<u32, 4>,
+    so_stride: array<u32, 4>,
+    so_instance_vertices: u32,
 }
 @group(0) @binding(0) var<storage, read> arena: array<u32>;
 @group(0) @binding(1) var<storage, read> P: DrawParams;
@@ -90,6 +95,23 @@ struct DrawParams {
 // average of the frame; the render back end keeps colors finite.
 fn finite_color(v: vec4<f32>) -> vec4<f32> {
     return clamp(select(v, vec4<f32>(0.0), v != v), vec4<f32>(-1e18), vec4<f32>(1e18));
+}
+// LOG, RECIP and RECIPSQRT replace the infinities of IEEE arithmetic in their
+// `CLAMPED` and `FF` forms: largest float and zero respectively.
+fn log_clamped(v: f32) -> f32 {
+    return select(max(log2(v), -3.40282347e38), -3.40282347e38, v <= 0.0);
+}
+fn recip_clamped(v: f32) -> f32 {
+    return select(1.0 / v, select(3.40282347e38, -3.40282347e38, (bitcast<u32>(v) >> 31u) != 0u), v == 0.0);
+}
+fn recip_ff(v: f32) -> f32 {
+    return select(1.0 / v, 0.0, v == 0.0);
+}
+fn recipsqrt_clamped(v: f32) -> f32 {
+    return select(1.0 / sqrt(v), 3.40282347e38, v == 0.0);
+}
+fn recipsqrt_ff(v: f32) -> f32 {
+    return select(1.0 / sqrt(v), 0.0, v == 0.0);
 }
 fn mul_ni(a: f32, b: f32) -> f32 {
     return select(a * b, 0.0, a == 0.0 || b == 0.0);

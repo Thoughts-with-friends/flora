@@ -171,6 +171,15 @@ pub enum AddressMode {
     Border,
 }
 
+/// The border colors hosts offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BorderColor {
+    #[default]
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
+}
+
 /// A host sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SamplerDesc {
@@ -184,6 +193,8 @@ pub struct SamplerDesc {
     pub max_lod: u16,
     /// `Some(compare function)` for comparison samplers (`E_COMPAREFUNC`).
     pub compare: Option<u8>,
+    /// What [`AddressMode::Border`] reads outside the texture.
+    pub border: BorderColor,
     /// The texture cannot be filtered (depth or integer formats).
     pub non_filterable: bool,
 }
@@ -259,9 +270,21 @@ pub enum Topology {
     TriangleStrip,
 }
 
+/// Stream-out data a draw leaves, to be moved where later draws read vertices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCopy {
+    /// Byte offset in the stream-out buffer; the data goes to the same offset of the
+    /// arena's stream region.
+    pub offset: u32,
+    pub size: u32,
+}
+
 /// One draw call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawCommand {
+    /// Only the vertex shader's stream-out writes count: nothing is rasterized.
+    pub stream_only: bool,
+    pub stream_copies: Vec<StreamCopy>,
     pub vertex: Arc<ShaderModule>,
     pub pixel: Arc<ShaderModule>,
     pub state: PipelineState,
@@ -290,6 +313,8 @@ pub struct DrawCommand {
 pub struct ShaderModule {
     pub id: u64,
     pub wgsl: String,
+    /// Uses the stream-out buffer in `group(2)`.
+    pub stream_out: bool,
     /// Binding numbers of `group(1)` this module uses: `(binding, is sampler)`.
     pub bindings: Vec<(u32, BindingKind)>,
 }
@@ -317,6 +342,8 @@ pub enum RenderCommand {
     },
     /// The arena restarts: flush work that still reads its old contents.
     ArenaWrap,
+    /// The console rebooted: shader ids start over and no surface survives.
+    Reset,
     Upload(Box<TextureUpload>),
     Clear {
         color: Option<(SurfaceKey, u32, [f32; 4])>,

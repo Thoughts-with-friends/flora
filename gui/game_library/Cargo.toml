@@ -1,5 +1,5 @@
 [package]
-name = "flora_game_library"
+name = "shocora_game_library"
 description = "Game library: ROM directories from roms.json and the titles found in them"
 authors.workspace = true
 categories.workspace = true
