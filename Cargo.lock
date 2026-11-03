@@ -3737,6 +3737,7 @@ dependencies = [
  "image",
  "log",
  "rfd",
+ "serde_json",
  "shocora_game_library",
  "shocora_gui_common",
  "shocora_netplay",
@@ -4884,6 +4885,7 @@ dependencies = [
  "wiiu_memory",
  "wiiu_peripherals",
  "wiiu_rpl",
+ "wiiu_sound",
  "wiiu_title",
 ]
 

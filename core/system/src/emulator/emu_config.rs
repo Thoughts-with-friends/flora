@@ -21,6 +21,8 @@ pub struct Config {
     /// Vertical blanks per flip, whatever the title asks for. A title whose logic
     /// counts frames runs faster with less than it was made for.
     pub swap_interval: Option<u32>,
+    /// How many times larger than on the console the title's pictures are drawn.
+    pub resolution_factor: u32,
     /// Least vertical blanks per flip: `2` caps the title at 30 fps, and titles asking for
     /// less than that keep their own rate.
     pub min_swap_interval: Option<u32>,
@@ -39,6 +41,7 @@ impl Default for Config {
             paced: true,
             fonts_dir: None,
             swap_interval: None,
+            resolution_factor: 1,
             min_swap_interval: None,
             cheats_dir: PathBuf::from("cheats"),
         }

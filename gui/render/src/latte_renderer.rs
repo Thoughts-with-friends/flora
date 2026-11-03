@@ -28,8 +28,8 @@ use wiiu_gpu::{
     RenderBackend, RenderCommand, Screen,
     latte::{ARENA_SIZE, STREAM_REGION_BASE, STREAM_REGION_SIZE},
     render::{
-        AddressMode, BindingKind, BorderColor, BoundTexture, DrawCommand, HostFormat, SamplerDesc,
-        ShaderModule, SurfaceKey, TextureUpload, Topology,
+        AddressMode, BindingKind, BorderColor, BoundTexture, DrawCommand, HostFormat,
+        ResolutionScale, SamplerDesc, ShaderModule, SurfaceKey, TextureUpload, Topology,
     },
     shader::{TextureDim, TextureKind},
 };
@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// Size the shader prelude reads through the dynamic binding.
-const PARAMS_BINDING_SIZE: u64 = 324;
+const PARAMS_BINDING_SIZE: u64 = 340;
 
 /// Address of the surfaces standing in for attachments of the wrong size.
 const STAND_IN_ADDRESS: u32 = 0xFFFF_F000;
@@ -77,6 +77,21 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             | wgpu::Features::VERTEX_WRITABLE_STORAGE
             // Latte renders to formats WebGPU keeps read-only, such as RGBA8 SNORM.
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+}
+
+/// Tells other threads that video memory ran out while drawing large.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryWatch(Arc<std::sync::atomic::AtomicU32>);
+
+impl MemoryWatch {
+    fn report(&self, factor: u32) {
+        self.0.store(factor, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The factor that did not fit, once for each time it happened.
+    pub fn take(&self) -> Option<u32> {
+        Some(self.0.swap(0, std::sync::atomic::Ordering::Relaxed)).filter(|factor| *factor != 0)
+    }
 }
 
 /// A screen image ready for presentation.
@@ -665,6 +680,12 @@ pub struct LatteRenderer {
     upscaler: Upscaler,
     frame_generator: FrameGenerator,
     streamer: Streamer,
+    /// How much larger than on the console the title's pictures are drawn.
+    resolution: ResolutionScale,
+    /// Tells whoever chooses the resolution when video memory ran out.
+    memory_watch: MemoryWatch,
+    /// Textures the title brought along: these never grow, whatever their size.
+    uploaded: std::collections::HashSet<SurfaceKey>,
     /// Screens with a new image since the last flip.
     presented: Vec<Screen>,
     logged: std::collections::HashSet<String>,
@@ -838,6 +859,9 @@ impl LatteRenderer {
             upscaler: Upscaler::default(),
             frame_generator: FrameGenerator::default(),
             streamer: Streamer::default(),
+            resolution: ResolutionScale::default(),
+            memory_watch: MemoryWatch::default(),
+            uploaded: std::collections::HashSet::new(),
             presented: Vec::new(),
             logged: std::collections::HashSet::new(),
             max_draws: std::env::var("SHOCORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
@@ -850,6 +874,11 @@ impl LatteRenderer {
 
     pub fn screens(&self) -> ScreenImages {
         self.screens.clone()
+    }
+
+    /// Reports when video memory runs out, while the renderer runs.
+    pub fn memory_watch(&self) -> MemoryWatch {
+        self.memory_watch.clone()
     }
 
     /// Where a second player's pictures come from, while the renderer runs.
@@ -912,6 +941,10 @@ impl LatteRenderer {
         }
         let device = &self.device;
         let id = self.next_surface_id;
+        let scale = if self.uploaded.contains(&key) { 1 } else { self.resolution.of(&key) };
+        // Large surfaces may not fit: the one who chose them gets to know.
+        let scope = (scale > 1 && !self.surfaces.contains_key(&key))
+            .then(|| device.push_error_scope(wgpu::ErrorFilter::OutOfMemory));
         let surface = self.surfaces.entry(key).or_insert_with(|| {
             let format = wgpu_format(key.format);
             let renderable = format.is_depth_stencil_format() || !format.is_compressed();
@@ -927,7 +960,7 @@ impl LatteRenderer {
                 TextureDim::D2Array => (wgpu::TextureDimension::D2, key.layers.max(1)),
                 TextureDim::D2 => (wgpu::TextureDimension::D2, 1),
             };
-            let (mut width, mut height) = (key.width.max(1), key.height.max(1));
+            let (mut width, mut height) = (key.width.max(1) * scale, key.height.max(1) * scale);
             if format.is_compressed() {
                 width = width.next_multiple_of(4);
                 height = height.next_multiple_of(4);
@@ -951,10 +984,37 @@ impl LatteRenderer {
                 id,
             }
         });
+        if let Some(error) = scope.and_then(|scope| pollster::block_on(scope.pop())) {
+            log::warn!("{key:?} does not fit into video memory at {scale}x: {error}");
+            self.memory_watch.report(scale);
+        }
         if surface.id == id {
             self.next_surface_id += 1;
         }
         surface
+    }
+
+    /// The surface `key` to draw to. One that was a texture so far becomes a target like any
+    /// other, as all attachments of a draw must grow together.
+    fn target_surface(&mut self, key: SurfaceKey, mip_count: u32) -> &mut HostSurface {
+        if self.resolution.applies(&key) && self.uploaded.remove(&key) {
+            self.surfaces.remove(&key);
+        }
+        self.surface(key, TextureDim::D2, mip_count)
+    }
+
+    /// Draws at `resolution` from now on. Targets of the old size are gone: titles draw most
+    /// of them again in the next frame.
+    fn set_resolution(&mut self, resolution: ResolutionScale) {
+        self.submit();
+        let old = self.resolution;
+        let uploaded = &self.uploaded;
+        self.surfaces.retain(|key, _| {
+            uploaded.contains(key) || (!old.applies(key) && !resolution.applies(key))
+        });
+        self.bind_groups.clear();
+        self.feedback_copies.clear();
+        self.resolution = resolution;
     }
 
     fn upload(&mut self, upload: &TextureUpload) {
@@ -963,6 +1023,7 @@ impl LatteRenderer {
         let format = wgpu_format(upload.key.format);
         let mip_count = upload.mips.len() as u32;
         let queue = self.queue.clone();
+        self.uploaded.insert(upload.key);
         let surface = self.surface(upload.key, upload.dim, mip_count);
         let texture = surface.texture.clone();
         let surface_id = surface.id;
@@ -1007,11 +1068,10 @@ impl LatteRenderer {
     ) {
         self.end_pass();
         let color_view = color.map(|(key, slice, _)| {
-            self.surface(key, TextureDim::D2, 1)
-                .target_view(0, slice.min(key.layers.saturating_sub(1)))
+            self.target_surface(key, 1).target_view(0, slice.min(key.layers.saturating_sub(1)))
         });
         let depth_view = depth.as_ref().map(|d| {
-            self.surface(d.surface, TextureDim::D2, 1)
+            self.target_surface(d.surface, 1)
                 .target_view(0, d.slice.min(d.surface.layers.saturating_sub(1)))
         });
         let color_attachment =
@@ -1496,12 +1556,12 @@ impl LatteRenderer {
         for target in &draw.color_targets {
             color_views.push(target.map(|(key, slice)| {
                 let (key, slice, stand_in) = fitted(key, slice);
-                (self.surface(key, TextureDim::D2, 1).target_view(0, slice), stand_in)
+                (self.target_surface(key, 1).target_view(0, slice), stand_in)
             }));
         }
         let depth_view = draw.depth_target.map(|(key, slice)| {
             let (key, slice, stand_in) = fitted(key, slice);
-            (self.surface(key, TextureDim::D2, 1).target_view(0, slice), stand_in)
+            (self.target_surface(key, 1).target_view(0, slice), stand_in)
         });
         let last = color_views.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
         let attachments: Vec<Option<wgpu::RenderPassColorAttachment<'_>>> = color_views[..last]
@@ -1639,10 +1699,30 @@ impl LatteRenderer {
         let vy = y.clamp(0.0, limit_h - 1.0);
         let vw = (width + x - vx).clamp(1.0, limit_w - vx);
         let vh = (height + y - vy).clamp(1.0, limit_h - vy);
-        pass.set_viewport(vx, vy, vw, vh, near.min(far), far.max(near));
+        let scale = draw
+            .color_targets
+            .iter()
+            .flatten()
+            .next()
+            .or(draw.depth_target.as_ref())
+            .map_or(1, |(key, _)| self.resolution.of(key));
+        let factor = scale as f32;
+        pass.set_viewport(
+            vx * factor,
+            vy * factor,
+            vw * factor,
+            vh * factor,
+            near.min(far),
+            far.max(near),
+        );
         let [sx, sy, sw, sh] = draw.scissor;
         let (sx, sy) = (sx.min(extent.0), sy.min(extent.1));
-        pass.set_scissor_rect(sx, sy, sw.min(extent.0 - sx), sh.min(extent.1 - sy));
+        pass.set_scissor_rect(
+            sx * scale,
+            sy * scale,
+            sw.min(extent.0 - sx) * scale,
+            sh.min(extent.1 - sy) * scale,
+        );
         pass.set_stencil_reference(u32::from(draw.stencil_reference));
         let [r, g, b, a] = draw.blend_constant;
         pass.set_blend_constant(wgpu::Color {
@@ -1696,11 +1776,11 @@ impl LatteRenderer {
             return;
         }
         let source_texture = self.surfaces.get(&source).map(|s| s.texture.clone());
-        let target_texture = self.surface(target, TextureDim::D2, target_level + 1).texture.clone();
+        let target_texture = self.target_surface(target, target_level + 1).texture.clone();
         let Some(source_texture) = source_texture else { return };
         let (width, height) = (
-            source.width.min(target.width >> target_level).max(1),
-            source.height.min(target.height >> target_level).max(1),
+            source_texture.width().min(target_texture.width() >> target_level).max(1),
+            source_texture.height().min(target_texture.height() >> target_level).max(1),
         );
         // An invalid copy would invalidate everything recorded with it, the whole frame.
         let format = source_texture.format();
@@ -1746,9 +1826,8 @@ impl LatteRenderer {
         target_slice: u32,
     ) {
         let format = wgpu_format(target.format);
-        let target_view = self
-            .surface(target, TextureDim::D2, target_level + 1)
-            .target_view(target_level, target_slice);
+        let target_view =
+            self.target_surface(target, target_level + 1).target_view(target_level, target_slice);
         let Some(source_texture) = self.surfaces.get(&source).map(|s| s.texture.clone()) else {
             return;
         };
@@ -1825,8 +1904,10 @@ impl LatteRenderer {
                 })
             })
             .clone();
-        let width = source.width.min(target.width >> target_level).max(1);
-        let height = source.height.min(target.height >> target_level).max(1);
+        let target_size =
+            self.surfaces.get(&target).map_or((1, 1), |s| (s.texture.width(), s.texture.height()));
+        let width = source_texture.width().min(target_size.0 >> target_level).max(1);
+        let height = source_texture.height().min(target_size.1 >> target_level).max(1);
         let encoder = self.encoder();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("shocora depth to color"),
@@ -1856,7 +1937,7 @@ impl LatteRenderer {
             return;
         }
         let source_view = surface.target_view(0, slice.min(source.layers.saturating_sub(1)));
-        let (width, height) = (source.width, source.height);
+        let (width, height) = (surface.texture.width(), surface.texture.height());
         let stale =
             self.screen_targets.get(&screen).is_none_or(|t| t.width != width || t.height != height);
         if stale {
@@ -1919,7 +2000,7 @@ impl LatteRenderer {
         pass.draw(0..3, 0..1);
         drop(pass);
         self.presented.push(screen);
-        if !self.upscaler.shows(screen) {
+        if self.resolution.factor > 1 || !self.upscaler.shows(screen) {
             self.screens.set(screen, target);
         }
     }
@@ -1930,15 +2011,20 @@ impl LatteRenderer {
             self.present(screen, key, slice);
         }
         self.submit();
-        self.upscaler.update(
-            &self.device,
-            &self.queue,
-            &self.presented,
-            &self.screen_targets,
-            &self.screens,
-            &mut self.generation,
-        );
-        let upscaled = self.presented.iter().any(|screen| self.upscaler.shows(*screen));
+        // A picture this large has nothing left to gain from xBRZ, and it would take too long.
+        let drawn_large = self.resolution.factor > 1;
+        if !drawn_large {
+            self.upscaler.update(
+                &self.device,
+                &self.queue,
+                &self.presented,
+                &self.screen_targets,
+                &self.screens,
+                &mut self.generation,
+            );
+        }
+        let upscaled =
+            !drawn_large && self.presented.iter().any(|screen| self.upscaler.shows(*screen));
         self.frame_generator.update(
             &self.device,
             &self.queue,
@@ -2006,6 +2092,8 @@ impl LatteRenderer {
         self.submit();
         self.save_pipeline_cache();
         self.surfaces.clear();
+        self.uploaded.clear();
+        self.resolution = ResolutionScale::default();
         self.modules.lock().unwrap_or_else(PoisonError::into_inner).clear();
         self.pipelines.clear();
         self.bind_groups.clear();
@@ -2028,6 +2116,7 @@ impl LatteRenderer {
         self.submit();
         let format = wgpu_format(key.format);
         let texture = self.surfaces.get(&key)?.texture.clone();
+        let key = SurfaceKey { width: texture.width(), height: texture.height(), ..key };
         match format {
             wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
                 self.read_texture(&texture, key.width, key.height)
@@ -2238,6 +2327,7 @@ impl RenderBackend for LatteRenderer {
                 | RenderCommand::ArenaWrap
                 | RenderCommand::Reset
                 | RenderCommand::Upload(_)
+                | RenderCommand::SetResolution(_)
                 | RenderCommand::Clear { .. }
                 | RenderCommand::CopySurface { .. }
                 | RenderCommand::CopyToScanBuffer { .. }
@@ -2257,6 +2347,7 @@ impl RenderBackend for LatteRenderer {
                 }
                 RenderCommand::ArenaWrap => self.submit(),
                 RenderCommand::Reset => self.reset(),
+                RenderCommand::SetResolution(resolution) => self.set_resolution(*resolution),
                 RenderCommand::Upload(upload) => self.upload(upload),
                 RenderCommand::Clear { color, depth } => self.clear(*color, *depth),
                 RenderCommand::Draw(draw) => {

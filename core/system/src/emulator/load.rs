@@ -82,6 +82,7 @@ impl Emulator {
         self.cores = (0..CORE_COUNT as u32).map(CpuState::new).collect();
         self.jit = wiiu_cpu::Jit::new();
         self.os = CafeOs::new();
+        self.os.timebase.set_speed(self.speed);
         self.os.gamepad = gamepad;
         self.os.pro_controllers = pro_controllers;
         self.os.gx2.forced_swap_interval = self.config.swap_interval;
@@ -89,6 +90,7 @@ impl Emulator {
         self.os.coreinit.shared_data.fonts_dir.clone_from(&self.config.fonts_dir);
         self.gpu = Gpu::new();
         self.gpu.reset_renderer();
+        self.gpu.set_resolution_factor(self.config.resolution_factor);
         self.iosu = iosu;
         self.stats = EmuStats::default();
         self.next_vsync = None;

@@ -24,6 +24,8 @@
 //! * `SHOCORA_RESET_AT=frame`: reboots the title at that frame, like the GUI's Reset.
 //! * `SHOCORA_TOUCH="frame,x,y,frames"`: touches the GamePad's screen (854 x 480 pixels).
 //! * `SHOCORA_MIN_SWAP_INTERVAL=n`: at least `n` vertical blanks per flip (2 caps at 30 fps).
+//! * `SHOCORA_SPEED=0.5|2|3|4`: how fast the title runs.
+//! * `SHOCORA_RES=n`: draws the title's pictures `n` times larger, up to 10240 wide.
 //! * `SHOCORA_NET_HOST="ip[/prefix],port[,password]"`: lets a second player join (with
 //!   `SHOCORA_SHOTS`); see `netclient`.
 use std::{
@@ -35,7 +37,7 @@ use shocora_render::{
     LatteRenderer, RenderBackend, RenderCommand, Screen, UpscaleConfig, UpscaleMethod,
     request_device, wgpu,
 };
-use wiiu_emu::{Config, Emulator, GamePadState, Status};
+use wiiu_emu::{Config, Emulator, GamePadState, GameSpeed, Status};
 
 /// The host's side of a second player, for a loop that polls.
 struct NetEvents {
@@ -253,6 +255,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jit: std::env::var_os("SHOCORA_INTERP").is_none(),
         paced: std::env::var_os("SHOCORA_UNPACED").is_none(),
         swap_interval: std::env::var("SHOCORA_SWAP_INTERVAL").ok().and_then(|n| n.parse().ok()),
+        resolution_factor: std::env::var("SHOCORA_RES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1),
         min_swap_interval: std::env::var("SHOCORA_MIN_SWAP_INTERVAL")
             .ok()
             .and_then(|n| n.parse().ok()),
@@ -260,6 +266,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Config::default()
     };
     let mut emu = Emulator::new(config)?;
+    emu.set_speed(match std::env::var("SHOCORA_SPEED").as_deref() {
+        Ok("0.5") => GameSpeed::Half,
+        Ok("2") => GameSpeed::Double,
+        Ok("3") => GameSpeed::Triple,
+        Ok("4") => GameSpeed::Quadruple,
+        _ => GameSpeed::Normal,
+    });
     emu.load_title(&path)?;
     if let Some(title) = emu.title() {
         println!("title: {} ({:016x?})", title.display_name(), title.meta.title_id);
@@ -310,6 +323,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut ubo_arena = std::collections::HashMap::new();
     let mut ubo_log = String::new();
+    let memory_watch = renderer.as_ref().map(LatteRenderer::memory_watch);
+    let mut resolution_factor = emu.config.resolution_factor;
     let second_player = std::sync::Arc::new(std::sync::Mutex::new(None));
     let net_host = match (std::env::var("SHOCORA_NET_HOST").ok(), &renderer) {
         (Some(text), Some(renderer)) => {
@@ -356,6 +371,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (frame >= at && frame < at + length).then_some((x as u16, y as u16))
         });
         emu.set_gamepad(pad);
+        // Like the GUI: what does not fit into video memory gets smaller.
+        if let Some(factor) = memory_watch.as_ref().and_then(shocora_render::MemoryWatch::take) {
+            let lower = shocora_render::ResolutionScale::lower_factor(factor);
+            if lower < resolution_factor {
+                println!("video memory ran out at {factor}x: going on at {lower}x");
+                resolution_factor = lower;
+                emu.set_resolution_factor(lower);
+            }
+        }
         if net_host.is_some() {
             let pad = *second_player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             emu.set_pro_controller(0, pad);

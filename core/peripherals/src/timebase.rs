@@ -19,11 +19,65 @@ pub const fn ticks_to_duration(ticks: u64) -> Duration {
     Duration::from_nanos((ticks as u128 * 1_000_000_000 / FREQUENCY as u128) as u64)
 }
 
+/// How fast the guest's time runs compared to real time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GameSpeed {
+    Half,
+    #[default]
+    Normal,
+    Double,
+    Triple,
+    Quadruple,
+}
+
+impl GameSpeed {
+    /// Every speed, slowest first.
+    pub const ALL: [Self; 5] =
+        [Self::Half, Self::Normal, Self::Double, Self::Triple, Self::Quadruple];
+
+    /// The speed after this one when cycling through them.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::Double,
+            Self::Double => Self::Triple,
+            Self::Triple => Self::Quadruple,
+            Self::Quadruple => Self::Half,
+            Self::Half => Self::Normal,
+        }
+    }
+
+    /// The speed as a multiple of half of real time, which keeps every speed a whole number.
+    pub const fn halves(self) -> u32 {
+        match self {
+            Self::Half => 1,
+            Self::Normal => 2,
+            Self::Double => 4,
+            Self::Triple => 6,
+            Self::Quadruple => 8,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Half => "0.5x",
+            Self::Normal => "1x",
+            Self::Double => "2x",
+            Self::Triple => "3x",
+            Self::Quadruple => "4x",
+        }
+    }
+}
+
 /// Monotonic tick counter plus the wall-clock offset used by `OSGetTime`.
 #[derive(Debug, Clone, Copy)]
 pub struct TimeBase {
-    boot: Instant,
-    /// Ticks since the Wii U epoch at `boot`.
+    /// When the current speed began.
+    speed_start: Instant,
+    /// Ticks since power-on at `speed_start`.
+    ticks_at_speed_start: u64,
+    speed: GameSpeed,
+    /// Ticks since the Wii U epoch at power-on.
     epoch_ticks_at_boot: u64,
 }
 
@@ -31,12 +85,25 @@ impl TimeBase {
     pub fn new() -> Self {
         let since_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let since_wiiu = since_unix.saturating_sub(Duration::from_secs(WIIU_EPOCH_UNIX_SECONDS));
-        Self { boot: Instant::now(), epoch_ticks_at_boot: duration_to_ticks(since_wiiu) }
+        Self {
+            speed_start: Instant::now(),
+            ticks_at_speed_start: 0,
+            speed: GameSpeed::Normal,
+            epoch_ticks_at_boot: duration_to_ticks(since_wiiu),
+        }
+    }
+
+    /// Time runs at `speed` from now on, continuing from where it is.
+    pub fn set_speed(&mut self, speed: GameSpeed) {
+        self.ticks_at_speed_start = self.ticks_since_boot();
+        self.speed_start = Instant::now();
+        self.speed = speed;
     }
 
     /// Ticks since power-on (`mftb`, `OSGetSystemTime`).
     pub fn ticks_since_boot(&self) -> u64 {
-        duration_to_ticks(self.boot.elapsed())
+        let elapsed = duration_to_ticks(self.speed_start.elapsed());
+        self.ticks_at_speed_start + elapsed * u64::from(self.speed.halves()) / 2
     }
 
     /// Ticks since 2000-01-01 (`OSGetTime`).
@@ -61,5 +128,39 @@ mod tests {
         assert_eq!(ticks_to_duration(FREQUENCY * 3), Duration::from_secs(3));
         let tb = TimeBase::new();
         assert!(tb.ticks_since_epoch() > FREQUENCY * 60 * 60 * 24 * 365 * 20);
+    }
+
+    #[test]
+    fn speeds_cycle_in_the_order_players_expect() {
+        let mut speed = GameSpeed::Normal;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            speed = speed.next();
+            seen.push(speed.label());
+        }
+        assert_eq!(seen, ["2x", "3x", "4x", "0.5x", "1x"]);
+    }
+
+    #[test]
+    fn time_keeps_going_forward_through_speed_changes() {
+        let mut tb = TimeBase::new();
+        let mut last = tb.ticks_since_boot();
+        for speed in [GameSpeed::Quadruple, GameSpeed::Half, GameSpeed::Normal] {
+            tb.set_speed(speed);
+            std::thread::sleep(Duration::from_millis(2));
+            let now = tb.ticks_since_boot();
+            assert!(now > last, "{speed:?}: {now} after {last}");
+            last = now;
+        }
+    }
+
+    #[test]
+    fn faster_time_gains_ticks_faster() {
+        let mut tb = TimeBase::new();
+        tb.set_speed(GameSpeed::Quadruple);
+        let wait = Duration::from_millis(20);
+        std::thread::sleep(wait);
+        // At least four times what passed; sleeping can only take longer.
+        assert!(tb.ticks_since_boot() >= duration_to_ticks(wait) * 4);
     }
 }

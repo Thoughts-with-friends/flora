@@ -9,7 +9,8 @@ use wiiu_cpu::{CpuState, Jit};
 use wiiu_gpu::{Gpu, GpuStats, RenderCommand};
 use wiiu_iosu::Iosu;
 use wiiu_memory::Memory;
-use wiiu_peripherals::GamePadState;
+use wiiu_peripherals::{GamePadState, GameSpeed};
+use wiiu_sound::speed::SpeedResampler;
 use wiiu_title::TitleInfo;
 
 use self::emu_config::Config;
@@ -72,6 +73,10 @@ pub struct Emulator {
     title: Option<TitleInfo>,
     status: Status,
     stats: EmuStats,
+    /// How fast the guest's time runs.
+    speed: GameSpeed,
+    /// Makes the sound of faster or slower time fit real time.
+    audio_speed: SpeedResampler,
     /// When the next vertical blank is due.
     next_vsync: Option<std::time::Instant>,
     /// Where time slices ran out, when profiling: a guest spinning on something
@@ -107,6 +112,8 @@ impl Emulator {
             title: None,
             status: Status::Idle,
             stats: EmuStats::default(),
+            speed: GameSpeed::Normal,
+            audio_speed: SpeedResampler::default(),
             next_vsync: None,
             slice_ends: std::collections::HashMap::new(),
         })
@@ -138,6 +145,20 @@ impl Emulator {
     pub fn set_swap_interval(&mut self, interval: Option<u32>) {
         self.config.swap_interval = interval;
         self.os.gx2.forced_swap_interval = interval;
+    }
+
+    /// Draws the title's pictures this many times larger from now on.
+    pub fn set_resolution_factor(&mut self, factor: u32) {
+        self.config.resolution_factor = factor;
+        self.gpu.set_resolution_factor(factor);
+    }
+
+    /// Time runs at `speed` from now on: the title, its timers and its sound.
+    pub fn set_speed(&mut self, speed: GameSpeed) {
+        self.speed = speed;
+        self.os.timebase.set_speed(speed);
+        // The next blank is due at the new pace, not when the old pace said.
+        self.next_vsync = None;
     }
 
     /// Least vertical blanks per flip from now on.
@@ -237,7 +258,8 @@ impl Emulator {
 
     /// Drains mixed audio: interleaved stereo at [`wiiu_cafe_os::sndcore2::OUTPUT_RATE`].
     pub fn take_audio(&mut self) -> Vec<i16> {
-        self.os.ax.output.drain(..).collect()
+        let samples: Vec<i16> = self.os.ax.output.drain(..).collect();
+        self.audio_speed.process(&samples, self.speed.halves())
     }
 
     /// Drains guest console output (`OSReport`, ...).

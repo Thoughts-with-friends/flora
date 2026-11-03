@@ -36,7 +36,8 @@ impl Emulator {
             return;
         }
         crate::cheat::apply(&self.cheats, &mut self.memory);
-        let frame_time = self.config.frame_time;
+        // Vertical blanks come as often as the guest's time says.
+        let frame_time = self.config.frame_time * 2 / self.speed.halves();
         let now = Instant::now();
         let deadline = match self.next_vsync {
             Some(vsync) if now < vsync + frame_time * MAX_LAG_FRAMES => vsync,

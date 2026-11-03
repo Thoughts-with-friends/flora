@@ -21,6 +21,7 @@ shocora_netplay = { workspace = true }
 shocora_render = { workspace = true }
 log = { workspace = true }
 rfd = "0.15"
+serde_json = "1"
 wiiu_emu = { workspace = true }
 
 [build-dependencies]

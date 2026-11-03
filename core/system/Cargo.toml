@@ -22,6 +22,7 @@ wiiu_iosu = { workspace = true }
 wiiu_mem_addr = { workspace = true }
 wiiu_memory = { workspace = true }
 wiiu_peripherals = { workspace = true }
+wiiu_sound = { workspace = true }
 wiiu_rpl = { workspace = true }
 wiiu_title = { workspace = true }
 

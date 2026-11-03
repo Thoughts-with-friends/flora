@@ -20,10 +20,14 @@ use crate::{
 /// Voices the library can hand out.
 const MAX_VOICES: u32 = 96;
 const VPB_SIZE: u32 = 0x60;
-/// Output rate of the mixer, in samples per second.
+/// Rate of the samples handed to the host, whatever the renderer runs at.
 pub const OUTPUT_RATE: u32 = 48_000;
-/// Samples rendered per AX frame at 48 kHz.
-const SAMPLES_PER_FRAME: u32 = 144;
+/// Samples per AX frame of a renderer at 48 kHz.
+const SAMPLES_PER_FRAME_48KHZ: u32 = 144;
+/// Samples per AX frame of a renderer at 32 kHz.
+const SAMPLES_PER_FRAME_32KHZ: u32 = 96;
+/// `AX_RENDERER_FREQ_48KHZ`, the first word of `AXINITPARAM`.
+const RENDERER_FREQ_48KHZ: u32 = 1;
 /// Length of an AX frame in milliseconds.
 const FRAME_MILLISECONDS: u64 = 3;
 /// A guest with this many callbacks waiting is not keeping up: frame callbacks
@@ -60,7 +64,7 @@ mod final_mix {
     pub const CHANNEL_POINTERS: u32 = 0x10;
     pub const SAMPLES: u32 = 0x40;
     /// Bytes of one device's block: pointers and samples for the most channels.
-    pub const SIZE: u32 = SAMPLES + 8 * super::SAMPLES_PER_FRAME * 4;
+    pub const SIZE: u32 = SAMPLES + 8 * super::SAMPLES_PER_FRAME_48KHZ * 4;
     /// Blocks per device: frames made up for at once all get a block of their own.
     pub const BLOCKS: u32 = 2 * PLAY_DELAY;
     /// Frames between a block's callback being queued and the block being played:
@@ -109,6 +113,10 @@ impl AxVoice {
 #[derive(Debug, Default)]
 pub struct AxState {
     initialized: bool,
+    /// Titles choose: a voice's pitch ratio is relative to this rate, not the output's.
+    renderer_48khz: bool,
+    /// Last stereo sample of the previous frame, where upsampling continues from.
+    upsample_from: [i16; 2],
     voice_base: u32,
     free: Vec<u32>,
     voices: HashMap<u32, AxVoice>,
@@ -128,6 +136,50 @@ pub struct AxState {
     user_protection: u32,
     /// Interleaved stereo for the host.
     pub output: VecDeque<i16>,
+}
+
+impl AxState {
+    /// Samples the renderer makes per AX frame.
+    const fn samples_per_frame(&self) -> u32 {
+        if self.renderer_48khz { SAMPLES_PER_FRAME_48KHZ } else { SAMPLES_PER_FRAME_32KHZ }
+    }
+
+    /// Queues a frame for the host, upsampled from a 32 kHz renderer.
+    fn queue_output(&mut self, frame: &[i16]) {
+        if self.renderer_48khz {
+            self.output.extend(frame);
+            return;
+        }
+        let at = |channel: usize, index: i64| -> f32 {
+            if index < 0 {
+                f32::from(self.upsample_from[channel])
+            } else {
+                f32::from(frame[index as usize * 2 + channel])
+            }
+        };
+        // Three output samples for two input samples: one sample of delay gives every output
+        // sample a neighbor on both sides, and frames join without a seam.
+        let produced = i64::from(SAMPLES_PER_FRAME_48KHZ);
+        let mut output = Vec::with_capacity(produced as usize * 2);
+        for sample in 0..produced {
+            let position = (sample + 1) * 2;
+            let (whole, third) = (position.div_euclid(3) - 1, position.rem_euclid(3));
+            for channel in 0..2 {
+                let before = at(channel, whole);
+                // The frame's last sample falls exactly on an input sample, with none after it.
+                let value = if third == 0 {
+                    before
+                } else {
+                    (at(channel, whole + 1) - before).mul_add(third as f32 / 3.0, before)
+                };
+                output.push(value as i16);
+            }
+        }
+        self.output.extend(output);
+        if let [.., left, right] = *frame {
+            self.upsample_from = [left, right];
+        }
+    }
 }
 
 struct GuestSamples<'a>(&'a Memory);
@@ -173,7 +225,8 @@ impl CafeOs {
 
     fn mix_frame(&mut self, memory: &mut Memory) {
         let source = GuestSamples(memory);
-        let frame_size = SAMPLES_PER_FRAME as usize * 2;
+        let frame_samples = self.ax.samples_per_frame();
+        let frame_size = frame_samples as usize * 2;
         let mut mix = vec![0.0_f32; frame_size];
         let mut finished = Vec::new();
         for (address, voice) in &mut self.ax.voices {
@@ -183,12 +236,12 @@ impl CafeOs {
             let before = voice.voice.current_offset;
             voice.volume = voice
                 .volume_delta
-                .mul_add(SAMPLES_PER_FRAME as f32, voice.volume)
+                .mul_add(frame_samples as f32, voice.volume)
                 .clamp(0.0, MAX_VOLUME);
             let target = [voice.volume * voice.tv_left, voice.volume * voice.tv_right];
             let step = [
-                (target[0] - voice.gains[0]) / SAMPLES_PER_FRAME as f32,
-                (target[1] - voice.gains[1]) / SAMPLES_PER_FRAME as f32,
+                (target[0] - voice.gains[0]) / frame_samples as f32,
+                (target[1] - voice.gains[1]) / frame_samples as f32,
             ];
             let mut gains = voice.gains;
             for frame in mix.as_chunks_mut::<2>().0 {
@@ -228,47 +281,49 @@ impl CafeOs {
     /// Queues what the TV hears: with a final mix callback, what it made of an earlier frame.
     fn play_frame(&mut self, memory: &Memory, mixed: &[i16]) {
         let Some(first) = self.ax.final_mix_blocks.get(&DEVICE_TV).copied() else {
-            self.ax.output.extend(mixed);
+            self.ax.queue_output(mixed);
             return;
         };
         let Some(frame) = self.ax.frames_mixed.checked_sub(final_mix::PLAY_DELAY) else {
-            self.ax.output.extend(std::iter::repeat_n(0, mixed.len()));
+            self.ax.queue_output(&vec![0; mixed.len()]);
             return;
         };
         let block = Self::final_mix_block(first, frame);
+        let frame_samples = self.ax.samples_per_frame();
         let channel = |channel: u32, sample: u32| {
-            let at = block + final_mix::SAMPLES + (channel * SAMPLES_PER_FRAME + sample) * 4;
+            let at = block + final_mix::SAMPLES + (channel * frame_samples + sample) * 4;
             memory.read_u32(at).unwrap_or(0).cast_signed().clamp(-32768, 32767) as i16
         };
-        for sample in 0..SAMPLES_PER_FRAME {
-            self.ax.output.push_back(channel(0, sample));
-            self.ax.output.push_back(channel(1, sample));
-        }
+        let played: Vec<i16> = (0..frame_samples)
+            .flat_map(|sample| [channel(0, sample), channel(1, sample)])
+            .collect();
+        self.ax.queue_output(&played);
     }
 
     /// Hands this frame's samples to the final mix callbacks.
     fn run_final_mix(&mut self, memory: &mut Memory, mixed: &[i16]) {
         let callbacks: Vec<_> = self.ax.final_mix_callbacks.iter().map(|(d, f)| (*d, *f)).collect();
+        let frame_samples = self.ax.samples_per_frame();
         for (device, function) in callbacks {
             let Some(first) = self.ax.final_mix_blocks.get(&device).copied() else { continue };
             let block = Self::final_mix_block(first, self.ax.frames_mixed);
             let (channels, devices) = final_mix::layout(device);
             let total = channels * devices;
             let samples = block + final_mix::SAMPLES;
-            let _ = memory.fill(samples, total * SAMPLES_PER_FRAME * 4, 0);
+            let _ = memory.fill(samples, total * frame_samples * 4, 0);
             for (i, sample) in mixed.iter().enumerate() {
                 let (frame, channel) = ((i / 2) as u32, (i % 2) as u32);
-                let at = samples + (channel * SAMPLES_PER_FRAME + frame) * 4;
+                let at = samples + (channel * frame_samples + frame) * 4;
                 let _ = memory.write_u32(at, i32::from(*sample).cast_unsigned());
             }
             for channel in 0..total {
-                let pointer = samples + channel * SAMPLES_PER_FRAME * 4;
+                let pointer = samples + channel * frame_samples * 4;
                 let _ =
                     memory.write_u32(block + final_mix::CHANNEL_POINTERS + channel * 4, pointer);
             }
             let _ = memory.write_u32(block, block + final_mix::CHANNEL_POINTERS);
             let _ = memory.write_u16(block + 4, channels as u16);
-            let _ = memory.write_u16(block + 6, SAMPLES_PER_FRAME as u16);
+            let _ = memory.write_u16(block + 6, frame_samples as u16);
             let _ = memory.write_u16(block + 8, devices as u16);
             let _ = memory.write_u16(block + 10, channels as u16);
             self.callbacks.push(GuestCall { function, args: vec![block] });
@@ -276,11 +331,12 @@ impl CafeOs {
     }
 }
 
-fn initialize(ctx: &mut HleContext<'_>) {
+fn initialize(ctx: &mut HleContext<'_>, renderer_48khz: bool) {
     if ctx.os.ax.initialized {
         return;
     }
     ctx.os.ax.initialized = true;
+    ctx.os.ax.renderer_48khz = renderer_48khz;
     ctx.os.ax.first_tick = ctx.os.timebase.ticks_since_boot();
     let base = ctx.os.registry.allocate_data(MAX_VOICES * VPB_SIZE, 64);
     ctx.os.ax.voice_base = base;
@@ -289,17 +345,19 @@ fn initialize(ctx: &mut HleContext<'_>) {
 
 #[hle_export(lib = "sndcore2", name = "AXInit")]
 fn ax_init(ctx: &mut HleContext<'_>) {
-    initialize(ctx);
+    initialize(ctx, false);
 }
 
 #[hle_export(lib = "sndcore2", name = "AXInitEx")]
 fn ax_init_ex(ctx: &mut HleContext<'_>, _pipeline: u32) {
-    initialize(ctx);
+    initialize(ctx, false);
 }
 
 #[hle_export(lib = "sndcore2", name = "AXInitWithParams")]
-fn ax_init_with_params(ctx: &mut HleContext<'_>, _params: u32) {
-    initialize(ctx);
+fn ax_init_with_params(ctx: &mut HleContext<'_>, params: u32) -> Result<(), HleError> {
+    let frequency = ctx.memory.read_u32(params)?;
+    initialize(ctx, frequency == RENDERER_FREQ_48KHZ);
+    Ok(())
 }
 
 #[hle_export(lib = "sndcore2", name = "AXIsInit")]
@@ -318,13 +376,13 @@ fn ax_get_max_voices(_ctx: &mut HleContext<'_>) -> u32 {
 }
 
 #[hle_export(lib = "sndcore2", name = "AXGetInputSamplesPerFrame")]
-fn ax_get_input_samples_per_frame(_ctx: &mut HleContext<'_>) -> u32 {
-    SAMPLES_PER_FRAME
+fn ax_get_input_samples_per_frame(ctx: &mut HleContext<'_>) -> u32 {
+    ctx.os.ax.samples_per_frame()
 }
 
 #[hle_export(lib = "sndcore2", name = "AXGetInputSamplesPerSec")]
-fn ax_get_input_samples_per_sec(_ctx: &mut HleContext<'_>) -> u32 {
-    OUTPUT_RATE
+fn ax_get_input_samples_per_sec(ctx: &mut HleContext<'_>) -> u32 {
+    ctx.os.ax.samples_per_frame() * 1000 / FRAME_MILLISECONDS as u32
 }
 
 #[hle_export(lib = "sndcore2", name = "AXRegisterAppFrameCallback")]
@@ -453,7 +511,7 @@ fn acquire(
     callback: u32,
     user: u32,
 ) -> Result<u32, HleError> {
-    initialize(ctx);
+    initialize(ctx, false);
     ctx.os.registry.commit(ctx.memory)?;
     let Some(address) = ctx.os.ax.free.pop() else { return Ok(0) };
     ctx.memory.fill(address, VPB_SIZE, 0)?;
@@ -888,7 +946,7 @@ mod tests {
 
     #[test]
     fn ax_makes_its_frames_in_real_time() {
-        // 333 frames of 144 samples: the 48 kHz the library promises.
+        // 333 frames a second: of 144 samples at 48 kHz, of 96 at 32 kHz.
         assert_eq!(super::frames_after(wiiu_peripherals::timebase::FREQUENCY), 333);
         assert_eq!(super::frames_after(wiiu_peripherals::timebase::FREQUENCY * 3), 1000);
     }
@@ -923,6 +981,68 @@ mod tests {
         assert!(largest < 1000, "jump of {largest}");
     }
 
+    /// Source samples a voice at ratio 1 uses up per frame, and output values per frame.
+    fn rates_after(env: &mut TestEnv) -> (u32, usize) {
+        let mix = SCRATCH + 0x200;
+        env.memory.write_u16(mix, 0x8000).unwrap();
+        let voice = constant_voice(env, 0x4000, mix);
+        let before = env.os.ax.voices[&voice].voice.current_offset;
+        env.os.mix_frame(&mut env.memory);
+        let after = env.os.ax.voices[&voice].voice.current_offset;
+        (after - before, env.os.ax.output.len())
+    }
+
+    #[test]
+    fn plain_init_renders_at_32_khz_and_still_outputs_48() {
+        let mut env = TestEnv::new();
+        env.call("sndcore2", "AXInit", &[]);
+        assert_eq!(env.call("sndcore2", "AXGetInputSamplesPerSec", &[]), 32_000);
+        assert_eq!(env.call("sndcore2", "AXGetInputSamplesPerFrame", &[]), 96);
+        // A sound at ratio 1 plays at 32 kHz, not 1.5 times too fast and too high.
+        assert_eq!(rates_after(&mut env), (96, 288));
+    }
+
+    #[test]
+    fn the_older_library_name_is_the_same_library() {
+        let mut env = TestEnv::new();
+        env.call("snd_core", "AXInit", &[]);
+        assert_eq!(env.call("snd_core", "AXGetInputSamplesPerSec", &[]), 32_000);
+    }
+
+    #[test]
+    fn titles_can_ask_for_a_48_khz_renderer() {
+        let mut env = TestEnv::new();
+        env.memory.write_u32(SCRATCH + 0x300, super::RENDERER_FREQ_48KHZ).unwrap();
+        env.call("sndcore2", "AXInitWithParams", &[SCRATCH + 0x300]);
+        assert_eq!(env.call("sndcore2", "AXGetInputSamplesPerSec", &[]), 48_000);
+        assert_eq!(rates_after(&mut env), (144, 288));
+    }
+
+    #[test]
+    fn params_can_ask_for_32_khz_too() {
+        let mut env = TestEnv::new();
+        env.memory.write_u32(SCRATCH + 0x300, 0).unwrap();
+        env.call("sndcore2", "AXInitWithParams", &[SCRATCH + 0x300]);
+        assert_eq!(env.call("sndcore2", "AXGetInputSamplesPerSec", &[]), 32_000);
+    }
+
+    #[test]
+    fn upsampling_joins_frames_without_a_seam() {
+        let mut ax = super::AxState::default();
+        // A rising ramp over two frames, the same on both channels.
+        let ramp = |from: i16| -> Vec<i16> {
+            (0..96_i16).flat_map(|i| [from + i * 30, from + i * 30]).collect()
+        };
+        ax.queue_output(&ramp(0));
+        ax.queue_output(&ramp(96 * 30));
+        assert_eq!(ax.output.len(), 2 * 2 * 144);
+        let left: Vec<i32> = ax.output.iter().step_by(2).map(|s| i32::from(*s)).collect();
+        // 30 per input sample is 20 per output sample, everywhere including the join.
+        for pair in left[2..].windows(2) {
+            assert!((pair[1] - pair[0] - 20).abs() <= 1, "step in {pair:?}");
+        }
+    }
+
     #[test]
     fn final_mix_results_play_in_order_even_when_callbacks_lag() {
         let mut env = TestEnv::new();
@@ -935,7 +1055,7 @@ mod tests {
             env.os.mix_frame(&mut env.memory);
             let block = crate::CafeOs::final_mix_block(first, frame);
             let samples = block + super::final_mix::SAMPLES;
-            for sample in 0..super::SAMPLES_PER_FRAME {
+            for sample in 0..env.os.ax.samples_per_frame() {
                 env.memory.write_u32(samples + sample * 4, frame + 100).unwrap();
             }
         }

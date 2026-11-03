@@ -5,4 +5,4 @@ pub mod timebase;
 
 pub use controller::{GamePadState, VpadButtons};
 pub use rtc::CalendarTime;
-pub use timebase::TimeBase;
+pub use timebase::{GameSpeed, TimeBase};

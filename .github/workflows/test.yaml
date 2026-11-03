@@ -41,7 +41,7 @@ jobs:
       - name: Test
         # `melon_egui` and `melon_lan` are excluded for the reason in
         # lint.yaml: they compile the melonDS C++ core.
-        run: cargo nextest run --workspace --target ${{ matrix.job.target }} --exclude lunaris --exclude melon_egui --exclude melon_lan --no-fail-fast
+        run: cargo nextest run --workspace --target ${{ matrix.job.target }} --no-fail-fast
 
   # TODO: Raw Pointer Dereference Detection
   # miri:

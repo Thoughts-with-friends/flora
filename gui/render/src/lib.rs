@@ -13,12 +13,12 @@ pub mod upscale;
 pub use egui_wgpu::wgpu;
 pub use framegen::FrameGenSetting;
 pub use latte_renderer::{
-    LatteRenderer, RenderThread, ScreenImage, ScreenImages, request_device, wanted_features,
-    wgpu_format,
+    LatteRenderer, MemoryWatch, RenderThread, ScreenImage, ScreenImages, request_device,
+    wanted_features, wgpu_format,
 };
 pub use stream::{StreamFrame, StreamTap};
 pub use upscale::{UpscaleConfig, UpscaleMethod, UpscaleSetting};
-pub use wiiu_gpu::{RenderBackend, RenderCommand, Screen};
+pub use wiiu_gpu::{RenderBackend, RenderCommand, Screen, render::ResolutionScale};
 
 /// Graphics API selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -26,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::lang::tr;
 use eframe::egui::{
     self, Align2, Color32, FontId, Id, LayerId, Order, Painter, Pos2, Rect, Sense, Shape, Stroke,
     StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
@@ -558,7 +559,7 @@ fn paint_selection(painter: &Painter, rect: Rect, scale: f32) {
     painter.text(
         band.center(),
         Align2::CENTER_CENTER,
-        "はじめる",
+        tr("launcher.start"),
         FontId::proportional(19.0 * scale),
         Color32::WHITE,
     );

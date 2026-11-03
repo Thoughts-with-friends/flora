@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::Path, sync::mpsc::SyncSender};
 
 use eframe::{egui, egui_wgpu};
 use shocora_render::{
-    FrameGenSetting, LatteRenderer, RenderCommand, RenderThread, Screen, ScreenImages, StreamTap,
-    UpscaleConfig, UpscaleSetting, wgpu,
+    FrameGenSetting, LatteRenderer, MemoryWatch, RenderCommand, RenderThread, Screen, ScreenImages,
+    StreamTap, UpscaleConfig, UpscaleSetting, wgpu,
 };
 
 /// Where the driver's compiled shaders stay between runs.
@@ -24,6 +24,7 @@ pub struct Presenter {
     upscale: UpscaleSetting,
     frame_gen: FrameGenSetting,
     stream: StreamTap,
+    memory_watch: MemoryWatch,
     device: wgpu::Device,
     egui_renderer: std::sync::Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
     /// Registered texture, the generation it shows and the image size.
@@ -47,6 +48,7 @@ impl Presenter {
         let upscale = renderer.upscale_setting();
         let frame_gen = renderer.frame_gen_setting();
         let stream = renderer.stream_tap();
+        let memory_watch = renderer.memory_watch();
         let render_thread = RenderThread::spawn(renderer).map_err(|e| e.to_string())?;
 
         Ok(Self {
@@ -54,6 +56,7 @@ impl Presenter {
             upscale,
             frame_gen,
             stream,
+            memory_watch,
             render_thread,
             device: state.device.clone(),
             egui_renderer: std::sync::Arc::clone(&state.renderer),
@@ -69,6 +72,11 @@ impl Presenter {
     /// Applies from the next flip on.
     pub fn set_frame_generation(&self, enabled: bool) {
         self.frame_gen.set(enabled);
+    }
+
+    /// The factor that did not fit into video memory, if one did not since the last call.
+    pub fn take_memory_shortage(&self) -> Option<u32> {
+        self.memory_watch.take()
     }
 
     /// Where a second player's pictures come from.

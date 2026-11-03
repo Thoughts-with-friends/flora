@@ -49,6 +49,12 @@ impl Gpu {
         self.cp.execute(words, &mut ctx)
     }
 
+    /// Draws the title's pictures this many times larger, as far as that stays within
+    /// [`ResolutionScale::MAX_WIDTH`](crate::render::ResolutionScale::MAX_WIDTH).
+    pub fn set_resolution_factor(&mut self, factor: u32) {
+        self.latte.set_resolution_factor(factor);
+    }
+
     /// Makes the host renderer forget everything of the previous boot.
     pub fn reset_renderer(&mut self) {
         self.latte.commands.push(RenderCommand::Reset);

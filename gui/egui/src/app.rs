@@ -9,10 +9,11 @@ use shocora_gui_common::{
     input::{Controllers, merge},
 };
 use shocora_netplay::{DEFAULT_PORT, HostConfig, LinkState, Refusal};
-use shocora_render::{GraphicsApi, Screen, UpscaleMethod, upscale};
-use wiiu_emu::{GamePadState, Status};
+use shocora_render::{GraphicsApi, ResolutionScale, Screen, UpscaleMethod, upscale};
+use wiiu_emu::{GamePadState, GameSpeed, Status, VpadButtons};
 
 use crate::{
+    lang::{self, tr, trf},
     launcher::Launcher,
     netplay::{self, Netplay},
     presenter::Presenter,
@@ -27,6 +28,43 @@ enum FrameRate {
     Title,
     Max30,
     Force60,
+}
+
+/// `width` x `height` drawn `factor` times larger, as far as the limit allows.
+fn scaled_size(factor: u32, width: u32, height: u32) -> String {
+    let factor = ResolutionScale::for_tv(factor, width).factor;
+    format!("{} x {}", width * factor, height * factor)
+}
+
+/// The pages of the settings window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Graphics,
+    Input,
+    Netplay,
+}
+
+impl SettingsTab {
+    const ALL: [Self; 4] = [Self::General, Self::Graphics, Self::Input, Self::Netplay];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => tr("settings.general"),
+            Self::Graphics => tr("settings.graphics"),
+            Self::Input => tr("settings.input"),
+            Self::Netplay => tr("settings.netplay"),
+        }
+    }
+
+    fn menu_label(self) -> &'static str {
+        match self {
+            Self::General => tr("settings.general_menu"),
+            Self::Graphics => tr("settings.graphics_menu"),
+            Self::Input => tr("settings.input_menu"),
+            Self::Netplay => tr("settings.netplay_menu"),
+        }
+    }
 }
 
 /// The cheat editor window.
@@ -60,6 +98,12 @@ pub struct ShocoraApp {
     log: Vec<String>,
     show_log: bool,
     last_gamepad: GamePadState,
+    /// The settings window's page, while it is open.
+    settings_tab: Option<SettingsTab>,
+    /// How fast the title runs. Back to normal at the next start of the program.
+    speed: GameSpeed,
+    /// The controller's speed button was down at the last look: a press changes it once.
+    speed_button_down: bool,
     controllers: Controllers,
     /// Titles found in the directories listed in `roms.json`.
     library: GameLibrary,
@@ -98,6 +142,7 @@ impl ShocoraApp {
         let console =
             Console::spawn(config.emulator_config(), render, move || ctx.request_repaint())?;
         let mut config = config;
+        lang::set_language(&config.language);
         if config.netplay_address.is_empty() {
             if let Some(address) = shocora_netplay::local_address() {
                 config.netplay_address = address.to_string();
@@ -129,6 +174,9 @@ impl ShocoraApp {
             log: Vec::new(),
             show_log: true,
             last_gamepad: GamePadState::default(),
+            settings_tab: None,
+            speed: GameSpeed::Normal,
+            speed_button_down: false,
             controllers: Controllers::new(),
             library: GameLibrary::default(),
             library_error: None,
@@ -145,7 +193,7 @@ impl ShocoraApp {
     }
 
     fn boot(&mut self, path: PathBuf) {
-        self.log.push(format!("loading {}", path.display()));
+        self.log.push(trf("log.loading", &[("path", &path.display())]));
         self.boot_pending = true;
         self.console.send(ConsoleCommand::Load(path.clone()));
         self.config.last_title = Some(path);
@@ -160,7 +208,7 @@ impl ShocoraApp {
                 self.library = GameLibrary::scan(&paths);
                 self.library_error = None;
                 self.log.extend(self.library.problems.iter().cloned());
-                self.log.push(format!("library: {} titles", self.library.games.len()));
+                self.log.push(trf("library.count", &[("count", &self.library.games.len())]));
             }
             Err(error) => {
                 self.library = GameLibrary::default();
@@ -171,7 +219,8 @@ impl ShocoraApp {
 
     /// Asks for a directory of titles, adds it to `roms.json` and rescans.
     fn pick_rom_folder(&mut self) {
-        let Some(dir) = rfd::FileDialog::new().set_title("ROM folder").pick_folder() else {
+        let Some(dir) = rfd::FileDialog::new().set_title(tr("dialog.rom_folder")).pick_folder()
+        else {
             return;
         };
         let path = Path::new(DEFAULT_PATH);
@@ -203,9 +252,12 @@ impl ShocoraApp {
     fn pick_and_boot(&mut self, folder: bool) {
         let dialog = rfd::FileDialog::new();
         let picked = if folder {
-            dialog.set_title("Open title folder").pick_folder()
+            dialog.set_title(tr("dialog.title_folder")).pick_folder()
         } else {
-            dialog.set_title("Open RPX").add_filter("Wii U executable", &["rpx"]).pick_file()
+            dialog
+                .set_title(tr("dialog.rpx"))
+                .add_filter(tr("dialog.rpx_filter"), &["rpx"])
+                .pick_file()
         };
         if let Some(path) = picked {
             self.boot(path);
@@ -216,6 +268,17 @@ impl ShocoraApp {
         let snapshot = self.console.drain();
         self.presenter.sync();
         self.log.extend(snapshot.console_lines.iter().map(|l| l.trim_end().to_owned()));
+        if let Some(factor) = self.presenter.take_memory_shortage() {
+            // Frames already on their way may report the old factor once more.
+            let lower = ResolutionScale::lower_factor(factor);
+            if lower < self.config.resolution_factor {
+                self.log.push(trf(
+                    "graphics.memory_ran_out",
+                    &[("factor", &factor), ("lower", &lower)],
+                ));
+                self.set_resolution_factor(lower);
+            }
+        }
         if snapshot.title.is_some() {
             self.boot_pending = false;
         }
@@ -225,7 +288,7 @@ impl ShocoraApp {
         }
         if let Some(Status::Crashed(message)) = &snapshot.status {
             if self.status != snapshot.status {
-                self.log.push(format!("emulation stopped: {message}"));
+                self.log.push(trf("log.stopped", &[("message", message)]));
             }
         }
         let overflow = self.log.len().saturating_sub(LOG_LINES);
@@ -248,6 +311,30 @@ impl ShocoraApp {
         });
         let mut pad = merge(keyboard, self.controllers.gamepad(&self.config.pad_bindings));
         pad.touch = self.touch;
+        // The host's clock is not a guest's to change: its buttons all go to the title.
+        if !matches!(self.netplay, Netplay::Guest(_)) {
+            let button = pad.held.contains(VpadButtons::STICK_L);
+            pad.held.remove(VpadButtons::STICK_L);
+            let pressed = button && !self.speed_button_down;
+            self.speed_button_down = button;
+            let tab = !ctx.egui_wants_keyboard_input()
+                && ctx.input(|input| {
+                    input.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                key: egui::Key::Tab,
+                                pressed: true,
+                                repeat: false,
+                                ..
+                            }
+                        )
+                    })
+                });
+            if pressed || tab {
+                self.next_speed();
+            }
+        }
         if pad != self.last_gamepad {
             self.last_gamepad = pad;
             // A guest's controller belongs to the host's second player.
@@ -257,6 +344,11 @@ impl ShocoraApp {
                 self.console.send(ConsoleCommand::GamePad(pad));
             }
         }
+    }
+
+    fn next_speed(&mut self) {
+        self.speed = self.speed.next();
+        self.console.send(ConsoleCommand::Speed(self.speed));
     }
 
     fn start_hosting(&mut self) {
@@ -283,7 +375,7 @@ impl ShocoraApp {
                 self.save_config();
             }
             Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
-                self.netplay_error = Some(format!("{address} はこの PC のアドレスではありません"));
+                self.netplay_error = Some(trf("netplay.not_this_pc", &[("address", &address)]));
             }
             Err(error) => {
                 self.netplay_error = Some(format!("port {DEFAULT_PORT}: {error}"));
@@ -310,52 +402,171 @@ impl ShocoraApp {
         self.netplay = Netplay::Off;
     }
 
-    fn netplay_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Netplay", |ui| match self.netplay {
+    fn netplay_settings(&mut self, ui: &mut egui::Ui) {
+        match self.netplay {
             Netplay::Off => {
-                ui.label("パスワード（なしでも可）");
+                ui.label(tr("netplay.password"));
                 ui.add(egui::TextEdit::singleline(&mut self.netplay_password).password(true));
                 ui.separator();
-                ui.label("この PC の IP アドレス");
-                ui.text_edit_singleline(&mut self.config.netplay_address).on_hover_text(
-                    "同じネットワーク（192.168.1.10 なら 192.168.1.x）の相手だけが参加できます。\n\
-                     広いネットワークは 10.1.2.3/16 のように指定します。",
-                );
+                ui.label(tr("netplay.own_address"));
+                ui.text_edit_singleline(&mut self.config.netplay_address)
+                    .on_hover_text(tr("netplay.own_address_hint"));
                 let ready = !self.config.netplay_address.trim().is_empty();
                 if ui
-                    .add_enabled(ready, egui::Button::new("2P ホストを開始"))
-                    .on_hover_text(
-                        "パスワードそのものは送りませんが、通信は暗号化されません。\n\
-                         信頼できるネットワークで使ってください。",
-                    )
+                    .add_enabled(ready, egui::Button::new(tr("netplay.start_host")))
+                    .on_hover_text(tr("netplay.start_host_hint"))
                     .clicked()
                 {
-                    ui.close();
                     self.start_hosting();
                 }
                 ui.separator();
-                ui.label("ホストの IP アドレス");
+                ui.label(tr("netplay.host_address"));
                 ui.text_edit_singleline(&mut self.config.netplay_host);
                 let ready = !self.config.netplay_host.trim().is_empty();
-                if ui.add_enabled(ready, egui::Button::new("参加")).clicked() {
-                    ui.close();
+                if ui.add_enabled(ready, egui::Button::new(tr("netplay.join"))).clicked() {
                     self.join(ui.ctx());
                 }
             }
             Netplay::Host(_) | Netplay::Guest(_) => {
-                if ui.button("切断").clicked() {
-                    ui.close();
+                if ui.button(tr("netplay.disconnect")).clicked() {
                     self.stop_netplay();
                 }
             }
+        }
+        if let Some(status) = self.netplay_status() {
+            ui.separator();
+            ui.label(status);
+        }
+    }
+
+    fn set_resolution_factor(&mut self, factor: u32) {
+        self.config.resolution_factor = factor;
+        self.console.send(ConsoleCommand::ResolutionFactor(factor));
+        self.save_config();
+    }
+
+    fn resolution_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(tr("graphics.resolution")).on_hover_text(tr("graphics.resolution_hint"));
+        let current = self.config.resolution_factor;
+        for factor in ResolutionScale::FACTORS {
+            let label = if factor == 1 {
+                tr("graphics.native").to_owned()
+            } else {
+                trf(
+                    "graphics.factor",
+                    &[
+                        ("factor", &factor),
+                        ("at720", &scaled_size(factor, 1280, 720)),
+                        ("at1080", &scaled_size(factor, 1920, 1080)),
+                    ],
+                )
+            };
+            if ui.radio(current == factor, label).clicked() && current != factor {
+                self.set_resolution_factor(factor);
+            }
+        }
+    }
+
+    fn graphics_settings(&mut self, ui: &mut egui::Ui) {
+        self.resolution_settings(ui);
+        ui.separator();
+        self.upscale_menu(ui);
+        ui.separator();
+        self.frame_rate_menu(ui);
+        ui.separator();
+        let mut generate = self.config.frame_generation;
+        if ui
+            .checkbox(&mut generate, tr("graphics.frame_generation"))
+            .on_hover_text(tr("graphics.frame_generation_hint"))
+            .changed()
+        {
+            self.set_frame_generation(generate);
+        }
+        ui.separator();
+        ui.label(tr("graphics.api"));
+        for api in GraphicsApi::ALL {
+            if ui.radio(self.config.graphics_api == api, api.label()).clicked() {
+                self.config.graphics_api = api;
+                self.save_config();
+            }
+        }
+    }
+
+    fn general_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(tr("general.language"));
+        ui.horizontal(|ui| {
+            for (code, name) in lang::LANGUAGES {
+                let chosen = self.config.language == code;
+                if ui.radio(chosen, name).clicked() && !chosen {
+                    self.config.language = code.to_owned();
+                    lang::set_language(code);
+                    self.save_config();
+                }
+            }
         });
+        ui.separator();
+        ui.label(tr("general.speed")).on_hover_text(tr("general.speed_hint"));
+        ui.horizontal(|ui| {
+            for speed in GameSpeed::ALL {
+                if ui.radio(self.speed == speed, speed.label()).clicked() && self.speed != speed {
+                    self.speed = speed;
+                    self.console.send(ConsoleCommand::Speed(speed));
+                }
+            }
+        });
+        ui.separator();
+        if ui.button(tr("general.fonts_folder")).clicked() {
+            self.pick_fonts_dir();
+        }
+        if ui.button(tr("general.rom_folder")).clicked() {
+            self.pick_rom_folder();
+        }
+    }
+
+    fn input_settings(&self, ui: &mut egui::Ui) {
+        ui.label(tr("input.speed_keys"));
+        ui.label(tr("input.edit_hint"));
+        ui.separator();
+        egui::Grid::new("bindings").striped(true).show(ui, |ui| {
+            ui.strong(tr("input.action"));
+            ui.strong(tr("input.keyboard"));
+            ui.strong(tr("input.controller"));
+            ui.end_row();
+            for (action, key) in &self.config.key_bindings.0 {
+                ui.label(action);
+                ui.label(key);
+                ui.label(self.config.pad_bindings.0.get(action).map_or("-", String::as_str));
+                ui.end_row();
+            }
+        });
+    }
+
+    /// The settings window, with one tab per subject.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let Some(mut tab) = self.settings_tab else { return };
+        let mut open = true;
+        egui::Window::new(tr("menu.settings")).open(&mut open).resizable(true).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for choice in SettingsTab::ALL {
+                    ui.selectable_value(&mut tab, choice, choice.title());
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| match tab {
+                SettingsTab::General => self.general_settings(ui),
+                SettingsTab::Graphics => self.graphics_settings(ui),
+                SettingsTab::Input => self.input_settings(ui),
+                SettingsTab::Netplay => self.netplay_settings(ui),
+            });
+        });
+        self.settings_tab = open.then_some(tab);
     }
 
     /// The guest's screen: what the host sends.
     fn guest_screen(&mut self, ui: &mut egui::Ui) {
         let Netplay::Guest(guest) = &mut self.netplay else { return };
         let Some(texture) = guest.texture(ui.ctx()) else {
-            ui.centered_and_justified(|ui| ui.label("ホストの画面を待っています…"));
+            ui.centered_and_justified(|ui| ui.label(tr("netplay.waiting_picture")));
             return;
         };
         let size = texture.size_vec2();
@@ -368,13 +579,11 @@ impl ShocoraApp {
 
     fn netplay_status(&self) -> Option<String> {
         let link = |state: &LinkState| match state {
-            LinkState::Waiting => "待機中".to_owned(),
-            LinkState::Connecting => "接続中…".to_owned(),
-            LinkState::Unreachable(_) => "接続できません（再試行中）".to_owned(),
-            LinkState::Refused(Refusal::WrongPassword) => "パスワードが違います".to_owned(),
-            LinkState::Refused(Refusal::Network) => {
-                "ホストと同じネットワークではありません".to_owned()
-            }
+            LinkState::Waiting => tr("netplay.waiting").to_owned(),
+            LinkState::Connecting => tr("netplay.connecting").to_owned(),
+            LinkState::Unreachable(_) => tr("netplay.unreachable").to_owned(),
+            LinkState::Refused(Refusal::WrongPassword) => tr("netplay.wrong_password").to_owned(),
+            LinkState::Refused(Refusal::Network) => tr("netplay.other_network").to_owned(),
             LinkState::Connected { peer, round_trip: Some(time) } => {
                 format!("{peer} ping {} ms", time.as_millis())
             }
@@ -382,11 +591,13 @@ impl ShocoraApp {
         };
         match &self.netplay {
             Netplay::Off => self.netplay_error.as_ref().map(|error| format!("2P: {error}")),
-            Netplay::Host(host) => Some(format!(
-                "2P ホスト {} ポート {}: {}",
-                self.netplay_network,
-                host.port(),
-                link(&host.state())
+            Netplay::Host(host) => Some(trf(
+                "netplay.hosting",
+                &[
+                    ("network", &self.netplay_network),
+                    ("port", &host.port()),
+                    ("state", &link(&host.state())),
+                ],
             )),
             Netplay::Guest(guest) => Some(format!("2P: {}", link(&guest.client.state()))),
         }
@@ -394,37 +605,40 @@ impl ShocoraApp {
 
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open RPX…").clicked() {
+            ui.menu_button(tr("menu.file"), |ui| {
+                if ui.button(tr("menu.open_rpx")).clicked() {
                     ui.close();
                     self.pick_and_boot(false);
                 }
-                if ui.button("Open title folder…").clicked() {
+                if ui.button(tr("menu.open_title")).clicked() {
                     ui.close();
                     self.pick_and_boot(true);
                 }
                 if let Some(last) = self.config.last_title.clone() {
-                    if ui.button(format!("Reload {}", short_name(&last))).clicked() {
+                    if ui
+                        .button(trf("menu.reload_title", &[("title", &short_name(&last))]))
+                        .clicked()
+                    {
                         ui.close();
                         self.boot(last);
                     }
                 }
-                if ui.button("Select ROM folder…").clicked() {
+                if ui.button(tr("menu.select_rom_folder")).clicked() {
                     ui.close();
                     self.pick_rom_folder();
                 }
-                if ui.button("Reload game library (roms.json)").clicked() {
+                if ui.button(tr("menu.reload_library")).clicked() {
                     ui.close();
                     self.reload_library();
                 }
                 ui.separator();
-                if ui.button("Exit").clicked() {
+                if ui.button(tr("menu.exit")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            ui.menu_button("Emulation", |ui| {
+            ui.menu_button(tr("menu.emulation"), |ui| {
                 let running = self.status == Some(Status::Running);
-                let label = if self.paused { "Resume" } else { "Pause" };
+                let label = if self.paused { tr("menu.resume") } else { tr("menu.pause") };
                 if ui.add_enabled(running, egui::Button::new(label)).clicked() {
                     self.console.send(if self.paused {
                         ConsoleCommand::Resume
@@ -433,59 +647,49 @@ impl ShocoraApp {
                     });
                     ui.close();
                 }
-                if ui.add_enabled(self.cheats_path.is_some(), egui::Button::new("Cheats…")).clicked() {
+                if ui
+                    .add_enabled(self.cheats_path.is_some(), egui::Button::new(tr("menu.cheats")))
+                    .clicked()
+                {
                     self.open_cheats();
                     ui.close();
                 }
-                if ui.add_enabled(self.title.is_some(), egui::Button::new("Reset")).clicked() {
-                    self.log.push("reset".to_owned());
+                if ui
+                    .add_enabled(self.title.is_some(), egui::Button::new(tr("menu.reset")))
+                    .clicked()
+                {
+                    self.log.push(tr("log.reset").to_owned());
                     self.console.send(ConsoleCommand::Reset);
                     ui.close();
                 }
-                if ui.add_enabled(self.title.is_some(), egui::Button::new("Stop")).clicked() {
+                if ui
+                    .add_enabled(self.title.is_some(), egui::Button::new(tr("menu.stop")))
+                    .clicked()
+                {
                     self.console.send(ConsoleCommand::Stop);
                     ui.close();
                 }
             });
-            self.netplay_menu(ui);
-            ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.show_library, "Game library");
-                ui.checkbox(&mut self.show_log, "Guest log");
-                ui.separator();
-                self.upscale_menu(ui);
-                ui.separator();
-                self.frame_rate_menu(ui);
-                let mut generate = self.config.frame_generation;
-                if ui
-                    .checkbox(&mut generate, "Frame generation (30 → 60 fps)")
-                    .on_hover_text("ゲーム速度を変えずに、フレームの間の絵を作って表示します。\nxBRZ の使用中は働きません。")
-                    .changed()
-                {
-                    self.set_frame_generation(generate);
-                }
-                ui.separator();
-                if ui.button("System fonts folder…").clicked() {
-                    ui.close();
-                    self.pick_fonts_dir();
-                }
-                ui.separator();
-                ui.label("Graphics API (applies on restart)");
-                for api in GraphicsApi::ALL {
-                    if ui.radio(self.config.graphics_api == api, api.label()).clicked() {
-                        self.config.graphics_api = api;
-                        self.save_config();
+            ui.menu_button(tr("menu.settings"), |ui| {
+                for tab in SettingsTab::ALL {
+                    if ui.button(tab.menu_label()).clicked() {
+                        ui.close();
+                        self.settings_tab = Some(tab);
                     }
                 }
+            });
+            ui.menu_button(tr("menu.view"), |ui| {
+                ui.checkbox(&mut self.show_library, tr("menu.game_library"));
+                ui.checkbox(&mut self.show_log, tr("menu.guest_log"));
             });
         });
     }
 
     /// Asks for the folder with `CafeStd.ttf`; titles booted from now on use it.
     fn pick_fonts_dir(&mut self) {
-        let dialog = rfd::FileDialog::new()
-            .set_title("Folder with CafeStd.ttf (Cemu: resources/sharedFonts)");
+        let dialog = rfd::FileDialog::new().set_title(tr("dialog.fonts_folder"));
         if let Some(dir) = dialog.pick_folder() {
-            self.log.push(format!("system fonts: {} (applies on the next boot)", dir.display()));
+            self.log.push(trf("log.fonts", &[("path", &dir.display())]));
             self.console.send(ConsoleCommand::FontsDir(Some(dir.clone())));
             self.config.fonts_dir = Some(dir);
             self.save_config();
@@ -493,17 +697,15 @@ impl ShocoraApp {
     }
 
     fn frame_rate_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label("Frame rate");
+        ui.label(tr("graphics.frame_rate"));
         let current = self.frame_rate();
-        let title = ui.radio(current == FrameRate::Title, "As the title asks");
-        let capped = ui.radio(current == FrameRate::Max30, "Max 30 fps").on_hover_text(
-            "ゲームの処理がフレーム数で進むタイトルが速すぎるときに使います。\n\
-             30 fps より遅いタイトルはそのままです。",
-        );
-        let forced = ui.radio(current == FrameRate::Force60, "Force 60 fps").on_hover_text(
-            "A title made for 30 fps whose logic counts frames, such as Twilight Princess HD, \
-             then runs at up to double speed.",
-        );
+        let title = ui.radio(current == FrameRate::Title, tr("graphics.as_title"));
+        let capped = ui
+            .radio(current == FrameRate::Max30, tr("graphics.max30"))
+            .on_hover_text(tr("graphics.max30_hint"));
+        let forced = ui
+            .radio(current == FrameRate::Force60, tr("graphics.force60"))
+            .on_hover_text(tr("graphics.force60_hint"));
         let chosen = if title.clicked() {
             FrameRate::Title
         } else if capped.clicked() {
@@ -542,10 +744,12 @@ impl ShocoraApp {
     }
 
     fn upscale_menu(&mut self, ui: &mut egui::Ui) {
-        ui.add_enabled_ui(upscale::available(), |ui| {
-            ui.label("Screen upscaling (xBRZ)");
-            let mut changed =
-                ui.radio(self.config.upscale.method == UpscaleMethod::None, "Off").clicked();
+        let usable = upscale::available() && self.config.resolution_factor == 1;
+        ui.add_enabled_ui(usable, |ui| {
+            ui.label(tr("graphics.xbrz")).on_disabled_hover_text(tr("graphics.xbrz_unavailable"));
+            let mut changed = ui
+                .radio(self.config.upscale.method == UpscaleMethod::None, tr("graphics.off"))
+                .clicked();
             if changed {
                 self.config.upscale.method = UpscaleMethod::None;
             }
@@ -599,7 +803,7 @@ impl ShocoraApp {
         editor.message = match written {
             Ok(()) => {
                 self.console.send(ConsoleCommand::ReloadCheats);
-                format!("適用しました（有効なコード: {count}）")
+                trf("cheats.applied", &[("count", &count)])
             }
             Err(error) => format!("{}: {error}", path.display()),
         };
@@ -608,21 +812,21 @@ impl ShocoraApp {
     fn cheat_window(&mut self, ctx: &egui::Context) {
         let Some(editor) = &mut self.cheats else { return };
         let (mut open, mut save) = (true, false);
-        egui::Window::new("チートコード").open(&mut open).default_size([460.0, 380.0]).show(
+        egui::Window::new(tr("cheats.title")).open(&mut open).default_size([460.0, 380.0]).show(
             ctx,
             |ui| {
-                ui.label("「アドレス 値」を 16 進数で 1 行ずつ。値の桁数で書き込み幅が決まります（2 桁: 8bit、4 桁: 16bit、8 桁: 32bit）。");
-                ui.label("// で名前を付け、// disabled で次のコードを無効にできます。");
+                ui.label(tr("cheats.format"));
+                ui.label(tr("cheats.comments"));
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut editor.text)
                             .code_editor()
                             .desired_width(f32::INFINITY)
-                            .hint_text("// ルピー 999\n1050_6A1C 03E7"),
+                            .hint_text(tr("cheats.hint")),
                     );
                 });
                 ui.horizontal(|ui| {
-                    save = ui.button("保存して適用").clicked();
+                    save = ui.button(tr("cheats.save")).clicked();
                     ui.label(&editor.message);
                 });
             },
@@ -678,14 +882,14 @@ impl ShocoraApp {
         ui.horizontal(|ui| {
             let running = self.status == Some(Status::Running);
             let state = match (&self.status, self.paused) {
-                (Some(Status::Running), true) => "Paused".to_owned(),
-                (Some(Status::Running), false) => "Running".to_owned(),
-                (Some(Status::Exited(code)), _) => format!("Exited ({code})"),
-                (Some(Status::Crashed(_)), _) => "Crashed".to_owned(),
-                (Some(Status::Idle) | None, _) => "Idle".to_owned(),
+                (Some(Status::Running), true) => tr("status.paused").to_owned(),
+                (Some(Status::Running), false) => tr("status.running").to_owned(),
+                (Some(Status::Exited(code)), _) => trf("status.exited", &[("code", code)]),
+                (Some(Status::Crashed(_)), _) => tr("status.crashed").to_owned(),
+                (Some(Status::Idle) | None, _) => tr("status.idle").to_owned(),
             };
             if running {
-                if setting(ui, state, "クリックで一時停止/再開") {
+                if setting(ui, state, tr("status.pause_hint")) {
                     self.console.send(if self.paused {
                         ConsoleCommand::Resume
                     } else {
@@ -697,65 +901,71 @@ impl ShocoraApp {
             }
             ui.separator();
             let rate = match self.frame_rate() {
-                FrameRate::Title => "タイトル指定",
-                FrameRate::Max30 => "最大 30 fps",
-                FrameRate::Force60 => "60 fps 強制",
+                FrameRate::Title => tr("status.rate_title"),
+                FrameRate::Max30 => tr("status.rate_max30"),
+                FrameRate::Force60 => tr("status.rate_force60"),
             };
             let fps = format!("{:.1} fps ({rate})", self.fps);
-            if setting(
-                ui,
-                fps,
-                "クリックでタイトル指定 → 最大 30 fps → 60 fps 強制 と切り替え。\n\
-                 30 fps 用のタイトルは 60 fps にすると最大で倍速になります。",
-            ) {
+            if setting(ui, fps, tr("status.rate_hint")) {
                 self.toggle_frame_rate();
             }
             ui.separator();
-            let generation = if self.config.frame_generation {
-                "フレーム生成 ON"
-            } else {
-                "フレーム生成 OFF"
-            };
-            if setting(ui, generation.to_owned(), "クリックでフレーム生成（30 → 60 fps）を切り替え")
+            if !matches!(self.netplay, Netplay::Guest(_))
+                && setting(
+                    ui,
+                    trf("status.speed", &[("speed", &self.speed.label())]),
+                    tr("status.speed_hint"),
+                )
             {
+                self.next_speed();
+            }
+            ui.separator();
+            let generation = if self.config.frame_generation {
+                tr("status.framegen_on")
+            } else {
+                tr("status.framegen_off")
+            };
+            if setting(ui, generation.to_owned(), tr("status.framegen_hint")) {
                 self.set_frame_generation(!self.config.frame_generation);
             }
             ui.separator();
             let scale = match self.config.upscale.method {
-                UpscaleMethod::None => "xBRZ off".to_owned(),
+                UpscaleMethod::None => tr("status.xbrz_off").to_owned(),
                 UpscaleMethod::Xbrz => format!("xBRZ {}x", self.config.upscale.factor),
             };
-            if upscale::available() && setting(ui, scale, "クリックで画面の拡大方法を切り替え")
-            {
+            if upscale::available() && setting(ui, scale, tr("status.xbrz_hint")) {
                 self.cycle_upscale();
             }
             ui.separator();
-            ui.label(self.title.as_deref().unwrap_or("no title"));
+            ui.label(self.title.as_deref().unwrap_or_else(|| tr("status.no_title")));
             ui.separator();
             #[allow(clippy::cast_precision_loss)]
-            ui.label(format!("{:.1} M instructions", self.instructions as f64 / 1e6));
+            let millions = format!("{:.1}", self.instructions as f64 / 1e6);
+            ui.label(trf("status.instructions", &[("millions", &millions)]));
             if let Some(status) = self.netplay_status() {
                 ui.separator();
                 ui.label(status);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let api = format!("{} ({})", self.active_api.label(), Presenter::backend_name());
-                if setting(ui, api, "クリックでグラフィックス API を切り替え（次回起動から）")
-                {
+                if setting(ui, api, tr("status.api_hint")) {
                     self.cycle_graphics_api();
                 }
                 if self.config.graphics_api != self.active_api {
-                    ui.label(format!("→ {} after restart", self.config.graphics_api.label()));
+                    ui.label(trf(
+                        "status.after_restart",
+                        &[("api", &self.config.graphics_api.label())],
+                    ));
                 }
             });
         });
     }
 
-    /// Titles from `roms.json`; double-click or "Boot" starts one.
+    /// Titles from `roms.json`; double-click or tr("library.boot") starts one.
     fn library_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Games");
-            if ui.small_button("⟳").on_hover_text("Rescan roms.json directories").clicked() {
+            ui.heading(tr("library.games"));
+            if ui.small_button("⟳").on_hover_text(tr("library.rescan")).clicked() {
                 self.reload_library();
             }
         });
@@ -765,7 +975,7 @@ impl ShocoraApp {
             return;
         }
         if self.library.games.is_empty() {
-            ui.label("No titles found in the roms.json directories.");
+            ui.label(tr("library.none"));
             return;
         }
         let mut boot = None;
@@ -783,7 +993,7 @@ impl ShocoraApp {
                     boot = Some(game.path.clone());
                 }
                 response.context_menu(|ui| {
-                    if ui.button("Boot").clicked() {
+                    if ui.button(tr("library.boot")).clicked() {
                         boot = Some(game.path.clone());
                         ui.close();
                     }
@@ -806,17 +1016,15 @@ impl ShocoraApp {
         {
             self.boot(path);
         }
-        let notice = self.library_error.clone().or_else(|| {
-            self.library
-                .games
-                .is_empty()
-                .then(|| "No titles found in the roms.json directories.".to_owned())
-        });
+        let notice = self
+            .library_error
+            .clone()
+            .or_else(|| self.library.games.is_empty().then(|| tr("library.none").to_owned()));
         let button = egui::Rect::from_min_size(
             area.left_top() + egui::vec2(16.0, 16.0),
             egui::vec2(150.0, 32.0),
         );
-        if ui.put(button, egui::Button::new("ROMフォルダを選択…")).clicked() {
+        if ui.put(button, egui::Button::new(tr("launcher.select_rom"))).clicked() {
             self.pick_rom_folder();
         }
         let picture_rect = egui::Rect::from_min_size(
@@ -838,7 +1046,9 @@ impl ShocoraApp {
                         .fill(egui::Color32::from_black_alpha(170))
                         .corner_radius(4.0)
                         .inner_margin(egui::vec2(6.0, 2.0))
-                        .show(ui, |ui| ui.colored_label(egui::Color32::WHITE, "背景色"));
+                        .show(ui, |ui| {
+                            ui.colored_label(egui::Color32::WHITE, tr("launcher.background_color"))
+                        });
                     response.changed()
                 })
                 .inner
@@ -877,16 +1087,18 @@ impl ShocoraApp {
             ui.horizontal(|ui| {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.picture_path)
-                        .hint_text("背景画像のパス")
+                        .hint_text(tr("launcher.picture_path"))
                         .desired_width(rect.width() - 36.0),
                 );
                 if field.lost_focus() {
                     chosen = Some(self.picture_path.clone());
                 }
-                if ui.button("…").on_hover_text("背景画像を選ぶ").clicked() {
-                    let dialog = rfd::FileDialog::new()
-                        .set_title("背景画像")
-                        .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tga"]);
+                if ui.button("…").on_hover_text(tr("launcher.pick_picture")).clicked() {
+                    let dialog =
+                        rfd::FileDialog::new().set_title(tr("launcher.picture")).add_filter(
+                            tr("launcher.pictures"),
+                            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tga"],
+                        );
                     if let Some(path) = dialog.pick_file() {
                         chosen = Some(path.display().to_string());
                     }
@@ -1036,6 +1248,7 @@ impl eframe::App for ShocoraApp {
             egui::CentralPanel::default().show(ui, |ui| self.screens(ui));
         }
         self.cheat_window(ui.ctx());
+        self.settings_window(ui.ctx());
         self.launcher.paint_transition(ui.ctx());
     }
 }

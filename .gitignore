@@ -5,7 +5,6 @@
 /shader_cache/
 
 # ROMs and anything derived from them never enter the repository.
-/roms/
 *.rpx
 *.rpl
 *.wud
@@ -14,5 +13,9 @@
 *.iso
 /rom_captures/
 /resources/
-save/
+/roms/
 /cheats/
+save/
+
+# Documents
+docs/design/

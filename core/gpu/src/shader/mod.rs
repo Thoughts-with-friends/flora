@@ -87,10 +87,18 @@ struct DrawParams {
     so_base: array<u32, 4>,
     so_stride: array<u32, 4>,
     so_instance_vertices: u32,
+    res_scale: f32,
+    target_scaled: u32,
+    vs_scaled: u32,
+    ps_scaled: u32,
 }
 @group(0) @binding(0) var<storage, read> arena: array<u32>;
 @group(0) @binding(1) var<storage, read> P: DrawParams;
 
+// How much larger than the title thinks texture `unit` is.
+fn tex_scale(mask: u32, unit: u32) -> f32 {
+    return select(1.0, P.res_scale, ((mask >> unit) & 1u) != 0u);
+}
 // A NaN written to a float target would spread through every later blur and
 // average of the frame; the render back end keeps colors finite.
 fn finite_color(v: vec4<f32>) -> vec4<f32> {

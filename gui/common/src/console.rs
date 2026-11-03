@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wiiu_emu::{EmuStats, Emulator, GamePadState, RenderCommand, Status};
+use wiiu_emu::{EmuStats, Emulator, GamePadState, GameSpeed, RenderCommand, Status};
 
 use crate::audio::AudioOutput;
 
@@ -44,6 +44,10 @@ pub enum ConsoleCommand {
     FontsDir(Option<PathBuf>),
     /// Vertical blanks per flip from now on, whatever the title asks for.
     SwapInterval(Option<u32>),
+    /// How many times larger the title's pictures are drawn from now on.
+    ResolutionFactor(u32),
+    /// How fast the title runs from now on.
+    Speed(GameSpeed),
     /// Least vertical blanks per flip from now on: never faster than this.
     MinSwapInterval(Option<u32>),
 }
@@ -202,6 +206,10 @@ impl EmuThread {
             ConsoleCommand::AudioTap(tap) => self.audio_tap = tap,
             ConsoleCommand::FontsDir(dir) => self.emulator.config.fonts_dir = dir,
             ConsoleCommand::SwapInterval(interval) => self.emulator.set_swap_interval(interval),
+            ConsoleCommand::ResolutionFactor(factor) => {
+                self.emulator.set_resolution_factor(factor);
+            }
+            ConsoleCommand::Speed(speed) => self.emulator.set_speed(speed),
             ConsoleCommand::MinSwapInterval(interval) => {
                 self.emulator.set_min_swap_interval(interval);
             }

@@ -20,8 +20,8 @@ use crate::{
     regs::{RegisterFile, base, config, context as reg, resource},
     render::{
         AddressMode, BindingKind, BlendState, BorderColor, BoundTexture, DepthClear, DrawCommand,
-        HostFormat, MipData, PipelineState, RenderCommand, SamplerDesc, ShaderModule, StencilFace,
-        StreamCopy, SurfaceKey, TextureUpload, Topology,
+        HostFormat, MipData, PipelineState, RenderCommand, ResolutionScale, SamplerDesc,
+        ShaderModule, StencilFace, StreamCopy, SurfaceKey, TextureUpload, Topology,
     },
     shader::{self, PixelInputs, TEXTURE_UNITS, TextureDim, TextureKind, TextureSignature},
     tiling::{Layout, detile, swizzle_from_address},
@@ -36,7 +36,7 @@ pub const STREAM_REGION_BASE: u32 = ARENA_SIZE - STREAM_REGION_SIZE;
 /// Alignment of draw parameter blocks (`min_storage_buffer_offset_alignment`).
 const PARAMS_ALIGN: u32 = 256;
 /// Size of `DrawParams` in the shader prelude.
-const PARAMS_SIZE: usize = 32 + 4 * 16 * 4 + 36;
+const PARAMS_SIZE: usize = 32 + 4 * 16 * 4 + 36 + 16;
 /// Texture contents are re-checked once per this many frames at most.
 const TEXTURE_RECHECK_FRAMES: u64 = 2;
 /// Bytes hashed per step when checking whether a texture changed.
@@ -323,6 +323,12 @@ pub struct Latte {
     arena_entries: HashMap<u64, ArenaSlice>,
     /// Surfaces rendered to: `(masked address, width, height)` → key.
     host_surfaces: HashMap<(u32, u32, u32), SurfaceKey>,
+    /// Factor the user asked for.
+    requested_factor: u32,
+    /// Width of the TV picture, once the title has shown one.
+    tv_width: u32,
+    /// What the renderer was told last.
+    resolution: ResolutionScale,
     textures: HashMap<SurfaceKey, KnownTexture>,
     programs: HashMap<u64, Arc<ProgramPair>>,
     /// By program hash, uniform blocks in use, and pixel stage or not.
@@ -348,6 +354,9 @@ impl Default for Latte {
             arena_cursor: 0,
             arena_entries: HashMap::new(),
             host_surfaces: HashMap::new(),
+            requested_factor: 1,
+            tv_width: 0,
+            resolution: ResolutionScale::default(),
             textures: HashMap::new(),
             programs: HashMap::new(),
             shader_uses: HashMap::new(),
@@ -494,7 +503,29 @@ impl Latte {
         self.commands.push(RenderCommand::Clear { color: color_clear, depth: depth_clear });
     }
 
+    pub fn set_resolution_factor(&mut self, factor: u32) {
+        self.requested_factor = factor.max(1);
+        self.update_resolution();
+    }
+
+    /// Tells the renderer if the scale changed. It takes the TV's width to know, so a title
+    /// starts out at its own resolution until it shows its first picture.
+    fn update_resolution(&mut self) {
+        if self.tv_width == 0 {
+            return;
+        }
+        let new = ResolutionScale::for_tv(self.requested_factor, self.tv_width);
+        if new != self.resolution {
+            self.resolution = new;
+            self.commands.push(RenderCommand::SetResolution(new));
+        }
+    }
+
     pub fn copy_to_scan(&mut self, words: &SurfaceWords, screen: crate::Screen) {
+        if screen == crate::Screen::Tv && words.width != self.tv_width {
+            self.tv_width = words.width;
+            self.update_resolution();
+        }
         let key = Self::key_of_target(words, false);
         self.commands.push(RenderCommand::CopyToScanBuffer {
             surface: key,
@@ -1278,6 +1309,28 @@ impl Latte {
         } else {
             Vec::new()
         };
+        // Shaders work in the title's pixels: these tell them what is larger than it thinks.
+        let resolution = self.resolution;
+        let target =
+            color_targets.iter().flatten().next().or(depth_target.as_ref()).map(|(key, _)| key);
+        params[81] = (resolution.factor as f32).to_bits();
+        params[82] = u32::from(target.is_some_and(|key| resolution.applies(key)));
+        for texture in &textures {
+            let is_target = self.host_surfaces.contains_key(&(
+                texture.key.address,
+                texture.key.width,
+                texture.key.height,
+            ));
+            if is_target && resolution.applies(&texture.key) {
+                let unit = texture.binding / 2;
+                let (word, unit) = if unit < TEXTURE_UNITS as u32 {
+                    (83, unit)
+                } else {
+                    (84, unit - TEXTURE_UNITS as u32)
+                };
+                params[word] |= 1 << unit;
+            }
+        }
         let params_bytes: Vec<u8> = params.iter().flat_map(|w| w.to_le_bytes()).collect();
         let params_offset = self.arena_write_unique(&params_bytes, PARAMS_ALIGN);
 
@@ -1708,6 +1761,62 @@ fn decode_mips(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(width: u32, height: u32) -> SurfaceKey {
+        SurfaceKey { address: 0x1000, width, height, layers: 1, format: HostFormat::Rgba8Unorm }
+    }
+
+    #[test]
+    fn running_out_of_memory_steps_down_through_the_factors() {
+        assert_eq!(ResolutionScale::lower_factor(8), 6);
+        assert_eq!(ResolutionScale::lower_factor(5), 4);
+        assert_eq!(ResolutionScale::lower_factor(2), 1);
+        assert_eq!(ResolutionScale::lower_factor(1), 1);
+    }
+
+    #[test]
+    fn the_scale_stays_within_10k() {
+        assert_eq!(ResolutionScale::for_tv(8, 1280).factor, 8, "10240 x 5760");
+        assert_eq!(ResolutionScale::for_tv(8, 1920).factor, 5, "9600 x 5400");
+        assert_eq!(ResolutionScale::for_tv(2, 1920).factor, 2);
+        assert_eq!(ResolutionScale::for_tv(1, 1280).factor, 1);
+    }
+
+    #[test]
+    fn pictures_grow_and_shadow_maps_do_not() {
+        let scale = ResolutionScale::for_tv(4, 1280);
+        assert_eq!(scale.of(&target(1280, 720)), 4);
+        assert_eq!(scale.of(&target(640, 360)), 4, "half-size effects keep their proportion");
+        assert_eq!(scale.of(&target(1024, 1024)), 1, "square: a shadow map");
+        assert_eq!(scale.of(&target(2048, 1024)), 1, "wider than the TV");
+        assert_eq!(scale.of(&target(16, 9)), 1, "a tiny target holds data");
+        let cascades = SurfaceKey { layers: 4, ..target(1280, 720) };
+        assert_eq!(scale.of(&cascades), 1);
+        assert_eq!(ResolutionScale::default().of(&target(1280, 720)), 1);
+    }
+
+    #[test]
+    fn the_renderer_hears_of_the_scale_once_the_tv_is_known() {
+        let mut latte = Latte::default();
+        let scale_commands = |latte: &Latte| -> Vec<ResolutionScale> {
+            latte
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    RenderCommand::SetResolution(scale) => Some(*scale),
+                    _ => None,
+                })
+                .collect()
+        };
+        latte.set_resolution_factor(4);
+        assert!(scale_commands(&latte).is_empty(), "no picture yet");
+        let tv = SurfaceWords { width: 1280, height: 720, ..SurfaceWords::default() };
+        latte.copy_to_scan(&tv, crate::Screen::Tv);
+        latte.copy_to_scan(&tv, crate::Screen::Tv);
+        assert_eq!(scale_commands(&latte), [ResolutionScale { factor: 4, limit_width: 1280 }]);
+        latte.set_resolution_factor(1);
+        assert_eq!(scale_commands(&latte).len(), 2);
+    }
 
     #[test]
     fn depth_read_as_a_texture_keeps_its_precision() {

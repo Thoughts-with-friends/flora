@@ -10,6 +10,7 @@
 //! does the signal processing.
 pub mod adpcm;
 pub mod mixer;
+pub mod speed;
 pub mod voice;
 
 pub use mixer::Mixer;

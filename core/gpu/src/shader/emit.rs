@@ -548,7 +548,11 @@ impl<'a> Translator<'a> {
             tex::GET_TEXTURE_RESINFO => {
                 let name = self.temp();
                 let size = match signature.dim {
-                    TextureDim::D2 | TextureDim::Cube => {
+                    TextureDim::D2 => {
+                        let scale = self.texture_scale(unit as u32);
+                        format!("vec3<u32>(textureDimensions({tex_name}) / u32({scale}), 1u)")
+                    }
+                    TextureDim::Cube => {
                         format!("vec3<u32>(textureDimensions({tex_name}), 1u)")
                     }
                     TextureDim::D2Array => format!(
@@ -571,7 +575,11 @@ impl<'a> Translator<'a> {
                     (self.int_coord(op, 0), self.int_coord(op, 1), self.int_coord(op, 2));
                 let lod = self.int_coord(op, 3);
                 let load = match signature.dim {
-                    TextureDim::D2 | TextureDim::Cube => {
+                    TextureDim::D2 => {
+                        let scale = self.texture_scale(unit as u32);
+                        format!("textureLoad({tex_name}, vec2<i32>({x},{y}) * i32({scale}), {lod})")
+                    }
+                    TextureDim::Cube => {
                         format!("textureLoad({tex_name}, vec2<i32>({x},{y}), {lod})")
                     }
                     TextureDim::D2Array => {
@@ -586,7 +594,7 @@ impl<'a> Translator<'a> {
                 self.write_tex_result(op, &swizzled);
             }
             tex::FETCH4 if signature.dim == TextureDim::D2 => {
-                let call = self.sample_call(op, signature, &tex_name, &sampler_name);
+                let call = self.sample_call(op, signature, unit as u32, &tex_name, &sampler_name);
                 let bits = if matches!(signature.kind, TextureKind::Uint) {
                     call
                 } else {
@@ -599,7 +607,7 @@ impl<'a> Translator<'a> {
                 self.write_tex_result(op, &name);
             }
             _ => {
-                let call = self.sample_call(op, signature, &tex_name, &sampler_name);
+                let call = self.sample_call(op, signature, unit as u32, &tex_name, &sampler_name);
                 let bits = self.texel_bits(signature, &call);
                 let swizzled = self.swizzle_texel(signature, &bits);
                 self.write_tex_result(op, &swizzled);
@@ -617,10 +625,17 @@ impl<'a> Translator<'a> {
     }
 
     /// The expression sampling the texture.
+    /// Expression for how much larger than the title thinks texture `unit` is.
+    fn texture_scale(&self, unit: u32) -> String {
+        let mask = if self.stage == Stage::Pixel { "P.ps_scaled" } else { "P.vs_scaled" };
+        format!("tex_scale({mask}, {unit}u)")
+    }
+
     fn sample_call(
         &mut self,
         op: &TexOp,
         signature: TextureSignature,
+        unit: u32,
         tex_name: &str,
         sampler_name: &str,
     ) -> String {
@@ -629,7 +644,8 @@ impl<'a> Translator<'a> {
         let scale_x = !op.normalized[0];
         let scale_y = !op.normalized[1];
         let (x, y) = if scale_x || scale_y {
-            let size = format!("vec2<f32>(textureDimensions({tex_name}))");
+            let scale = self.texture_scale(unit);
+            let size = format!("(vec2<f32>(textureDimensions({tex_name})) / {scale})");
             (
                 if scale_x { format!("({x} / {size}.x)") } else { x },
                 if scale_y { format!("({y} / {size}.y)") } else { y },
@@ -1301,7 +1317,12 @@ pub fn translate_pixel(
     }
     if position_enabled {
         t.note_gpr(position_gpr);
-        let _ = writeln!(prologue, "R[{position_gpr}] = bitcast<vec4<u32>>(input.frag_position);");
+        // In the title's pixels, however large the host draws.
+        let _ = writeln!(
+            prologue,
+            "R[{position_gpr}] = bitcast<vec4<u32>>(vec4<f32>(input.frag_position.xy / \
+             select(1.0, P.res_scale, P.target_scaled != 0u), input.frag_position.zw));"
+        );
     }
     let front_face = (inputs.control1 >> 8) & 1 != 0;
     if front_face {

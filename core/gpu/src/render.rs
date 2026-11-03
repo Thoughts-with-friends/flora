@@ -126,6 +126,61 @@ impl HostFormat {
 
 /// Identity of a surface. The swizzle bits are masked out of `address`, so a
 /// render target and a texture view of it compare equal.
+/// How much larger than on the console the host draws.
+///
+/// Surfaces the title renders to are made `factor` times as wide and high; textures it brings
+/// along stay as they are. Which ones is a matter of size only, so that the shader translator
+/// and the host renderer agree without talking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionScale {
+    pub factor: u32,
+    /// Width of the TV picture. What is wider is no picture but something like an atlas.
+    pub limit_width: u32,
+}
+
+impl Default for ResolutionScale {
+    fn default() -> Self {
+        Self { factor: 1, limit_width: 0 }
+    }
+}
+
+impl ResolutionScale {
+    /// The factors on offer, smallest first.
+    pub const FACTORS: [u32; 7] = [1, 2, 3, 4, 5, 6, 8];
+    /// Widest picture the host draws: "10K".
+    pub const MAX_WIDTH: u32 = 10_240;
+    /// Smaller targets hold data rather than pictures: light levels, lookup tables.
+    const MIN_SIDE: u32 = 32;
+
+    /// The scale for a title showing a TV picture `tv_width` wide, for a `requested` factor.
+    pub const fn for_tv(requested: u32, tv_width: u32) -> Self {
+        let most = Self::MAX_WIDTH / if tv_width == 0 { 1 } else { tv_width };
+        let factor = if requested < most { requested } else { most };
+        Self { factor: if factor == 0 { 1 } else { factor }, limit_width: tv_width }
+    }
+
+    /// The factor on offer below `factor`, for when video memory runs out.
+    pub fn lower_factor(factor: u32) -> u32 {
+        Self::FACTORS.into_iter().rev().find(|f| *f < factor).unwrap_or(1)
+    }
+
+    /// Whether the target `key` is drawn larger. Square targets and arrays are mostly shadow
+    /// maps, which would eat the memory of everything else at these factors.
+    pub const fn applies(&self, key: &SurfaceKey) -> bool {
+        self.factor > 1
+            && key.layers == 1
+            && key.width != key.height
+            && key.width <= self.limit_width
+            && key.width >= Self::MIN_SIDE
+            && key.height >= Self::MIN_SIDE
+    }
+
+    /// The factor of the target `key`.
+    pub const fn of(&self, key: &SurfaceKey) -> u32 {
+        if self.applies(key) { self.factor } else { 1 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SurfaceKey {
     pub address: u32,
@@ -329,6 +384,8 @@ pub enum BindingKind {
 /// Work for the host renderer, independent of the graphics API.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderCommand {
+    /// Draw at this scale from now on: what the old one drew is gone.
+    SetResolution(ResolutionScale),
     /// Fill a screen with a solid color (linear RGBA in `0.0..=1.0`).
     ClearScreen {
         screen: Screen,

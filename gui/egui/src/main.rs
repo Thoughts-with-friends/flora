@@ -7,6 +7,7 @@
 
 mod app;
 mod fonts;
+mod lang;
 mod launcher;
 mod netplay;
 mod presenter;
