@@ -4,7 +4,7 @@ Rule: **`core/*` knows nothing about windows, file pickers, graphics APIs or
 audio devices.** Host integration lives in `gui/*`.
 
 ```text
-gui/egui (shocora_egui) ─► gui/common (shocora_gui_common) ─► gui/render (shocora_render)
+gui/egui (shocora) ─► gui/common (shocora_gui_common) ─► gui/render (shocora_render)
                                   │
                                   ▼
                         core/system (wiiu_emu)
@@ -34,7 +34,7 @@ gui/egui (shocora_egui) ─► gui/common (shocora_gui_common) ─► gui/render
 | `wiiu_emu`         | core/system        | `Emulator`: wiring, frame loop, title loading               |
 | `shocora_render`     | gui/render         | `WgpuRenderer`, `GlowRenderer`, `GraphicsApi`               |
 | `shocora_gui_common` | gui/common         | Emulation thread, config, key bindings                      |
-| `shocora_egui`       | gui/egui           | The application                                             |
+| `shocora`       | gui/egui           | The application                                             |
 | `xtask`            | xtask              | `cargo xtask build/run/test`                                |
 
 ## 2.1 Writing an HLE function

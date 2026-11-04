@@ -11,17 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wiiu_peripherals::GamePadState;
-
 use crate::{
-    LinkState, PEER_TIMEOUT, PING_INTERVAL,
-    protocol::{self, Downsampler, Frame, Message, Refusal},
+    LinkState, PEER_TIMEOUT, PING_INTERVAL, local_addresses,
+    protocol::{self, Downsampler, Frame, GuestInput, HostStatus, Message, Refusal},
 };
 
-/// Size of the network when only an address is given: `192.168.1.x`, as most homes have.
+/// Size of the network when only an address is given and no adapter of this machine has it:
+/// `192.168.1.x`, as most homes have.
 const DEFAULT_PREFIX: u8 = 24;
 /// How long a wrong password keeps the door shut: guessing takes too long this way.
 const REFUSAL_DELAY: Duration = Duration::from_secs(1);
+/// How long a refused guest gets to read the refusal and hang up.
+const REFUSAL_LINGER: Duration = Duration::from_millis(500);
 
 /// How often the host looks for new guests, sound and pictures.
 const TICK: Duration = Duration::from_millis(5);
@@ -29,21 +30,25 @@ const TICK: Duration = Duration::from_millis(5);
 const AUDIO_CHUNK: usize = protocol::AUDIO_RATE as usize / 50 * 2;
 /// Frames of sound the emulator may be ahead before it is dropped: a second.
 const AUDIO_QUEUE: usize = 60;
+/// How often the guest hears about the host's state.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the host needs from the emulator.
 pub trait HostEvents: Send + Sync + 'static {
     /// The guest's controller; `None` when it left.
-    fn input(&self, pad: Option<GamePadState>);
+    fn input(&self, input: Option<GuestInput>);
     /// Whether anyone looks at the pictures, which cost time to make.
     fn streaming(&self, wanted: bool);
-    /// The newest picture since the last call.
-    fn take_frame(&self) -> Option<Frame>;
+    /// The newest picture of each screen since the last call.
+    fn take_frames(&self) -> Vec<Frame>;
+    /// What the guest's status bar shows.
+    fn status(&self) -> HostStatus;
 }
 
 /// Where a host listens and whom it lets in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
-    /// This machine's address on the network: only that interface listens.
+    /// This machine's address on the network guests may come from.
     pub address: Ipv4Addr,
     /// Bits of the address that make up the network.
     pub prefix: u8,
@@ -53,7 +58,8 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    /// `text` is `192.168.1.10`, or `192.168.1.10/16` for a network other than the usual /24.
+    /// `text` is `192.168.1.10`, whose network is as large as the adapter with that address
+    /// says, or `192.168.1.10/16` to choose.
     ///
     /// # Errors
     /// Says what is wrong with `text`.
@@ -63,7 +69,10 @@ impl HostConfig {
         let address: Ipv4Addr =
             address.parse().map_err(|_| format!("IPv4 アドレスではありません: {address}"))?;
         let prefix = match prefix {
-            "" => DEFAULT_PREFIX,
+            "" => local_addresses()
+                .iter()
+                .find(|local| local.address == address)
+                .map_or(DEFAULT_PREFIX, |local| local.prefix),
             bits => bits
                 .parse()
                 .ok()
@@ -84,9 +93,14 @@ impl HostConfig {
         format!("{network}/{}", self.prefix)
     }
 
-    /// Whether `peer` is on this host's network.
-    pub fn admits(&self, peer: IpAddr) -> bool {
-        match peer.to_canonical() {
+    /// Whether `peer`, which reached this machine at `local`, may join: it is on this host's
+    /// network or is this machine itself, whichever of its addresses it used.
+    pub fn admits(&self, peer: IpAddr, local: IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        if peer.is_loopback() || peer == local.to_canonical() {
+            return true;
+        }
+        match peer {
             IpAddr::V4(peer) => (peer.to_bits() ^ self.address.to_bits()) & self.mask() == 0,
             IpAddr::V6(_) => false,
         }
@@ -104,6 +118,8 @@ struct Session {
     downsampler: Downsampler,
     audio: Vec<i16>,
     last_ping: Option<Instant>,
+    /// When the guest last heard about the host, and whether it was the first player then.
+    last_status: Option<(Instant, bool)>,
 }
 
 impl Session {
@@ -141,7 +157,16 @@ impl Host {
     /// # Errors
     /// Fails if the port is taken or the address is not this machine's.
     pub fn start(config: HostConfig, events: impl HostEvents) -> io::Result<Self> {
-        let listener = TcpListener::bind((config.address, config.port))?;
+        let listener = if config.address.is_loopback() {
+            // Nobody else can even knock, and no firewall needs to ask.
+            TcpListener::bind((config.address, config.port))?
+        } else {
+            // Only binding tells whether the address is this machine's.
+            drop(TcpListener::bind((config.address, 0))?);
+            // Guests reach this machine at whichever address suits them; `admits` decides who
+            // stays.
+            TcpListener::bind((Ipv4Addr::UNSPECIFIED, config.port))?
+        };
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let state = Arc::new(Mutex::new(LinkState::Waiting));
@@ -193,7 +218,9 @@ fn serve<E: HostEvents>(
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
         match listener.accept() {
-            Ok((stream, peer)) if !config.admits(peer.ip()) => {
+            Ok((stream, peer))
+                if !stream.local_addr().is_ok_and(|local| config.admits(peer.ip(), local.ip())) =>
+            {
                 log::warn!("netplay: {peer} is not on {}", config.network());
                 let _ = refuse(stream, Refusal::Network);
             }
@@ -235,10 +262,16 @@ fn leave(session: &mut Option<Session>, events: &impl HostEvents) {
 }
 
 /// Says no to a guest. Accepted sockets may inherit the listener's non-blocking mode.
-fn refuse(mut stream: TcpStream, reason: Refusal) -> io::Result<()> {
+pub(crate) fn refuse(mut stream: TcpStream, reason: Refusal) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(PEER_TIMEOUT))?;
-    protocol::write_message(&mut stream, &Message::Refused(reason))
+    protocol::write_message(&mut stream, &Message::Refused(reason))?;
+    // Closing with the guest's greeting unread resets the connection, which can destroy the
+    // refusal on its way. Reads the greeting until the guest hangs up.
+    stream.shutdown(Shutdown::Write)?;
+    stream.set_read_timeout(Some(REFUSAL_LINGER))?;
+    let _ = io::copy(&mut stream, &mut io::sink());
+    Ok(())
 }
 
 /// Asks for the password, or an empty one when there is none.
@@ -299,6 +332,7 @@ fn open<E: HostEvents>(
         downsampler: Downsampler::default(),
         audio: Vec::new(),
         last_ping: None,
+        last_status: None,
     })
 }
 
@@ -314,7 +348,7 @@ fn listen(
 ) -> io::Result<()> {
     loop {
         match protocol::read_message(reading)? {
-            Message::Input(pad) => events.input(Some(pad)),
+            Message::Input(input) => events.input(Some(input)),
             Message::Ping(value) => {
                 let mut stream = writer.lock().unwrap_or_else(PoisonError::into_inner);
                 protocol::write_message(&mut *stream, &Message::Pong(value))?;
@@ -346,8 +380,17 @@ fn pump(session: &mut Session, sound: &[Vec<i16>], events: &impl HostEvents) -> 
         let chunk = std::mem::replace(&mut session.audio, rest);
         session.send(&Message::Audio(chunk))?;
     }
-    if let Some(frame) = events.take_frame() {
-        session.send(&Message::Video(protocol::encode_frame(&frame)?))?;
+    for frame in events.take_frames() {
+        session.send(&Message::Video(frame.display, protocol::encode_frame(&frame)?))?;
+    }
+    let status = events.status();
+    // Rights change at once, the rest is thinned out.
+    let due = session.last_status.is_none_or(|(last, player1)| {
+        last.elapsed() >= STATUS_INTERVAL || player1 != status.player1
+    });
+    if due {
+        session.last_status = Some((Instant::now(), status.player1));
+        session.send(&Message::Status(status))?;
     }
     Ok(())
 }

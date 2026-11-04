@@ -18,12 +18,16 @@ pub const AUDIO_RATE: u32 = 16_000;
 /// Rate of the sound the emulator produces.
 const INPUT_AUDIO_RATE: u32 = 48_000;
 /// Bumped when the messages change: both sides must speak the same version.
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 /// Anything longer did not come from a peer speaking this protocol.
 const MAX_PAYLOAD: usize = 4 << 20;
 /// Largest picture a guest decodes.
 const MAX_FRAME_SIDE: u32 = 4096;
 const JPEG_QUALITY: u8 = 70;
+/// Size of the GamePad's screen: a touch is never outside of it.
+const TOUCH_SIZE: (u16, u16) = (854, 480);
+/// Longest title a status carries, in bytes.
+const MAX_STATUS_TITLE: usize = 256;
 
 mod tag {
     pub const HELLO: u8 = 1;
@@ -36,6 +40,7 @@ mod tag {
     pub const ANSWER: u8 = 8;
     pub const WELCOME: u8 = 9;
     pub const REFUSED: u8 = 10;
+    pub const STATUS: u8 = 11;
 }
 
 /// Bytes of the random value a host greets a guest with.
@@ -76,12 +81,67 @@ pub fn answers_match(a: &[u8; ANSWER_SIZE], b: &[u8; ANSWER_SIZE]) -> bool {
     a.iter().zip(b).fold(0, |difference, (x, y)| difference | (x ^ y)) == 0
 }
 
+/// Which of the console's screens a picture shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Display {
+    Tv = 0,
+    GamePad = 1,
+}
+
 /// A picture as RGBA8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
+    pub display: Display,
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// What a guest does with its controller.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GuestInput {
+    pub pad: GamePadState,
+    /// The buttons and sticks go to the GamePad instead of the Pro Controller.
+    pub to_gamepad: bool,
+}
+
+/// What the emulator on the host is doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostState {
+    #[default]
+    Idle,
+    Running,
+    Paused,
+    Exited(i32),
+    Crashed,
+}
+
+/// The frame rate setting of the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameRate {
+    #[default]
+    Title,
+    Max30,
+    Force60,
+}
+
+/// What a guest's status bar shows about the host.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostStatus {
+    pub state: HostState,
+    /// Frames the title flips to the screen per second.
+    pub fps: f32,
+    pub rate: FrameRate,
+    /// How fast the title runs, as a label.
+    pub speed: String,
+    pub frame_generation: bool,
+    /// Factor of the xBRZ upscaling; zero when off.
+    pub xbrz: u8,
+    /// The running title's name; empty when there is none.
+    pub title: String,
+    pub instructions: u64,
+    /// The guest plays as the first player.
+    pub player1: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,31 +149,38 @@ pub enum Message {
     Hello,
     Ping(u64),
     Pong(u64),
-    Input(GamePadState),
-    /// A JPEG picture.
-    Video(Vec<u8>),
+    Input(GuestInput),
+    /// A JPEG picture of a screen.
+    Video(Display, Vec<u8>),
     /// Interleaved stereo at [`AUDIO_RATE`].
     Audio(Vec<i16>),
     Challenge([u8; CHALLENGE_SIZE]),
     Answer([u8; ANSWER_SIZE]),
     Welcome,
     Refused(Refusal),
+    Status(HostStatus),
 }
 
 fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
 }
 
-fn encode_input(pad: &GamePadState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24);
+fn encode_input(input: &GuestInput) -> Vec<u8> {
+    let pad = &input.pad;
+    let mut out = Vec::with_capacity(26);
     out.extend(pad.held.bits().to_be_bytes());
     for value in [pad.left_stick.x, pad.left_stick.y, pad.right_stick.x, pad.right_stick.y] {
         out.extend(value.to_be_bytes());
     }
+    out.push(u8::from(pad.touch.is_some()));
+    let (x, y) = pad.touch.unwrap_or_default();
+    out.extend(x.to_be_bytes());
+    out.extend(y.to_be_bytes());
+    out.push(u8::from(input.to_gamepad));
     out
 }
 
-fn decode_input(payload: &[u8]) -> io::Result<GamePadState> {
+fn decode_input(payload: &[u8]) -> io::Result<GuestInput> {
     let word = |at: usize| -> io::Result<[u8; 4]> {
         payload
             .get(at..at + 4)
@@ -125,11 +192,115 @@ fn decode_input(payload: &[u8]) -> io::Result<GamePadState> {
         let value = f32::from_be_bytes(word(at)?);
         Ok(if value.is_finite() { value.clamp(-1.0, 1.0) } else { 0.0 })
     };
-    Ok(GamePadState {
-        held: VpadButtons::from_bits_truncate(u32::from_be_bytes(word(0)?)),
-        left_stick: Stick { x: axis(4)?, y: axis(8)? },
-        right_stick: Stick { x: axis(12)?, y: axis(16)? },
-        touch: None,
+    let &[touching, x0, x1, y0, y1, to_gamepad] =
+        payload.get(20..).ok_or_else(|| invalid("short input message"))?
+    else {
+        return Err(invalid("short input message"));
+    };
+    let touch = (touching != 0).then(|| {
+        (
+            u16::from_be_bytes([x0, x1]).min(TOUCH_SIZE.0 - 1),
+            u16::from_be_bytes([y0, y1]).min(TOUCH_SIZE.1 - 1),
+        )
+    });
+    Ok(GuestInput {
+        pad: GamePadState {
+            held: VpadButtons::from_bits_truncate(u32::from_be_bytes(word(0)?)),
+            left_stick: Stick { x: axis(4)?, y: axis(8)? },
+            right_stick: Stick { x: axis(12)?, y: axis(16)? },
+            touch,
+        },
+        to_gamepad: to_gamepad != 0,
+    })
+}
+
+/// The first `limit` bytes of `text` or fewer, without cutting a character in two.
+fn clipped(text: &str, limit: usize) -> &str {
+    let end = (0..=limit.min(text.len())).rev().find(|end| text.is_char_boundary(*end));
+    &text[..end.unwrap_or(0)]
+}
+
+fn encode_status(status: &HostStatus) -> Vec<u8> {
+    let (state, code) = match status.state {
+        HostState::Idle => (0, 0),
+        HostState::Running => (1, 0),
+        HostState::Paused => (2, 0),
+        HostState::Exited(code) => (3, code),
+        HostState::Crashed => (4, 0),
+    };
+    let rate = match status.rate {
+        FrameRate::Title => 0,
+        FrameRate::Max30 => 1,
+        FrameRate::Force60 => 2,
+    };
+    let speed = clipped(&status.speed, u8::MAX as usize);
+    let mut out = vec![state];
+    out.extend(code.to_be_bytes());
+    out.extend(status.fps.to_be_bytes());
+    out.extend(status.instructions.to_be_bytes());
+    out.extend([rate, u8::from(status.frame_generation), status.xbrz, u8::from(status.player1)]);
+    #[allow(clippy::cast_possible_truncation)]
+    out.push(speed.len() as u8);
+    out.extend(speed.as_bytes());
+    out.extend(clipped(&status.title, MAX_STATUS_TITLE).as_bytes());
+    out
+}
+
+fn decode_status(payload: &[u8]) -> io::Result<HostStatus> {
+    let bad = || invalid("bad status");
+    let (head, rest) = payload.split_at_checked(21).ok_or_else(bad)?;
+    let &[
+        state,
+        c0,
+        c1,
+        c2,
+        c3,
+        f0,
+        f1,
+        f2,
+        f3,
+        i0,
+        i1,
+        i2,
+        i3,
+        i4,
+        i5,
+        i6,
+        i7,
+        rate,
+        generation,
+        xbrz,
+        player1,
+    ] = head
+    else {
+        return Err(bad());
+    };
+    let (&speed_length, rest) = rest.split_first().ok_or_else(bad)?;
+    let (speed, title) = rest.split_at_checked(speed_length as usize).ok_or_else(bad)?;
+    let text = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).map_err(|_| bad());
+    let fps = f32::from_be_bytes([f0, f1, f2, f3]);
+    Ok(HostStatus {
+        state: match state {
+            0 => HostState::Idle,
+            1 => HostState::Running,
+            2 => HostState::Paused,
+            3 => HostState::Exited(i32::from_be_bytes([c0, c1, c2, c3])),
+            4 => HostState::Crashed,
+            _ => return Err(bad()),
+        },
+        fps: if fps.is_finite() { fps } else { 0.0 },
+        rate: match rate {
+            0 => FrameRate::Title,
+            1 => FrameRate::Max30,
+            2 => FrameRate::Force60,
+            _ => return Err(bad()),
+        },
+        speed: text(speed)?,
+        frame_generation: generation != 0,
+        xbrz,
+        title: text(title)?,
+        instructions: u64::from_be_bytes([i0, i1, i2, i3, i4, i5, i6, i7]),
+        player1: player1 != 0,
     })
 }
 
@@ -147,8 +318,13 @@ pub fn write_message(out: &mut impl Write, message: &Message) -> io::Result<()> 
         Message::Hello => (tag::HELLO, VERSION.to_be_bytes().to_vec()),
         Message::Ping(value) => (tag::PING, value.to_be_bytes().to_vec()),
         Message::Pong(value) => (tag::PONG, value.to_be_bytes().to_vec()),
-        Message::Input(pad) => (tag::INPUT, encode_input(pad)),
-        Message::Video(jpeg) => (tag::VIDEO, jpeg.clone()),
+        Message::Input(input) => (tag::INPUT, encode_input(input)),
+        Message::Video(display, jpeg) => {
+            let mut payload = Vec::with_capacity(1 + jpeg.len());
+            payload.push(*display as u8);
+            payload.extend(jpeg);
+            (tag::VIDEO, payload)
+        }
         Message::Audio(samples) => {
             (tag::AUDIO, samples.iter().flat_map(|sample| sample.to_be_bytes()).collect())
         }
@@ -157,6 +333,7 @@ pub fn write_message(out: &mut impl Write, message: &Message) -> io::Result<()> 
         Message::Welcome => (tag::WELCOME, Vec::new()),
         Message::Refused(Refusal::Network) => (tag::REFUSED, vec![0]),
         Message::Refused(Refusal::WrongPassword) => (tag::REFUSED, vec![1]),
+        Message::Status(status) => (tag::STATUS, encode_status(status)),
     };
     let length = u32::try_from(payload.len()).map_err(|_| invalid("message too long"))?;
     let mut packet = Vec::with_capacity(5 + payload.len());
@@ -195,7 +372,15 @@ pub fn read_message(input: &mut impl Read) -> io::Result<Message> {
         tag::PING => Ok(Message::Ping(value()?)),
         tag::PONG => Ok(Message::Pong(value()?)),
         tag::INPUT => decode_input(&payload).map(Message::Input),
-        tag::VIDEO => Ok(Message::Video(payload)),
+        tag::VIDEO => {
+            let display = match payload.first() {
+                Some(0) => Display::Tv,
+                Some(1) => Display::GamePad,
+                _ => return Err(invalid("bad picture message")),
+            };
+            payload.remove(0);
+            Ok(Message::Video(display, payload))
+        }
         tag::AUDIO => Ok(Message::Audio(
             payload.as_chunks::<2>().0.iter().map(|bytes| i16::from_be_bytes(*bytes)).collect(),
         )),
@@ -208,6 +393,7 @@ pub fn read_message(input: &mut impl Read) -> io::Result<Message> {
             payload.as_slice().try_into().map(Message::Answer).map_err(|_| invalid("bad answer"))
         }
         tag::WELCOME => Ok(Message::Welcome),
+        tag::STATUS => decode_status(&payload).map(Message::Status),
         tag::REFUSED => match payload.as_slice() {
             [0] => Ok(Message::Refused(Refusal::Network)),
             [1] => Ok(Message::Refused(Refusal::WrongPassword)),
@@ -235,18 +421,18 @@ pub fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decompresses a picture from the other side.
+/// Decompresses a picture of `display` from the other side.
 ///
 /// # Errors
 /// Fails if it is not a JPEG of a sensible size.
-pub fn decode_frame(jpeg: &[u8]) -> io::Result<Frame> {
+pub fn decode_frame(display: Display, jpeg: &[u8]) -> io::Result<Frame> {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_FRAME_SIDE);
     limits.max_image_height = Some(MAX_FRAME_SIDE);
     let mut reader = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg);
     reader.limits(limits);
     let image = reader.decode().map_err(io::Error::other)?.into_rgba8();
-    Ok(Frame { width: image.width(), height: image.height(), rgba: image.into_raw() })
+    Ok(Frame { display, width: image.width(), height: image.height(), rgba: image.into_raw() })
 }
 
 /// Thins 48 kHz stereo out to [`AUDIO_RATE`], averaging what it drops so that the highest
@@ -292,14 +478,29 @@ mod tests {
             held: VpadButtons::A | VpadButtons::DOWN,
             left_stick: Stick { x: -0.5, y: 1.0 },
             right_stick: Stick { x: 0.25, y: 0.0 },
-            touch: None,
+            touch: Some((12, 34)),
+        };
+        let status = HostStatus {
+            state: HostState::Exited(-3),
+            fps: 29.5,
+            rate: FrameRate::Max30,
+            speed: "2x".to_owned(),
+            frame_generation: true,
+            xbrz: 4,
+            title: "ゲーム".to_owned(),
+            instructions: u64::MAX - 1,
+            player1: true,
         };
         for message in [
             Message::Hello,
             Message::Ping(7),
             Message::Pong(u64::MAX),
-            Message::Input(pad),
-            Message::Video(vec![1, 2, 3]),
+            Message::Input(GuestInput { pad, to_gamepad: true }),
+            Message::Input(GuestInput::default()),
+            Message::Video(Display::Tv, vec![1, 2, 3]),
+            Message::Video(Display::GamePad, vec![4]),
+            Message::Status(status),
+            Message::Status(HostStatus::default()),
             Message::Audio(vec![-1, 2, i16::MIN, i16::MAX]),
             Message::Challenge([7; CHALLENGE_SIZE]),
             Message::Answer([9; ANSWER_SIZE]),
@@ -331,24 +532,50 @@ mod tests {
         assert!(read_message(&mut other_version.as_slice()).is_err());
         let short_input = [tag::INPUT, 0, 0, 0, 1, 0];
         assert!(read_message(&mut short_input.as_slice()).is_err());
+        let no_screen = [tag::VIDEO, 0, 0, 0, 0];
+        assert!(read_message(&mut no_screen.as_slice()).is_err());
+        let short_status = [tag::STATUS, 0, 0, 0, 1, 0];
+        assert!(read_message(&mut short_status.as_slice()).is_err());
     }
 
     #[test]
     fn stick_values_are_sane_whatever_arrives() {
-        let mut payload = vec![0; 20];
+        let mut payload = vec![0; 26];
         payload[4..8].copy_from_slice(&f32::NAN.to_be_bytes());
         payload[8..12].copy_from_slice(&5.0_f32.to_be_bytes());
-        let pad = decode_input(&payload).unwrap();
+        let pad = decode_input(&payload).unwrap().pad;
         assert_eq!((pad.left_stick.x, pad.left_stick.y), (0.0, 1.0));
+        assert_eq!(pad.touch, None);
+    }
+
+    #[test]
+    fn touches_stay_on_the_screen_whatever_arrives() {
+        let mut payload = vec![0; 26];
+        payload[20] = 1;
+        payload[21..25].fill(0xFF);
+        assert_eq!(decode_input(&payload).unwrap().pad.touch, Some((853, 479)));
+    }
+
+    #[test]
+    fn long_titles_are_cut_between_characters() {
+        let status = HostStatus { title: "あ".repeat(200), ..HostStatus::default() };
+        let decoded = decode_status(&encode_status(&status)).unwrap();
+        assert!(decoded.title.len() <= MAX_STATUS_TITLE);
+        assert!(status.title.starts_with(&decoded.title));
     }
 
     #[test]
     fn pictures_keep_their_size_and_rough_color() {
-        let frame = Frame { width: 32, height: 16, rgba: [200, 40, 10, 255].repeat(32 * 16) };
-        let decoded = decode_frame(&encode_frame(&frame).unwrap()).unwrap();
-        assert_eq!((decoded.width, decoded.height), (32, 16));
+        let frame = Frame {
+            display: Display::GamePad,
+            width: 32,
+            height: 16,
+            rgba: [200, 40, 10, 255].repeat(32 * 16),
+        };
+        let decoded = decode_frame(Display::GamePad, &encode_frame(&frame).unwrap()).unwrap();
+        assert_eq!((decoded.display, decoded.width, decoded.height), (Display::GamePad, 32, 16));
         assert!(decoded.rgba[0].abs_diff(200) < 8 && decoded.rgba[1].abs_diff(40) < 8);
-        assert!(decode_frame(b"not a picture").is_err());
+        assert!(decode_frame(Display::Tv, b"not a picture").is_err());
     }
 
     #[test]

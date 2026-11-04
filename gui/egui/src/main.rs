@@ -72,6 +72,7 @@ fn native_options(api: GraphicsApi) -> eframe::NativeOptions {
         label: Some("shocora"),
         required_features: shocora_render::wanted_features(adapter),
         required_limits: adapter.limits(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
         ..Default::default()
     });
     options.wgpu_options =

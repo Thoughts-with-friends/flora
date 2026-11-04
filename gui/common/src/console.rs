@@ -23,6 +23,8 @@ use crate::audio::AudioOutput;
 const IDLE_POLL: Duration = Duration::from_millis(66);
 /// Rate of the samples the emulator produces.
 const AUDIO_RATE: u32 = 48_000;
+/// Longest time between repaints without a new picture: input is read when painting.
+const MAX_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Requests from the UI.
 #[derive(Debug, Clone)]
@@ -241,6 +243,7 @@ impl EmuThread {
 
     fn run(mut self, repaint: &dyn Fn()) {
         let (mut fps_flips, mut fps_start, mut fps) = (0_u64, Instant::now(), 0.0_f32);
+        let (mut painted_flips, mut painted_at) = (0_u64, Instant::now());
         loop {
             // `run_frame` paces a running guest; otherwise wait for something to do.
             let command = if self.running() {
@@ -275,7 +278,12 @@ impl EmuThread {
                 (fps_flips, fps_start) = (flips, Instant::now());
             }
             self.publish(fps);
-            repaint();
+            // A title at 30 fps need not have the window and the desktop drawn 60 times a second.
+            let flips = self.emulator.stats().gpu.flips;
+            if flips != painted_flips || painted_at.elapsed() >= MAX_REPAINT_INTERVAL {
+                (painted_flips, painted_at) = (flips, Instant::now());
+                repaint();
+            }
         }
     }
 }

@@ -24,9 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         app:
-          - package: shocora_egui
-            app_name: shocora_egui
-            bin_name: shocora_egui
+          - package: shocora
+            app_name: shocora
+            bin_name: shocora
             features: release
             no_default_features: true
 

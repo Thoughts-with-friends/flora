@@ -1,74 +1,31 @@
 //! Game library.
 //!
-//! ROM directories are listed in `roms.json` (machine-specific, git-ignored;
-//! see `roms.example.json`):
-//!
-//! ```json
-//! { "rom_dirs": ["D:\\GAME\\Emulator\\WiiU\\Roms"] }
-//! ```
-//!
-//! Each directory may contain extracted titles (`<name>/code`, `content`,
-//! `meta`) and bare `.rpx` files; [`GameLibrary::scan`] finds them all.
+//! ROM directories are listed in `shocora.toml`. Each may contain extracted titles
+//! (`<name>/code`, `content`, `meta`) and bare `.rpx` files; [`GameLibrary::scan`] finds them
+//! all.
 use std::path::{Path, PathBuf};
 
 use wiiu_title::{TitleInfo, TitleSource};
 
-/// Default location of the ROM list: `roms.json` in the working directory.
-pub const DEFAULT_PATH: &str = "roms.json";
+/// Where the ROM directories were listed before `shocora.toml` took them over.
+pub const LEGACY_PATH: &str = "roms.json";
 
-/// Contents of `roms.json`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Contents of the old `roms.json`.
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
-pub struct RomPaths {
-    /// Directories scanned for titles.
-    pub rom_dirs: Vec<PathBuf>,
+struct LegacyRomPaths {
+    rom_dirs: Vec<PathBuf>,
 }
 
-/// Why `roms.json` could not be read.
-#[derive(Debug)]
-pub enum RomPathsError {
-    Missing(PathBuf),
-    Io(PathBuf, std::io::Error),
-    Json(PathBuf, serde_json::Error),
-}
-
-impl std::fmt::Display for RomPathsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing(path) => {
-                write!(f, "{} not found (copy roms.example.json)", path.display())
-            }
-            Self::Io(path, e) => write!(f, "{}: {e}", path.display()),
-            Self::Json(path, e) => write!(f, "{}: {e}", path.display()),
+/// The directories an old `roms.json` lists, if there is a readable one.
+pub fn legacy_rom_dirs(path: &Path) -> Option<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<LegacyRomPaths>(&text) {
+        Ok(paths) => Some(paths.rom_dirs),
+        Err(error) => {
+            log::warn!("{}: {error}", path.display());
+            None
         }
-    }
-}
-
-impl std::error::Error for RomPathsError {}
-
-impl RomPaths {
-    /// Reads `path`.
-    ///
-    /// # Errors
-    /// Fails if the file is missing, unreadable or not valid JSON.
-    pub fn load(path: &Path) -> Result<Self, RomPathsError> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                RomPathsError::Missing(path.to_owned())
-            } else {
-                RomPathsError::Io(path.to_owned(), e)
-            }
-        })?;
-        serde_json::from_str(&text).map_err(|e| RomPathsError::Json(path.to_owned(), e))
-    }
-
-    /// Writes `path` as pretty JSON.
-    ///
-    /// # Errors
-    /// Fails if the file cannot be written.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, format!("{text}\n"))
     }
 }
 
@@ -103,10 +60,10 @@ pub struct GameLibrary {
 }
 
 impl GameLibrary {
-    /// Scans every directory in `paths` (one level deep).
-    pub fn scan(paths: &RomPaths) -> Self {
+    /// Scans every directory in `dirs` (one level deep).
+    pub fn scan(dirs: &[PathBuf]) -> Self {
         let mut library = Self::default();
-        for dir in &paths.rom_dirs {
+        for dir in dirs {
             library.scan_dir(dir);
         }
         library.games.sort_by(|a, b| a.name.cmp(&b.name));
@@ -165,9 +122,7 @@ mod tests {
         fs::create_dir_all(root.join("not a title")).unwrap();
         fs::create_dir_all(root.join("broken/code")).unwrap();
 
-        let json_path = root.join("roms.json");
-        RomPaths { rom_dirs: vec![root.clone(), root.join("missing")] }.save(&json_path).unwrap();
-        let library = GameLibrary::scan(&RomPaths::load(&json_path).unwrap());
+        let library = GameLibrary::scan(&[root.clone(), root.join("missing")]);
 
         let names: Vec<_> = library.games.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["homebrew", "ゲーム"]);
@@ -177,10 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_reported() {
-        assert!(matches!(
-            RomPaths::load(Path::new("definitely-missing.json")),
-            Err(RomPathsError::Missing(_))
-        ));
+    fn an_old_rom_list_is_still_understood() {
+        let path = std::env::temp_dir().join(format!("shocora-roms-{}.json", std::process::id()));
+        fs::write(&path, r#"{ "rom_dirs": ["D:\\Roms"] }"#).unwrap();
+        assert_eq!(legacy_rom_dirs(&path), Some(vec![PathBuf::from("D:\\Roms")]));
+        fs::write(&path, "not json").unwrap();
+        assert_eq!(legacy_rom_dirs(&path), None);
+        let _ = fs::remove_file(&path);
+        assert_eq!(legacy_rom_dirs(&path), None);
     }
 }

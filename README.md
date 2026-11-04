@@ -82,7 +82,7 @@ cargo xtask icon   # gui/egui/assets/shocora.svg -> shocora.png, shocora.ico
 ### 📂 Setup & File Structure
 
 - **Configuration File**: Settings are saved in `shocora.toml` within the working directory.
-- **ROM Directory Management**: Listed in `roms.json` (git-ignored; template available as `roms.example.json`).
+- **ROM Directory Management**: Listed under `rom_dirs` in `shocora.toml`. An old `roms.json` is read once when `rom_dirs` is empty.
   - Supports extracted titles (`<name>/code`, `content`, `meta`) and `.rpx` files.
   - Detected games appear in the **Games** panel; double-click to boot.
 - **Shader Cache**: Compiled GPU shaders are saved in `shader_cache/` to minimize stuttering on subsequent runs.
@@ -94,13 +94,18 @@ cargo xtask icon   # gui/egui/assets/shocora.svg -> shocora.png, shocora.ico
 
 ### 🌐 Local Network Netplay
 
-Allows a second player to join via local network.
+Allows a second player to join via local network or a VPN such as Radmin VPN.
 
-- **Host Setup**: Enter the host PC's IP address (e.g., `192.168.1.10` or `10.1.2.3/16` for wider subnets) and host on port `47800`.
-  - Access is limited to guests within the specified network.
+- **Host Setup**: Hosts on port `47800` at `127.0.0.1` by default, which only this PC can join. To play with another PC, enter this PC's address on the network the guest is on (e.g., `192.168.1.10`, or its VPN address).
+  - Access is limited to this PC and guests within that address's network. The network's size comes from the adapter; `10.1.2.3/16` overrides it.
+  - With such an address the port listens on all of the PC's addresses. Guests on other PCs need inbound TCP `47800` allowed through the firewall.
+  - The addresses entered are saved to `shocora.toml`, which is git-ignored.
+  - **Give player 2 the rights of player 1** lets the guest play on the GamePad while your own input does not reach the game. The rights end when the guest leaves.
   - Password protection is optional.
-- **Guest Experience**: Connect to the host's IP to play as a **Pro Controller**.
-  - **Video**: 640 × 360 resolution at 20 fps.
+- **Guest Experience**: Connect to the host's IP (`127.0.0.1` on the same PC, the default) to play as a **Pro Controller**. The picture starts once the host runs a title.
+  - **Video**: TV at 640 × 360 and 20 fps, GamePad on its right at 427 × 240 and 10 fps.
+  - **GamePad**: The mouse touches its screen. **Send buttons to the GamePad** moves the controller from the Pro Controller to the GamePad.
+  - **Status Bar**: Shows the host's FPS, title and so on, updated once per second.
   - **Audio**: 16 kHz stream.
 - **Connection Handling**: Ping checks occur once per second. If no response is received for 3 seconds, the connection closes and the guest continuously attempts reconnection.
 - **Security Warning**: While passwords are not sent in plain text, network traffic is **unencrypted**. Only use Netplay on trusted networks.

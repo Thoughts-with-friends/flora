@@ -4,7 +4,7 @@
 //! cargo run -p shocora_tests --example import_audit -- FILE.rpx [...]
 //! ```
 //!
-//! Without arguments every title in `roms.json` is audited. Output never names
+//! Without arguments every title in `shocora.toml` is audited. Output never names
 //! a title, so it can be pasted into issues.
 use std::{collections::BTreeMap, path::PathBuf};
 

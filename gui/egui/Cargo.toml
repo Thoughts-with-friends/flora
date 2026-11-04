@@ -1,5 +1,5 @@
 [package]
-name = "shocora_egui"
+name = "shocora"
 description = "shocora: the default egui front end"
 authors.workspace = true
 categories.workspace = true
@@ -12,7 +12,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wayland", "wgpu", "x11"] }
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tga", "webp"] }
 shocora_game_library = { workspace = true }

@@ -1447,6 +1447,7 @@ const fn ends_block_after_fallback(op: Opcode) -> bool {
 }
 
 /// A block to translate, decoded where the guest's memory can be read.
+#[derive(Clone)]
 pub(super) struct Job {
     pub(super) pc: u32,
     pub(super) instructions: Vec<(u32, Opcode, Instr)>,
@@ -1455,12 +1456,36 @@ pub(super) struct Job {
     /// `interpret_one` for the bus in use.
     helper: usize,
     generation: u64,
+    /// Worth the time to make it run as fast as it can.
+    optimized: bool,
 }
 
 impl Job {
     /// The result of a translation that went wrong.
     pub(super) const fn failed(&self) -> Translated {
-        Translated { pc: self.pc, code: None, alignment: 1, generation: self.generation, nanos: 0 }
+        Translated {
+            pc: self.pc,
+            code: None,
+            alignment: 1,
+            generation: self.generation,
+            nanos: 0,
+            optimized: self.optimized,
+        }
+    }
+
+    /// The same block again, to be made as fast as it can run.
+    pub(super) fn into_optimized(self) -> Self {
+        Self { optimized: true, ..self }
+    }
+
+    /// Whether the block has code in `[start, end)`.
+    pub(super) const fn overlaps(&self, start: u32, end: u32) -> bool {
+        self.pc < end && start < self.next
+    }
+
+    /// A translation of it is good for the code as of `generation`.
+    pub(super) const fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 }
 
@@ -1472,6 +1497,8 @@ pub(super) struct Translated {
     pub(super) alignment: u64,
     pub(super) generation: u64,
     pub(super) nanos: u64,
+    /// Comes from an [optimizing job](Job::into_optimized).
+    pub(super) optimized: bool,
 }
 
 /// Whether nothing after `op` can run: it always branches away.
@@ -1507,20 +1534,29 @@ pub(super) fn decode_block<B: Bus>(pc: u32, bus: &mut B, generation: u64) -> Res
     }
     let helper =
         interpret_one::<B> as unsafe extern "C" fn(*mut CpuState, *mut HelperContext) -> u32;
-    Ok(Job { pc, instructions, next: at, helper: helper as usize, generation })
+    Ok(Job { pc, instructions, next: at, helper: helper as usize, generation, optimized: false })
 }
 
 /// One translation thread.
 pub(super) struct Worker {
+    /// Translates quickly.
     isa: OwnedTargetIsa,
+    /// Makes faster code.
+    optimizing_isa: OwnedTargetIsa,
     context: Context,
     builder_context: FunctionBuilderContext,
     pages: usize,
 }
 
 impl Worker {
-    pub(super) fn new(isa: OwnedTargetIsa, pages: usize) -> Self {
-        Self { isa, context: Context::new(), builder_context: FunctionBuilderContext::new(), pages }
+    pub(super) fn new(isa: OwnedTargetIsa, optimizing_isa: OwnedTargetIsa, pages: usize) -> Self {
+        Self {
+            isa,
+            optimizing_isa,
+            context: Context::new(),
+            builder_context: FunctionBuilderContext::new(),
+            pages,
+        }
     }
 
     pub(super) fn translate(&mut self, job: &Job) -> Translated {
@@ -1534,6 +1570,7 @@ impl Worker {
             alignment,
             generation: job.generation,
             nanos: timer.elapsed().as_nanos() as u64,
+            optimized: job.optimized,
         }
     }
 
@@ -1607,7 +1644,8 @@ impl Worker {
             }
             b.finalize(self.isa.frontend_config());
         }
-        let compiled = match self.context.compile(&*self.isa, &mut ControlPlane::default()) {
+        let isa = if job.optimized { &self.optimizing_isa } else { &self.isa };
+        let compiled = match self.context.compile(&**isa, &mut ControlPlane::default()) {
             Ok(compiled) => compiled,
             Err(error) => {
                 log::error!("JIT failed at {:#010x}: {:?}", job.pc, error.inner);

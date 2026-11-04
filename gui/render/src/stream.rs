@@ -1,4 +1,4 @@
-//! Small pictures of the TV for a second player on the network.
+//! Small pictures of a screen for a second player on the network.
 //!
 //! The GPU shrinks a thinned-out selection of frames and hands them over without stalling the
 //! renderer: a picture is copied to a buffer at one flip and picked up at a later one, once
@@ -13,12 +13,16 @@ use std::{
 
 use egui_wgpu::wgpu;
 
-use crate::ScreenImage;
+use crate::{Screen, ScreenImage};
 
-/// Size of the pictures, half as wide as the usual 1280 x 720 TV.
-const SIZE: (u32, u32) = (640, 360);
-/// Time between pictures: 20 per second, whatever the title's frame rate is.
-const INTERVAL: Duration = Duration::from_millis(50);
+/// Size of the TV's pictures, half as wide as the usual 1280 x 720 TV.
+const TV_SIZE: (u32, u32) = (640, 360);
+/// Time between the TV's pictures: 20 per second, whatever the title's frame rate is.
+const TV_INTERVAL: Duration = Duration::from_millis(50);
+/// Size of the GamePad's pictures, half as wide as its screen.
+const GAMEPAD_SIZE: (u32, u32) = (427, 240);
+/// Time between the GamePad's pictures: titles mostly show little there, so 10 per second.
+const GAMEPAD_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A picture as RGBA8.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,8 +61,9 @@ struct Target {
 }
 
 /// Lives on the render thread.
-#[derive(Default)]
 pub struct Streamer {
+    size: (u32, u32),
+    interval: Duration,
     tap: StreamTap,
     target: Option<Target>,
     last: Option<Instant>,
@@ -75,12 +80,29 @@ impl std::fmt::Debug for Streamer {
 }
 
 impl Streamer {
+    /// Pictures of `screen`.
+    pub fn new(screen: Screen) -> Self {
+        let (size, interval) = match screen {
+            Screen::Tv => (TV_SIZE, TV_INTERVAL),
+            Screen::Drc => (GAMEPAD_SIZE, GAMEPAD_INTERVAL),
+        };
+        Self {
+            size,
+            interval,
+            tap: StreamTap::default(),
+            target: None,
+            last: None,
+            in_flight: false,
+            mapped: Arc::default(),
+        }
+    }
+
     pub fn tap(&self) -> StreamTap {
         self.tap.clone()
     }
 
     /// After a flip: hands over a finished picture and starts the next one when it is due.
-    /// `source` is the TV's new image, if there is one. `pipeline` must render
+    /// `source` is the screen's new image, if there is one. `pipeline` must render
     /// to RGBA8 from the texture and sampler of `layout`.
     pub(crate) fn update(
         &mut self,
@@ -102,13 +124,14 @@ impl Streamer {
             self.deliver();
             self.in_flight = false;
         }
-        let due = self.last.is_none_or(|last| last.elapsed() >= INTERVAL);
+        let due = self.last.is_none_or(|last| last.elapsed() >= self.interval);
         if !due || !self.tap.enabled.load(Ordering::Relaxed) {
             return;
         }
         let Some(source) = source else { return };
         self.last = Some(Instant::now());
-        let target = self.target.get_or_insert_with(|| create_target(device));
+        let size = self.size;
+        let target = self.target.get_or_insert_with(|| create_target(device, size));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shocora stream"),
             layout,
@@ -153,7 +176,7 @@ impl Streamer {
                 buffer: &target.buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(row_bytes()),
+                    bytes_per_row: Some(row_bytes(size.0)),
                     rows_per_image: None,
                 },
             },
@@ -174,30 +197,30 @@ impl Streamer {
     fn deliver(&self) {
         let Some(target) = &self.target else { return };
         let picture = target.buffer.slice(..).get_mapped_range().ok().map(|data| {
-            let row = row_bytes() as usize;
-            let mut rgba = Vec::with_capacity((SIZE.0 * SIZE.1 * 4) as usize);
+            let row = row_bytes(self.size.0) as usize;
+            let mut rgba = Vec::with_capacity((self.size.0 * self.size.1 * 4) as usize);
             for line in data.chunks_exact(row) {
-                rgba.extend_from_slice(&line[..(SIZE.0 * 4) as usize]);
+                rgba.extend_from_slice(&line[..(self.size.0 * 4) as usize]);
             }
             rgba
         });
         target.buffer.unmap();
         let Some(rgba) = picture else { return };
         if self.tap.enabled.load(Ordering::Relaxed) {
-            let frame = StreamFrame { width: SIZE.0, height: SIZE.1, rgba };
+            let frame = StreamFrame { width: self.size.0, height: self.size.1, rgba };
             *self.tap.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
         }
     }
 }
 
-const fn row_bytes() -> u32 {
-    (SIZE.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+const fn row_bytes(width: u32) -> u32 {
+    (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
 }
 
-fn create_target(device: &wgpu::Device) -> Target {
+fn create_target(device: &wgpu::Device, size: (u32, u32)) -> Target {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shocora stream"),
-        size: wgpu::Extent3d { width: SIZE.0, height: SIZE.1, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -208,7 +231,7 @@ fn create_target(device: &wgpu::Device) -> Target {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("shocora stream"),
-        size: u64::from(row_bytes()) * u64::from(SIZE.1),
+        size: u64::from(row_bytes(size.0)) * u64::from(size.1),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });

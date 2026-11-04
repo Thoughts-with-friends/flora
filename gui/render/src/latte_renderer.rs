@@ -12,14 +12,16 @@
 )]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use egui_wgpu::wgpu;
@@ -311,14 +313,92 @@ fn sorted_bindings(draw: &DrawCommand) -> Vec<(u32, BindingKind)> {
     bindings
 }
 
-/// What compiling a pipeline needs; shared by the threads doing it.
-struct PipelineContext<'a> {
-    device: &'a wgpu::Device,
-    modules: &'a Mutex<HashMap<u64, wgpu::ShaderModule>>,
-    cache: Option<&'a wgpu::PipelineCache>,
+/// How long a frame waits for its new pipelines when draws need not. What the driver has in
+/// its cache arrives in time, so only pipelines it really has to compile come late.
+const PIPELINE_WAIT: Duration = Duration::from_millis(8);
+
+/// Whether draws without a finished pipeline are left out instead of waited for, changeable
+/// from any thread while the renderer runs.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineSetting(Arc<AtomicBool>);
+
+impl PipelineSetting {
+    pub fn set(&self, background: bool) {
+        self.0.store(background, Ordering::Relaxed);
+    }
+
+    fn background(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
-impl PipelineContext<'_> {
+/// Flips without use after which a pipeline is dropped. The driver's cache makes one quick to
+/// get back, while keeping thousands of them takes gigabytes of the driver's memory.
+const PIPELINE_EXPIRE_FLIPS: u64 = 18_000;
+/// How often unused pipelines are looked for, and parsed shaders thrown away.
+const CLEANUP_FLIPS: u64 = 1800;
+/// Bind groups kept. They keep their textures alive, and are rebuilt cheaply.
+const MAX_BIND_GROUPS: usize = 2048;
+
+/// A compiled pipeline, `None` if the host refused it, and the flip that last used it.
+struct KnownPipeline {
+    pipeline: Option<Arc<wgpu::RenderPipeline>>,
+    last_used: u64,
+}
+
+/// What compiling a pipeline needs.
+#[derive(Clone)]
+struct PipelineContext {
+    device: wgpu::Device,
+    modules: Arc<Mutex<HashMap<u64, wgpu::ShaderModule>>>,
+    cache: Option<wgpu::PipelineCache>,
+}
+
+/// A pipeline for a compiling thread to make.
+struct PipelineJob {
+    /// The boot it belongs to: shader ids start over with the next.
+    epoch: u64,
+    key: PipelineKey,
+    draw: Box<DrawCommand>,
+    layout: wgpu::PipelineLayout,
+    context: PipelineContext,
+}
+
+/// A compiled pipeline: its boot, its key and the pipeline, if the host accepted it.
+type FinishedPipeline = (u64, PipelineKey, Option<Arc<wgpu::RenderPipeline>>);
+
+/// Starts the threads compiling pipelines: creating one can take the driver a long time, and
+/// they only stop when the sender is dropped.
+fn spawn_pipeline_threads() -> (Sender<PipelineJob>, Receiver<FinishedPipeline>) {
+    let (jobs, job_receiver) = mpsc::channel::<PipelineJob>();
+    let (finished_sender, finished) = mpsc::channel();
+    let job_receiver = Arc::new(Mutex::new(job_receiver));
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
+    for _ in 0..threads {
+        let (job_receiver, finished_sender) = (Arc::clone(&job_receiver), finished_sender.clone());
+        let spawned =
+            std::thread::Builder::new().name("shocora-pipeline".into()).spawn(move || {
+                loop {
+                    let job = job_receiver.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                    let Ok(job) = job else { break };
+                    // A panic in the driver leaves that pipeline's draws out, and nobody waiting.
+                    let pipeline = catch_unwind(AssertUnwindSafe(|| {
+                        job.context.build(&job.draw, &job.layout).map(Arc::new)
+                    }))
+                    .unwrap_or(None);
+                    if finished_sender.send((job.epoch, job.key, pipeline)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            log::error!("cannot start a pipeline thread: {error}");
+        }
+    }
+    (jobs, finished)
+}
+
+impl PipelineContext {
     fn module(&self, shader: &ShaderModule) -> wgpu::ShaderModule {
         let known =
             self.modules.lock().unwrap_or_else(PoisonError::into_inner).get(&shader.id).cloned();
@@ -498,7 +578,7 @@ impl PipelineContext<'_> {
             multisample: wgpu::MultisampleState::default(),
             fragment,
             multiview_mask: None,
-            cache: self.cache,
+            cache: self.cache.as_ref(),
         })
     }
 }
@@ -652,10 +732,17 @@ pub struct LatteRenderer {
     surfaces: HashMap<SurfaceKey, HostSurface>,
     next_surface_id: u64,
     /// Filled from several threads at once when pipelines are compiled.
-    modules: Mutex<HashMap<u64, wgpu::ShaderModule>>,
+    modules: Arc<Mutex<HashMap<u64, wgpu::ShaderModule>>>,
     /// The driver's compiled shaders, kept between runs when the backend can.
     pipeline_cache: Option<(wgpu::PipelineCache, PathBuf)>,
-    pipelines: HashMap<(u64, u64, u64), Option<Arc<wgpu::RenderPipeline>>>,
+    pipelines: HashMap<(u64, u64, u64), KnownPipeline>,
+    /// Pipelines on their way, made by other threads.
+    compiling: HashSet<PipelineKey>,
+    pipeline_jobs: Sender<PipelineJob>,
+    finished_pipelines: Receiver<FinishedPipeline>,
+    /// Bumped on every reboot: pipelines of an earlier boot are dropped on arrival.
+    pipeline_epoch: u64,
+    pipeline_setting: PipelineSetting,
     resource_layouts: HashMap<Vec<(u32, BindingKind)>, wgpu::BindGroupLayout>,
     pipeline_layouts: HashMap<(Vec<(u32, BindingKind)>, bool), wgpu::PipelineLayout>,
     /// What vertex shaders stream out to, with its `group(2)`, if the adapter allows it.
@@ -679,13 +766,18 @@ pub struct LatteRenderer {
     generation: u64,
     upscaler: Upscaler,
     frame_generator: FrameGenerator,
-    streamer: Streamer,
+    /// Pictures for a second player: the TV's, then the GamePad's.
+    streamers: [Streamer; 2],
     /// How much larger than on the console the title's pictures are drawn.
     resolution: ResolutionScale,
     /// Tells whoever chooses the resolution when video memory ran out.
     memory_watch: MemoryWatch,
     /// Textures the title brought along: these never grow, whatever their size.
     uploaded: std::collections::HashSet<SurfaceKey>,
+    /// Surfaces the GPU drew to, whose contents only the host has.
+    drawn_to: HashSet<SurfaceKey>,
+    /// How often the arena started over, for tools.
+    arena_wraps: u64,
     /// Screens with a new image since the last flip.
     presented: Vec<Screen>,
     logged: std::collections::HashSet<String>,
@@ -826,6 +918,7 @@ impl LatteRenderer {
         });
         let stream = StreamOutput::new(&device);
 
+        let (pipeline_jobs, finished_pipelines) = spawn_pipeline_threads();
         Self {
             device,
             queue,
@@ -834,9 +927,14 @@ impl LatteRenderer {
             arena_group,
             surfaces: HashMap::new(),
             next_surface_id: 1,
-            modules: Mutex::new(HashMap::new()),
+            modules: Arc::default(),
             pipeline_cache: None,
             pipelines: HashMap::new(),
+            compiling: HashSet::new(),
+            pipeline_jobs,
+            finished_pipelines,
+            pipeline_epoch: 0,
+            pipeline_setting: PipelineSetting::default(),
             resource_layouts: HashMap::new(),
             pipeline_layouts: HashMap::new(),
             stream,
@@ -858,10 +956,12 @@ impl LatteRenderer {
             generation: 0,
             upscaler: Upscaler::default(),
             frame_generator: FrameGenerator::default(),
-            streamer: Streamer::default(),
+            streamers: Screen::ALL.map(Streamer::new),
             resolution: ResolutionScale::default(),
             memory_watch: MemoryWatch::default(),
             uploaded: std::collections::HashSet::new(),
+            drawn_to: HashSet::new(),
+            arena_wraps: 0,
             presented: Vec::new(),
             logged: std::collections::HashSet::new(),
             max_draws: std::env::var("SHOCORA_MAX_DRAWS").ok().and_then(|v| v.parse().ok()),
@@ -882,8 +982,9 @@ impl LatteRenderer {
     }
 
     /// Where a second player's pictures come from, while the renderer runs.
-    pub fn stream_tap(&self) -> StreamTap {
-        self.streamer.tap()
+    pub fn stream_tap(&self, screen: Screen) -> StreamTap {
+        let index = Screen::ALL.iter().position(|each| *each == screen).unwrap_or(0);
+        self.streamers[index].tap()
     }
 
     /// Handle to switch frame generation while the renderer runs.
@@ -997,6 +1098,7 @@ impl LatteRenderer {
     /// The surface `key` to draw to. One that was a texture so far becomes a target like any
     /// other, as all attachments of a draw must grow together.
     fn target_surface(&mut self, key: SurfaceKey, mip_count: u32) -> &mut HostSurface {
+        self.drawn_to.insert(key);
         if self.resolution.applies(&key) && self.uploaded.remove(&key) {
             self.surfaces.remove(&key);
         }
@@ -1015,6 +1117,17 @@ impl LatteRenderer {
         self.bind_groups.clear();
         self.feedback_copies.clear();
         self.resolution = resolution;
+    }
+
+    /// Lets go of a texture, which the next use uploads again. What became a render target in
+    /// the meantime stays: guest memory does not have its contents.
+    fn forget_texture(&mut self, key: SurfaceKey) {
+        if self.uploaded.remove(&key) && !self.drawn_to.contains(&key) {
+            self.surfaces.remove(&key);
+            self.feedback_copies.remove(&key);
+            // They would keep the texture alive.
+            self.bind_groups.clear();
+        }
     }
 
     fn upload(&mut self, upload: &TextureUpload) {
@@ -1158,44 +1271,62 @@ impl LatteRenderer {
         }
     }
 
-    /// Compiles the pipelines of `draws`, as many at a time as there are cores to spare.
+    /// Handle to choose whether draws wait for their pipelines while the renderer runs.
+    pub fn pipeline_setting(&self) -> PipelineSetting {
+        self.pipeline_setting.clone()
+    }
+
+    /// Has the pipelines of `draws` compiled, as many at a time as there are cores to spare.
     fn compile_pipelines(&mut self, draws: &[&DrawCommand]) {
-        let mut jobs: HashMap<PipelineKey, (&DrawCommand, wgpu::PipelineLayout)> = HashMap::new();
         for draw in draws {
             let key = pipeline_key(draw);
-            if !self.pipelines.contains_key(&key) && !jobs.contains_key(&key) {
-                let layout = self.pipeline_layout(&sorted_bindings(draw), draw.vertex.stream_out);
-                jobs.insert(key, (draw, layout));
+            if self.pipelines.contains_key(&key) || !self.compiling.insert(key) {
+                continue;
+            }
+            let layout = self.pipeline_layout(&sorted_bindings(draw), draw.vertex.stream_out);
+            let job = PipelineJob {
+                epoch: self.pipeline_epoch,
+                key,
+                draw: Box::new((*draw).clone()),
+                layout,
+                context: self.pipeline_context(),
+            };
+            if self.pipeline_jobs.send(job).is_err() {
+                log::error!("the pipeline threads are gone");
+                self.compiling.remove(&key);
+                self.pipelines.insert(key, KnownPipeline { pipeline: None, last_used: self.flips });
             }
         }
-        let jobs: Vec<_> = jobs.into_iter().collect();
-        let next = AtomicUsize::new(0);
-        let context = PipelineContext {
-            device: &self.device,
-            modules: &self.modules,
-            cache: self.pipeline_cache.as_ref().map(|(cache, _)| cache),
-        };
-        let compile = || {
-            let mut done = Vec::new();
-            while let Some((key, (draw, layout))) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                done.push((*key, context.build(draw, layout).map(Arc::new)));
+    }
+
+    fn pipeline_arrived(&mut self, (epoch, key, pipeline): FinishedPipeline) {
+        if epoch == self.pipeline_epoch {
+            self.compiling.remove(&key);
+            self.pipelines.insert(key, KnownPipeline { pipeline, last_used: self.flips });
+        }
+    }
+
+    /// Takes in compiled pipelines until none is left to come, or until `deadline` if any.
+    fn wait_for_pipelines(&mut self, deadline: Option<Instant>) {
+        while !self.compiling.is_empty() {
+            let arrived = match deadline {
+                Some(deadline) => self
+                    .finished_pipelines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                None => self.finished_pipelines.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match arrived {
+                Ok(finished) => self.pipeline_arrived(finished),
+                Err(_) => return,
             }
-            done
-        };
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
-        let threads = threads.min(jobs.len());
-        let compiled: Vec<_> = if threads <= 1 {
-            compile()
-        } else {
-            std::thread::scope(|scope| {
-                // Collected first: joining as they are spawned would compile one at a time.
-                #[allow(clippy::needless_collect)]
-                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(compile)).collect();
-                workers.into_iter().filter_map(|w| w.join().ok()).flatten().collect()
-            })
-        };
-        for (key, pipeline) in compiled {
-            self.pipelines.insert(key, pipeline);
+        }
+    }
+
+    /// Waits for the pipeline of `key` alone.
+    fn wait_for_pipeline(&mut self, key: PipelineKey) {
+        while self.compiling.contains(&key) {
+            let Ok(finished) = self.finished_pipelines.recv() else { return };
+            self.pipeline_arrived(finished);
         }
     }
 
@@ -1272,12 +1403,48 @@ impl LatteRenderer {
             .clone()
     }
 
+    /// The draw's pipeline; `None` leaves the draw out. Stream-out feeds later draws and shows
+    /// no picture that next frame's could replace, so it never goes without. It is compiled
+    /// right here, as waiting in line behind a new scene's other pipelines could take seconds.
     fn pipeline(&mut self, draw: &DrawCommand) -> Option<Arc<wgpu::RenderPipeline>> {
         let key = pipeline_key(draw);
         if !self.pipelines.contains_key(&key) {
-            self.compile_pipelines(&[draw]);
+            if draw.stream_only && !self.compiling.contains(&key) {
+                let layout = self.pipeline_layout(&sorted_bindings(draw), draw.vertex.stream_out);
+                let pipeline = self.pipeline_context().build(draw, &layout).map(Arc::new);
+                self.pipelines.insert(key, KnownPipeline { pipeline, last_used: self.flips });
+            } else {
+                self.compile_pipelines(&[draw]);
+                if draw.stream_only || !self.pipeline_setting.background() {
+                    self.wait_for_pipeline(key);
+                }
+            }
         }
-        self.pipelines.get(&key).cloned().flatten()
+        let flips = self.flips;
+        let known = self.pipelines.get_mut(&key)?;
+        known.last_used = flips;
+        known.pipeline.clone()
+    }
+
+    /// Lets go of what has not been needed for long, as Cemu does with its shader states.
+    fn clean_up_pipelines(&mut self) {
+        let flips = self.flips;
+        self.pipelines.retain(|_, known| {
+            // A refusal costs nothing to remember, and would be logged again.
+            known.pipeline.is_none()
+                || flips.saturating_sub(known.last_used) < PIPELINE_EXPIRE_FLIPS
+        });
+        // Parsed shaders are large, and only needed to make pipelines: threads compiling right
+        // now hold on to the map they got, and a shader needed again is parsed again.
+        self.modules = Arc::default();
+    }
+
+    fn pipeline_context(&self) -> PipelineContext {
+        PipelineContext {
+            device: self.device.clone(),
+            modules: Arc::clone(&self.modules),
+            cache: self.pipeline_cache.as_ref().map(|(cache, _)| cache.clone()),
+        }
     }
 
     fn sampler(&mut self, desc: SamplerDesc) -> wgpu::Sampler {
@@ -2034,21 +2201,27 @@ impl LatteRenderer {
             &mut self.generation,
             upscaled,
         );
-        let tv = self.presented.contains(&Screen::Tv);
-        self.streamer.update(
-            &self.device,
-            &self.queue,
-            tv.then(|| self.screen_targets.get(&Screen::Tv)).flatten(),
-            &self.blit_pipeline,
-            &self.blit_layout,
-            &self.blit_sampler,
-        );
+        for (screen, streamer) in Screen::ALL.into_iter().zip(&mut self.streamers) {
+            streamer.update(
+                &self.device,
+                &self.queue,
+                self.presented
+                    .contains(&screen)
+                    .then(|| self.screen_targets.get(&screen))
+                    .flatten(),
+                &self.blit_pipeline,
+                &self.blit_layout,
+                &self.blit_sampler,
+            );
+        }
         self.presented.clear();
         self.flips += 1;
         self.frame_draws = 0;
-        // Bind groups keep textures alive; the set is rebuilt cheaply.
-        if self.bind_groups.len() > 8192 {
+        if self.bind_groups.len() > MAX_BIND_GROUPS {
             self.bind_groups.clear();
+        }
+        if self.flips.is_multiple_of(CLEANUP_FLIPS) {
+            self.clean_up_pipelines();
         }
     }
 
@@ -2093,9 +2266,13 @@ impl LatteRenderer {
         self.save_pipeline_cache();
         self.surfaces.clear();
         self.uploaded.clear();
+        self.drawn_to.clear();
         self.resolution = ResolutionScale::default();
-        self.modules.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        // Threads still compiling keep the old map: its ids mean nothing from now on.
+        self.modules = Arc::default();
         self.pipelines.clear();
+        self.compiling.clear();
+        self.pipeline_epoch += 1;
         self.bind_groups.clear();
         self.feedback_copies.clear();
         self.pending_scan.clear();
@@ -2300,6 +2477,17 @@ fn clear_color(key: SurfaceKey, rgba: [f32; 4]) -> wgpu::Color {
 
 impl Drop for LatteRenderer {
     fn drop(&mut self) {
+        if std::env::var_os("SHOCORA_PROFILE").is_some() {
+            println!(
+                "renderer: {} surfaces ({} uploaded), {} pipelines, {} parsed shaders, {} bind groups, {} arena wraps",
+                self.surfaces.len(),
+                self.uploaded.len(),
+                self.pipelines.len(),
+                self.modules.lock().unwrap_or_else(PoisonError::into_inner).len(),
+                self.bind_groups.len(),
+                self.arena_wraps,
+            );
+        }
         self.save_pipeline_cache();
     }
 }
@@ -2314,11 +2502,13 @@ impl RenderBackend for LatteRenderer {
             self.execute(&commands[at + 1..]);
             return;
         }
-        // New pipelines stall the host's draw thread: compiled together up front,
-        // their cost does not add up.
+        // New pipelines stall the host's draw thread: compiled together up front on other
+        // threads, their cost does not add up.
         let new: Vec<&DrawCommand> = commands
             .iter()
             .filter_map(|command| match command {
+                // Stream-out is compiled when its turn comes: see `pipeline`.
+                RenderCommand::Draw(draw) if draw.stream_only => None,
                 RenderCommand::Draw(draw) => {
                     (!self.pipelines.contains_key(&pipeline_key(draw))).then_some(draw.as_ref())
                 }
@@ -2327,6 +2517,7 @@ impl RenderBackend for LatteRenderer {
                 | RenderCommand::ArenaWrap
                 | RenderCommand::Reset
                 | RenderCommand::Upload(_)
+                | RenderCommand::ForgetTexture(_)
                 | RenderCommand::SetResolution(_)
                 | RenderCommand::Clear { .. }
                 | RenderCommand::CopySurface { .. }
@@ -2337,6 +2528,8 @@ impl RenderBackend for LatteRenderer {
         if !new.is_empty() {
             self.compile_pipelines(&new);
         }
+        let deadline = self.pipeline_setting.background().then(|| Instant::now() + PIPELINE_WAIT);
+        self.wait_for_pipelines(deadline);
         for command in commands {
             match command {
                 RenderCommand::ClearScreen { screen, color } => self.clear_screen(*screen, *color),
@@ -2345,10 +2538,14 @@ impl RenderBackend for LatteRenderer {
                         self.queue.write_buffer(&self.arena, u64::from(*offset), bytes);
                     }
                 }
-                RenderCommand::ArenaWrap => self.submit(),
+                RenderCommand::ArenaWrap => {
+                    self.arena_wraps += 1;
+                    self.submit();
+                }
                 RenderCommand::Reset => self.reset(),
                 RenderCommand::SetResolution(resolution) => self.set_resolution(*resolution),
                 RenderCommand::Upload(upload) => self.upload(upload),
+                RenderCommand::ForgetTexture(key) => self.forget_texture(*key),
                 RenderCommand::Clear { color, depth } => self.clear(*color, *depth),
                 RenderCommand::Draw(draw) => {
                     self.frame_draws += 1;
@@ -2440,6 +2637,7 @@ pub async fn request_device(
             label: Some("shocora"),
             required_features: wanted_features(adapter),
             required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         })
         .await

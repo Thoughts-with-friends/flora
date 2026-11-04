@@ -12,6 +12,11 @@
 //! compile in the background while the block runs on the interpreter, so new
 //! code costs speed for a moment instead of a stall on the frame.
 //!
+//! Translating comes in two steps, because the interpreter is what makes a new scene stutter:
+//! a block is first translated as quickly as possible. When nothing more urgent is left, it is
+//! translated again with Cranelift's optimizations, and that code takes over. Blocks find each
+//! other through the page table, so the next time they jump there they get the faster code.
+//!
 //! Blocks jump straight to each other: a single dispatch loop would funnel every
 //! guest branch through one host call site, which the host CPU cannot predict.
 //!
@@ -22,13 +27,14 @@
 mod emit;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Condvar, Mutex, PoisonError,
         mpsc::{self, Receiver, Sender},
     },
+    time::{Duration, Instant},
 };
 
 use cranelift_codegen::{
@@ -49,6 +55,11 @@ const PAGE_BITS: u32 = 12;
 const PAGE_ENTRIES: usize = 1 << (PAGE_BITS - 2);
 /// Translation threads at most; the emulator and renderer need cores too.
 const MAX_WORKERS: usize = 6;
+/// Of those, how many also optimize: this can wait, and must not take cores from the guest.
+const OPTIMIZING_WORKERS: usize = 2;
+/// How often finished translations are taken in while running: making code executable means
+/// asking the system to change page protections.
+const COLLECT_INTERVAL: Duration = Duration::from_millis(1);
 
 /// What a block's helper calls need besides the registers.
 pub(crate) struct HelperContext {
@@ -84,6 +95,47 @@ unsafe extern "C" fn interpret_one<B: Bus>(
     }
 }
 
+/// What the workers have to do.
+#[derive(Default)]
+struct JobQueues {
+    /// Blocks the guest runs on the interpreter right now.
+    first: VecDeque<Job>,
+    /// Blocks with quickly made code, to be made faster when there is time.
+    optimize: VecDeque<Job>,
+    closed: bool,
+}
+
+/// The queues and how the workers wait for them.
+#[derive(Default)]
+struct JobBoard {
+    queues: Mutex<JobQueues>,
+    changed: Condvar,
+}
+
+impl JobBoard {
+    fn change(&self, change: impl FnOnce(&mut JobQueues)) {
+        change(&mut self.queues.lock().unwrap_or_else(PoisonError::into_inner));
+        self.changed.notify_all();
+    }
+
+    /// The most urgent job this worker takes, as soon as there is one; `None` when work is over.
+    fn next(&self, optimizes: bool) -> Option<Job> {
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if queues.closed {
+                return None;
+            }
+            let optimize = |queues: &mut JobQueues| {
+                if optimizes { queues.optimize.pop_front() } else { None }
+            };
+            if let Some(job) = queues.first.pop_front().or_else(|| optimize(&mut queues)) {
+                return Some(job);
+            }
+            queues = self.changed.wait(queues).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 /// Translated code of one guest address space.
 pub struct Jit {
     module: JITModule,
@@ -92,8 +144,11 @@ pub struct Jit {
     pages: Vec<Option<Box<Page>>>,
     /// Instruction count of blocks that are queued, or that failed to translate.
     untranslated: HashMap<u32, u32>,
-    jobs: Sender<Job>,
+    /// Blocks being translated for the first time, to optimize once that is done.
+    awaiting: HashMap<u32, Job>,
+    board: Arc<JobBoard>,
     finished: Receiver<Translated>,
+    last_collect: Instant,
     /// Bumped on invalidation: translations of older code are dropped on arrival.
     generation: u64,
     /// Waits for each translation instead of interpreting meanwhile.
@@ -157,26 +212,27 @@ fn compile_enter(module: &mut JITModule, isa: &OwnedTargetIsa) -> EnterFn {
 /// Starts the threads translating blocks.
 fn spawn_workers(
     isa: &OwnedTargetIsa,
+    optimizing_isa: &OwnedTargetIsa,
     pages: usize,
-    jobs: Receiver<Job>,
+    board: &Arc<JobBoard>,
     finished: &Sender<Translated>,
 ) {
     let count = std::thread::available_parallelism()
         .map_or(1, |n| n.get().saturating_sub(4))
         .clamp(1, MAX_WORKERS);
-    let jobs = Arc::new(Mutex::new(jobs));
-    for _ in 0..count {
-        let (isa, jobs, finished) = (Arc::clone(isa), Arc::clone(&jobs), finished.clone());
+    for index in 0..count {
+        let (isa, optimizing_isa) = (Arc::clone(isa), Arc::clone(optimizing_isa));
+        let (board, finished) = (Arc::clone(board), finished.clone());
         let spawned = std::thread::Builder::new().name("shocora-jit".into()).spawn(move || {
-            let mut worker = emit::Worker::new(Arc::clone(&isa), pages);
-            loop {
-                let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
-                let Ok(job) = job else { break };
+            let new_worker =
+                || emit::Worker::new(Arc::clone(&isa), Arc::clone(&optimizing_isa), pages);
+            let mut worker = new_worker();
+            while let Some(job) = board.next(index < OPTIMIZING_WORKERS) {
                 // A panic in the compiler must not lose the job: its block stays
                 // interpreted, and whoever waits for it hears about that.
                 let translated = catch_unwind(AssertUnwindSafe(|| worker.translate(&job)))
                     .unwrap_or_else(|_| {
-                        worker = emit::Worker::new(Arc::clone(&isa), pages);
+                        worker = new_worker();
                         job.failed()
                     });
                 if finished.send(translated).is_err() {
@@ -190,29 +246,34 @@ fn spawn_workers(
     }
 }
 
+/// The compiler for the host at an optimization level of Cranelift.
+#[allow(
+    clippy::expect_used,
+    reason = "no host without Cranelift support can run shocora at usable speed"
+)]
+fn host_isa(level: &str) -> OwnedTargetIsa {
+    let mut flags = settings::builder();
+    flags.set("opt_level", level).expect("known flag");
+    flags.set("use_colocated_libcalls", "false").expect("known flag");
+    flags.set("is_pic", "false").expect("known flag");
+    // Cranelift's tail calls rely on them.
+    flags.set("preserve_frame_pointers", "true").expect("known flag");
+    let verify = if cfg!(debug_assertions) { "true" } else { "false" };
+    flags.set("enable_verifier", verify).expect("known flag");
+    cranelift_native::builder()
+        .expect("host supported by Cranelift")
+        .finish(settings::Flags::new(flags))
+        .expect("valid flags")
+}
+
 impl Jit {
     /// Creates an empty code cache for the host CPU.
     ///
     /// # Panics
     /// If Cranelift does not support the host (shocora only targets ones it does).
-    #[allow(
-        clippy::expect_used,
-        reason = "no host without Cranelift support can run shocora at usable speed"
-    )]
     pub fn new() -> Self {
-        let mut flags = settings::builder();
-        let level = if std::env::var_os("SHOCORA_JIT_NONE").is_some() { "none" } else { "speed" };
-        flags.set("opt_level", level).expect("known flag");
-        flags.set("use_colocated_libcalls", "false").expect("known flag");
-        flags.set("is_pic", "false").expect("known flag");
-        // Cranelift's tail calls rely on them.
-        flags.set("preserve_frame_pointers", "true").expect("known flag");
-        let verify = if cfg!(debug_assertions) { "true" } else { "false" };
-        flags.set("enable_verifier", verify).expect("known flag");
-        let isa = cranelift_native::builder()
-            .expect("host supported by Cranelift")
-            .finish(settings::Flags::new(flags))
-            .expect("valid flags");
+        let isa = host_isa("none");
+        let optimizing_isa = host_isa("speed");
         let mut module = JITModule::new(JITBuilder::with_isa(
             Arc::clone(&isa),
             cranelift_module::default_libcall_names(),
@@ -220,16 +281,18 @@ impl Jit {
         let enter = compile_enter(&mut module, &isa);
         let pages: Vec<Option<Box<Page>>> =
             (0..1_usize << (32 - PAGE_BITS)).map(|_| None).collect();
-        let (jobs, job_receiver) = mpsc::channel();
+        let board = Arc::new(JobBoard::default());
         let (finished_sender, finished) = mpsc::channel();
-        spawn_workers(&isa, pages.as_ptr() as usize, job_receiver, &finished_sender);
+        spawn_workers(&isa, &optimizing_isa, pages.as_ptr() as usize, &board, &finished_sender);
         Self {
             module,
             enter,
             pages,
             untranslated: HashMap::new(),
-            jobs,
+            awaiting: HashMap::new(),
+            board,
             finished,
+            last_collect: Instant::now(),
             generation: 0,
             synchronous: std::env::var_os("SHOCORA_JIT_SYNC").is_some(),
             compiled_blocks: 0,
@@ -257,7 +320,16 @@ impl Jit {
     pub fn invalidate(&mut self, address: u32, size: u32) {
         self.generation += 1;
         self.untranslated.clear();
+        self.awaiting.clear();
         let end = address.saturating_add(size);
+        // What is waiting for optimizing elsewhere is still good, and would otherwise stay slow.
+        let generation = self.generation;
+        self.board.change(|queues| {
+            queues.optimize.retain_mut(|job| {
+                job.set_generation(generation);
+                !job.overlaps(address, end)
+            });
+        });
         let mut at = address & !3;
         while at < end {
             if let Some(page) = &mut self.pages[(at >> PAGE_BITS) as usize] {
@@ -302,20 +374,36 @@ impl Jit {
     /// Takes in what the workers finished. Everything becomes executable at once:
     /// changing page protection per block would be a large part of translating.
     fn collect(&mut self, first: Option<Translated>) {
+        self.last_collect = Instant::now();
         let batch: Vec<_> = first.into_iter().chain(self.finished.try_iter()).collect();
         if batch.is_empty() {
             return;
         }
-        let defined: Vec<_> = batch.iter().filter_map(|t| Some((t.pc, self.define(t)?))).collect();
+        let defined: Vec<_> =
+            batch.iter().filter_map(|t| Some((t.pc, t.optimized, self.define(t)?))).collect();
         if let Err(error) = self.module.finalize_definitions() {
             log::error!("JIT: cannot make code executable: {error}");
             return;
         }
-        for (pc, id) in defined {
+        let mut to_optimize = Vec::new();
+        for (pc, optimized, id) in defined {
             let code = self.module.get_finalized_function(id);
             self.insert(pc, code);
-            self.untranslated.remove(&pc);
-            self.compiled_blocks += 1;
+            if !optimized {
+                self.untranslated.remove(&pc);
+                self.compiled_blocks += 1;
+                to_optimize.extend(self.awaiting.remove(&pc).map(Job::into_optimized));
+            }
+        }
+        if !to_optimize.is_empty() {
+            self.board.change(|queues| queues.optimize.extend(to_optimize));
+        }
+    }
+
+    /// Takes in what the workers finished, unless that was just done.
+    fn collect_if_due(&mut self) {
+        if self.last_collect.elapsed() >= COLLECT_INTERVAL {
+            self.collect(None);
         }
     }
 
@@ -328,9 +416,8 @@ impl Jit {
         let job = emit::decode_block::<B>(pc, bus, self.generation)?;
         let count = job.instructions.len() as u32;
         self.untranslated.insert(pc, count);
-        if self.jobs.send(job).is_err() {
-            log::error!("the JIT threads are gone");
-        }
+        self.awaiting.insert(pc, job.clone());
+        self.board.change(|queues| queues.first.push_back(job));
         Ok(count)
     }
 
@@ -338,7 +425,7 @@ impl Jit {
     fn wait_for(&mut self, pc: u32) {
         while self.lookup(pc).is_none() {
             let Ok(translated) = self.finished.recv() else { return };
-            let failed = translated.pc == pc && translated.code.is_none();
+            let failed = translated.pc == pc && translated.code.is_none() && !translated.optimized;
             self.collect(Some(translated));
             if failed {
                 return;
@@ -361,7 +448,7 @@ impl Jit {
         let Some(memory) = bus.fast_memory() else {
             return crate::interpreter::run(state, bus, budget);
         };
-        self.collect(None);
+        self.collect_if_due();
         let budget = budget as i64;
         let mut context =
             HelperContext { bus: std::ptr::from_mut(bus).cast(), result: None, remaining: budget };
@@ -383,7 +470,7 @@ impl Jit {
             // SAFETY: `context.bus` is the live `bus`; nothing else uses it meanwhile.
             let bus = unsafe { &mut *context.bus.cast::<B>() };
             let count = self.queue(pc, bus)?;
-            self.collect(None);
+            self.collect_if_due();
             if self.synchronous {
                 self.wait_for(pc);
                 if self.lookup(pc).is_some() {
@@ -417,6 +504,12 @@ impl Jit {
             }
         }
         Ok(None)
+    }
+}
+
+impl Drop for Jit {
+    fn drop(&mut self) {
+        self.board.change(|queues| queues.closed = true);
     }
 }
 

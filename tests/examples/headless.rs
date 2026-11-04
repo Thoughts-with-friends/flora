@@ -26,6 +26,7 @@
 //! * `SHOCORA_MIN_SWAP_INTERVAL=n`: at least `n` vertical blanks per flip (2 caps at 30 fps).
 //! * `SHOCORA_SPEED=0.5|2|3|4`: how fast the title runs.
 //! * `SHOCORA_RES=n`: draws the title's pictures `n` times larger, up to 10240 wide.
+//! * `SHOCORA_BACKGROUND_SHADERS`: compiles shaders in the background, as the GUI does.
 //! * `SHOCORA_NET_HOST="ip[/prefix],port[,password]"`: lets a second player join (with
 //!   `SHOCORA_SHOTS`); see `netclient`.
 use std::{
@@ -41,22 +42,42 @@ use wiiu_emu::{Config, Emulator, GamePadState, GameSpeed, Status};
 
 /// The host's side of a second player, for a loop that polls.
 struct NetEvents {
-    pad: std::sync::Arc<std::sync::Mutex<Option<GamePadState>>>,
-    tap: shocora_render::StreamTap,
+    input: std::sync::Arc<std::sync::Mutex<Option<shocora_netplay::GuestInput>>>,
+    status: std::sync::Arc<std::sync::Mutex<shocora_netplay::HostStatus>>,
+    tv: shocora_render::StreamTap,
+    gamepad: shocora_render::StreamTap,
 }
 
 impl shocora_netplay::HostEvents for NetEvents {
-    fn input(&self, pad: Option<GamePadState>) {
-        *self.pad.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pad;
+    fn input(&self, input: Option<shocora_netplay::GuestInput>) {
+        *self.input.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = input;
     }
 
     fn streaming(&self, wanted: bool) {
-        self.tap.set_enabled(wanted);
+        self.tv.set_enabled(wanted);
+        self.gamepad.set_enabled(wanted);
     }
 
-    fn take_frame(&self) -> Option<shocora_netplay::Frame> {
-        let frame = self.tap.take()?;
-        Some(shocora_netplay::Frame { width: frame.width, height: frame.height, rgba: frame.rgba })
+    fn take_frames(&self) -> Vec<shocora_netplay::Frame> {
+        [
+            (shocora_netplay::Display::Tv, &self.tv),
+            (shocora_netplay::Display::GamePad, &self.gamepad),
+        ]
+        .into_iter()
+        .filter_map(|(display, tap)| {
+            let frame = tap.take()?;
+            Some(shocora_netplay::Frame {
+                display,
+                width: frame.width,
+                height: frame.height,
+                rgba: frame.rgba,
+            })
+        })
+        .collect()
+    }
+
+    fn status(&self) -> shocora_netplay::HostStatus {
+        self.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -102,6 +123,7 @@ fn create_renderer() -> Result<LatteRenderer, Box<dyn std::error::Error>> {
     let (device, queue) = pollster::block_on(request_device(&adapter))?;
     let mut renderer = LatteRenderer::new(device, queue);
     renderer.use_pipeline_cache(Path::new("shader_cache"), &adapter.get_info());
+    renderer.pipeline_setting().set(std::env::var_os("SHOCORA_BACKGROUND_SHADERS").is_some());
     renderer.frame_gen_setting().set(std::env::var_os("SHOCORA_FRAMEGEN").is_some());
     Ok(renderer)
 }
@@ -326,6 +348,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memory_watch = renderer.as_ref().map(LatteRenderer::memory_watch);
     let mut resolution_factor = emu.config.resolution_factor;
     let second_player = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let net_status = std::sync::Arc::new(std::sync::Mutex::new(shocora_netplay::HostStatus {
+        state: shocora_netplay::HostState::Running,
+        speed: "1x".to_owned(),
+        title: emu.title().map(wiiu_emu::TitleInfo::display_name).unwrap_or_default(),
+        ..shocora_netplay::HostStatus::default()
+    }));
     let net_host = match (std::env::var("SHOCORA_NET_HOST").ok(), &renderer) {
         (Some(text), Some(renderer)) => {
             let mut parts = text.splitn(3, ',');
@@ -334,8 +362,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config =
                 shocora_netplay::HostConfig::new(address, port, parts.next().unwrap_or_default())?;
             let events = NetEvents {
-                pad: std::sync::Arc::clone(&second_player),
-                tap: renderer.stream_tap(),
+                input: std::sync::Arc::clone(&second_player),
+                status: std::sync::Arc::clone(&net_status),
+                tv: renderer.stream_tap(Screen::Tv),
+                gamepad: renderer.stream_tap(Screen::Drc),
             };
             let host = shocora_netplay::Host::start(config, events)?;
             println!("netplay: listening on port {}", host.port());
@@ -363,6 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .filter(|p| frame >= p.frame && frame < p.frame + p.frames)
             .fold(0, |bits, p| bits | p.button);
+        let guest = *second_player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut pad = GamePadState::from_button_bits(held);
         // SHOCORA_TOUCH="frame,x,y,frames": a finger on the GamePad's screen.
         pad.touch = std::env::var("SHOCORA_TOUCH").ok().and_then(|text| {
@@ -370,6 +401,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let [at, x, y, length] = parts[..] else { return None };
             (frame >= at && frame < at + length).then_some((x as u16, y as u16))
         });
+        // The guest's touches reach the GamePad, its buttons the Pro Controller.
+        let guest_touch = guest.and_then(|guest: shocora_netplay::GuestInput| guest.pad.touch);
+        pad.touch = pad.touch.or(guest_touch);
         emu.set_gamepad(pad);
         // Like the GUI: what does not fit into video memory gets smaller.
         if let Some(factor) = memory_watch.as_ref().and_then(shocora_render::MemoryWatch::take) {
@@ -381,8 +415,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if net_host.is_some() {
-            let pad = *second_player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            emu.set_pro_controller(0, pad);
+            emu.set_pro_controller(0, guest.map(|guest| guest.pad));
+            let mut status = net_status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            status.instructions = emu.stats().instructions;
+            status.fps = flip_rates.last().map_or(0.0, |rate| *rate as f32);
         }
         // SHOCORA_RESET_AT=frame: the reset the GUI offers.
         if std::env::var("SHOCORA_RESET_AT").ok().and_then(|at| at.parse().ok()) == Some(frame) {

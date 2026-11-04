@@ -13,15 +13,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use shocora_netplay::{Client, ClientEvents, Frame};
+use shocora_netplay::{Client, ClientEvents, Display, Frame, GuestInput, HostStatus};
 use wiiu_emu::GamePadState;
 
 #[derive(Debug, Default)]
 struct Received {
     frames: u64,
+    gamepad_frames: u64,
     frame_bytes: u64,
     samples: u64,
     size: (u32, u32),
+    gamepad_size: (u32, u32),
+    status: Option<HostStatus>,
 }
 
 struct Recorder {
@@ -41,16 +44,22 @@ fn save_png(path: &Path, frame: &Frame) -> Result<(), Box<dyn std::error::Error>
 
 impl ClientEvents for Recorder {
     fn frame(&mut self, frame: Frame) {
-        let number = {
+        let (name, every, number) = {
             let mut received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
-            received.frames += 1;
             received.frame_bytes += frame.rgba.len() as u64;
-            received.size = (frame.width, frame.height);
-            received.frames
+            if frame.display == Display::Tv {
+                received.frames += 1;
+                received.size = (frame.width, frame.height);
+                ("net", 20, received.frames)
+            } else {
+                received.gamepad_frames += 1;
+                received.gamepad_size = (frame.width, frame.height);
+                ("net_gamepad", 10, received.gamepad_frames)
+            }
         };
-        // One picture per second at 20 fps.
-        if let Some(dir) = self.out.as_ref().filter(|_| number % 20 == 1) {
-            if let Err(error) = save_png(&dir.join(format!("net_{number:06}.png")), &frame) {
+        // One picture per second of each screen.
+        if let Some(dir) = self.out.as_ref().filter(|_| number % every == 1) {
+            if let Err(error) = save_png(&dir.join(format!("{name}_{number:06}.png")), &frame) {
                 eprintln!("picture {number}: {error}");
             }
         }
@@ -59,6 +68,10 @@ impl ClientEvents for Recorder {
     fn audio(&mut self, samples: &[i16]) {
         self.received.lock().unwrap_or_else(PoisonError::into_inner).samples +=
             samples.len() as u64;
+    }
+
+    fn status(&mut self, status: HostStatus) {
+        self.received.lock().unwrap_or_else(PoisonError::into_inner).status = Some(status);
     }
 
     fn changed(&mut self) {}
@@ -101,20 +114,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|(at, _, length)| now >= *at && now < at + length)
             .fold(0, |bits, (_, button, _)| bits | button);
         if last_bits != Some(bits) {
-            client.set_input(GamePadState::from_button_bits(bits));
+            client.set_input(GuestInput {
+                pad: GamePadState::from_button_bits(bits),
+                to_gamepad: false,
+            });
             last_bits = Some(bits);
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             last_report = Instant::now();
-            let (frames, size, samples) = {
-                let received = received.lock().unwrap_or_else(PoisonError::into_inner);
-                (received.frames, received.size, received.samples)
-            };
+            let received = received.lock().unwrap_or_else(PoisonError::into_inner);
             println!(
-                "{now:>4}s {:?} · {frames} pictures {size:?} · {:.1} s of sound",
+                "{now:>4}s {:?} · TV {} {:?} · GamePad {} {:?} · {:.1} s of sound · {:?}",
                 client.state(),
-                samples as f64 / 2.0 / 16_000.0
+                received.frames,
+                received.size,
+                received.gamepad_frames,
+                received.gamepad_size,
+                received.samples as f64 / 2.0 / 16_000.0,
+                received.status,
             );
+            drop(received);
         }
         std::thread::sleep(Duration::from_millis(20));
     }

@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::Path, sync::mpsc::SyncSender};
 
 use eframe::{egui, egui_wgpu};
 use shocora_render::{
-    FrameGenSetting, LatteRenderer, MemoryWatch, RenderCommand, RenderThread, Screen, ScreenImages,
-    StreamTap, UpscaleConfig, UpscaleSetting, wgpu,
+    FrameGenSetting, LatteRenderer, MemoryWatch, PipelineSetting, RenderCommand, RenderThread,
+    Screen, ScreenImages, StreamTap, UpscaleConfig, UpscaleSetting, wgpu,
 };
 
 /// Where the driver's compiled shaders stay between runs.
@@ -23,7 +23,9 @@ pub struct Presenter {
     screens: ScreenImages,
     upscale: UpscaleSetting,
     frame_gen: FrameGenSetting,
-    stream: StreamTap,
+    pipelines: PipelineSetting,
+    /// Where a second player's pictures come from: the TV's, then the GamePad's.
+    stream: [StreamTap; 2],
     memory_watch: MemoryWatch,
     device: wgpu::Device,
     egui_renderer: std::sync::Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
@@ -47,7 +49,8 @@ impl Presenter {
 
         let upscale = renderer.upscale_setting();
         let frame_gen = renderer.frame_gen_setting();
-        let stream = renderer.stream_tap();
+        let pipelines = renderer.pipeline_setting();
+        let stream = Screen::ALL.map(|screen| renderer.stream_tap(screen));
         let memory_watch = renderer.memory_watch();
         let render_thread = RenderThread::spawn(renderer).map_err(|e| e.to_string())?;
 
@@ -55,6 +58,7 @@ impl Presenter {
             screens: render_thread.screens(),
             upscale,
             frame_gen,
+            pipelines,
             stream,
             memory_watch,
             render_thread,
@@ -74,13 +78,18 @@ impl Presenter {
         self.frame_gen.set(enabled);
     }
 
+    /// Whether draws go on without pipelines still being compiled, from the next frame on.
+    pub fn set_background_shaders(&self, background: bool) {
+        self.pipelines.set(background);
+    }
+
     /// The factor that did not fit into video memory, if one did not since the last call.
     pub fn take_memory_shortage(&self) -> Option<u32> {
         self.memory_watch.take()
     }
 
-    /// Where a second player's pictures come from.
-    pub fn stream_tap(&self) -> StreamTap {
+    /// Where a second player's pictures come from: the TV's, then the GamePad's.
+    pub fn stream_taps(&self) -> [StreamTap; 2] {
         self.stream.clone()
     }
 

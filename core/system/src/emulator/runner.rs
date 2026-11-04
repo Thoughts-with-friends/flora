@@ -8,8 +8,9 @@ use super::{Emulator, MAIN_CORE, Status, bus::CoreBus};
 
 /// A blocked guest is checked this often for expired sleeps, alarms and the like.
 const IDLE_POLL: Duration = Duration::from_millis(1);
-/// The last part of a wait spins: sleeping can overshoot by this much.
-const SPIN_MARGIN: Duration = Duration::from_micros(1500);
+/// The last part of a wait for the vertical blank spins: sleeping can overshoot by this much.
+/// Spinning keeps a core busy, so it is as little as keeps frames on time.
+const SPIN_MARGIN: Duration = Duration::from_micros(500);
 /// Further behind the display than this, real time is given up and re-based.
 const MAX_LAG_FRAMES: u32 = 4;
 
@@ -61,7 +62,13 @@ impl Emulator {
                 if !self.config.paced || Instant::now() >= deadline {
                     break;
                 }
-                wait_until(deadline.min(Instant::now() + IDLE_POLL));
+                // Sleeps, like Cemu's waiting threads: spinning through every idle moment would
+                // keep a whole core at full load for nothing.
+                if deadline.saturating_duration_since(Instant::now()) > IDLE_POLL + SPIN_MARGIN {
+                    std::thread::sleep(IDLE_POLL);
+                } else {
+                    wait_until(deadline);
+                }
                 if let Err(error) =
                     self.os.begin_frame(&mut self.cores[MAIN_CORE], &mut self.memory)
                 {

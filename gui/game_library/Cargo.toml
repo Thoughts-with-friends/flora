@@ -1,6 +1,6 @@
 [package]
 name = "shocora_game_library"
-description = "Game library: ROM directories from roms.json and the titles found in them"
+description = "Game library: the titles found in the ROM directories"
 authors.workspace = true
 categories.workspace = true
 edition.workspace = true

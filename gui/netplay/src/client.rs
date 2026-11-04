@@ -11,11 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wiiu_peripherals::GamePadState;
-
 use crate::{
     DEFAULT_PORT, LinkState, PEER_TIMEOUT, PING_INTERVAL,
-    protocol::{self, Frame, Message, Refusal},
+    protocol::{self, Frame, GuestInput, HostStatus, Message, Refusal},
 };
 
 /// What keeps a guest out.
@@ -44,6 +42,8 @@ pub trait ClientEvents {
     fn frame(&mut self, frame: Frame);
     /// Interleaved stereo at [`protocol::AUDIO_RATE`].
     fn audio(&mut self, samples: &[i16]);
+    /// The host's state, about once a second.
+    fn status(&mut self, status: HostStatus);
     /// The link changed; a good moment to draw again.
     fn changed(&mut self);
 }
@@ -52,7 +52,7 @@ pub trait ClientEvents {
 struct Shared {
     writer: Mutex<Option<TcpStream>>,
     /// Sent again after reconnecting.
-    pad: Mutex<GamePadState>,
+    input: Mutex<GuestInput>,
     stop: AtomicBool,
 }
 
@@ -111,10 +111,10 @@ impl Client {
     }
 
     /// Sends the controller's state to the host.
-    pub fn set_input(&self, pad: GamePadState) {
-        *self.shared.pad.lock().unwrap_or_else(PoisonError::into_inner) = pad;
+    pub fn set_input(&self, input: GuestInput) {
+        *self.shared.input.lock().unwrap_or_else(PoisonError::into_inner) = input;
         // A failure shows on the reading side, which then reconnects.
-        let _ = self.shared.send(&Message::Input(pad));
+        let _ = self.shared.send(&Message::Input(input));
     }
 }
 
@@ -152,10 +152,11 @@ fn wait(shared: &Shared, time: Duration) -> bool {
     shared.stop.load(Ordering::Relaxed)
 }
 
+/// The host's IPv4 address, the only kind hosts listen on: `localhost` may give IPv6 first.
 fn resolve(address: &str) -> io::Result<SocketAddr> {
     address
         .to_socket_addrs()?
-        .next()
+        .find(SocketAddr::is_ipv4)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such address"))
 }
 
@@ -239,8 +240,8 @@ fn serve(
     state: &Mutex<LinkState>,
 ) -> io::Result<()> {
     *shared.writer.lock().unwrap_or_else(PoisonError::into_inner) = Some(reading.try_clone()?);
-    let pad = *shared.pad.lock().unwrap_or_else(PoisonError::into_inner);
-    shared.send(&Message::Input(pad))?;
+    let input = *shared.input.lock().unwrap_or_else(PoisonError::into_inner);
+    shared.send(&Message::Input(input))?;
     let started = Instant::now();
     let ended = Arc::new(AtomicBool::new(false));
     let pinger = std::thread::Builder::new().name("shocora-net-ping".into()).spawn({
@@ -277,7 +278,8 @@ fn receive(
 ) -> io::Result<()> {
     loop {
         match protocol::read_message(reading)? {
-            Message::Video(jpeg) => match protocol::decode_frame(&jpeg) {
+            Message::Status(status) => events.status(status),
+            Message::Video(display, jpeg) => match protocol::decode_frame(display, &jpeg) {
                 Ok(frame) => events.frame(frame),
                 Err(error) => log::warn!("netplay: bad picture: {error}"),
             },
@@ -299,10 +301,13 @@ fn receive(
 mod tests {
     use std::sync::mpsc;
 
-    use wiiu_peripherals::controller::VpadButtons;
+    use wiiu_peripherals::{GamePadState, controller::VpadButtons};
 
     use super::*;
-    use crate::host::{Host, HostConfig, HostEvents};
+    use crate::{
+        host::{Host, HostConfig, HostEvents},
+        protocol::{Display, HostState},
+    };
 
     const LOOPBACK: &str = "127.0.0.1";
 
@@ -318,20 +323,21 @@ mod tests {
     fn guest_events() -> impl FnOnce() -> RecordingGuest + Send + 'static {
         let (frames, _f) = mpsc::channel();
         let (audio, _a) = mpsc::channel();
-        move || RecordingGuest { frames, audio }
+        let (statuses, _s) = mpsc::channel();
+        move || RecordingGuest { frames, audio, statuses }
     }
     const PATIENCE: Duration = Duration::from_secs(10);
 
     /// Reports everything the host's side sees.
     struct RecordingHost {
-        inputs: Mutex<mpsc::Sender<Option<GamePadState>>>,
+        inputs: Mutex<mpsc::Sender<Option<GuestInput>>>,
         wanted: Mutex<mpsc::Sender<bool>>,
         streaming: AtomicBool,
     }
 
     impl HostEvents for RecordingHost {
-        fn input(&self, pad: Option<GamePadState>) {
-            let _ = self.inputs.lock().unwrap().send(pad);
+        fn input(&self, input: Option<GuestInput>) {
+            let _ = self.inputs.lock().unwrap().send(input);
         }
 
         fn streaming(&self, wanted: bool) {
@@ -339,27 +345,42 @@ mod tests {
             let _ = self.wanted.lock().unwrap().send(wanted);
         }
 
-        fn take_frame(&self) -> Option<Frame> {
-            self.streaming.swap(false, Ordering::Relaxed).then(|| Frame {
-                width: 16,
-                height: 8,
-                rgba: [10, 200, 30, 255].repeat(16 * 8),
-            })
+        fn take_frames(&self) -> Vec<Frame> {
+            if !self.streaming.swap(false, Ordering::Relaxed) {
+                return Vec::new();
+            }
+            [(Display::Tv, 16), (Display::GamePad, 8)]
+                .map(|(display, width)| Frame {
+                    display,
+                    width,
+                    height: 8,
+                    rgba: [10, 200, 30, 255].repeat(width as usize * 8),
+                })
+                .to_vec()
+        }
+
+        fn status(&self) -> HostStatus {
+            HostStatus { state: HostState::Running, fps: 30.0, ..HostStatus::default() }
         }
     }
 
     struct RecordingGuest {
-        frames: mpsc::Sender<(u32, u32)>,
+        frames: mpsc::Sender<(Display, u32, u32)>,
         audio: mpsc::Sender<Vec<i16>>,
+        statuses: mpsc::Sender<HostStatus>,
     }
 
     impl ClientEvents for RecordingGuest {
         fn frame(&mut self, frame: Frame) {
-            let _ = self.frames.send((frame.width, frame.height));
+            let _ = self.frames.send((frame.display, frame.width, frame.height));
         }
 
         fn audio(&mut self, samples: &[i16]) {
             let _ = self.audio.send(samples.to_vec());
+        }
+
+        fn status(&mut self, status: HostStatus) {
+            let _ = self.statuses.send(status);
         }
 
         fn changed(&mut self) {}
@@ -367,7 +388,7 @@ mod tests {
 
     struct Rig {
         host: Host,
-        inputs: mpsc::Receiver<Option<GamePadState>>,
+        inputs: mpsc::Receiver<Option<GuestInput>>,
         wanted: mpsc::Receiver<bool>,
     }
 
@@ -400,22 +421,34 @@ mod tests {
         let rig = start_host();
         let (frames_tx, frames) = mpsc::channel();
         let (audio_tx, audio) = mpsc::channel();
+        let (statuses_tx, statuses) = mpsc::channel();
         let address = format!("{LOOPBACK}:{}", rig.host.port());
         let client = Client::start(&address, "", move || RecordingGuest {
             frames: frames_tx,
             audio: audio_tx,
+            statuses: statuses_tx,
         })
         .unwrap();
 
         eventually("the link", || matches!(client.state(), LinkState::Connected { .. }));
         assert_eq!(rig.wanted.recv_timeout(PATIENCE), Ok(true));
-        assert_eq!(frames.recv_timeout(PATIENCE), Ok((16, 8)));
+        assert_eq!(frames.recv_timeout(PATIENCE), Ok((Display::Tv, 16, 8)));
+        assert_eq!(frames.recv_timeout(PATIENCE), Ok((Display::GamePad, 8, 8)));
+        let status = statuses.recv_timeout(PATIENCE).unwrap();
+        assert_eq!((status.state, status.fps), (HostState::Running, 30.0));
 
-        // A held button reaches the host (the first input is the idle one sent on joining).
-        client.set_input(GamePadState::from_button_bits(VpadButtons::A.bits()));
+        // A held button and a touch reach the host (the first input is the idle one sent on
+        // joining).
+        let pad = GamePadState {
+            touch: Some((100, 200)),
+            ..GamePadState::from_button_bits(VpadButtons::A.bits())
+        };
+        client.set_input(GuestInput { pad, to_gamepad: true });
         loop {
-            let pad = rig.inputs.recv_timeout(PATIENCE).unwrap().unwrap();
-            if pad.held == VpadButtons::A {
+            let input = rig.inputs.recv_timeout(PATIENCE).unwrap().unwrap();
+            if input.pad.held == VpadButtons::A {
+                assert_eq!(input.pad.touch, Some((100, 200)));
+                assert!(input.to_gamepad);
                 break;
             }
         }
@@ -450,9 +483,11 @@ mod tests {
         drop(free);
         let (frames, _f) = mpsc::channel();
         let (audio, _a) = mpsc::channel();
+        let (statuses, _s) = mpsc::channel();
         let client = Client::start(&format!("{LOOPBACK}:{port}"), "", move || RecordingGuest {
             frames,
             audio,
+            statuses,
         })
         .unwrap();
         eventually("the report", || matches!(client.state(), LinkState::Unreachable(_)));
@@ -470,9 +505,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (frames, _f) = mpsc::channel();
         let (audio, _a) = mpsc::channel();
+        let (statuses, _s) = mpsc::channel();
         let client = Client::start(&format!("{LOOPBACK}:{port}"), "", move || RecordingGuest {
             frames,
             audio,
+            statuses,
         })
         .unwrap();
         // Answers the greeting, then never says anything again but keeps the socket open.
@@ -489,8 +526,9 @@ mod tests {
         let guest = || {
             let (frames, _f) = mpsc::channel();
             let (audio, _a) = mpsc::channel();
+            let (statuses, _s) = mpsc::channel();
             let address = address.clone();
-            Client::start(&address, "", move || RecordingGuest { frames, audio }).unwrap()
+            Client::start(&address, "", move || RecordingGuest { frames, audio, statuses }).unwrap()
         };
         let first = guest();
         eventually("the first guest", || matches!(first.state(), LinkState::Connected { .. }));
@@ -522,40 +560,123 @@ mod tests {
 
     #[test]
     fn a_guest_from_another_network_is_refused() {
-        // The listener takes loopback connections, but this host only admits another network.
-        let probe = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let config = HostConfig { prefix: 32, ..HostConfig::new("127.0.0.2", port, "").unwrap() };
-        let (inputs, _i) = mpsc::channel();
-        let (wanted, _w) = mpsc::channel();
-        let events = RecordingHost {
+        // Everything on loopback is this machine, which is always let in: refuses by hand.
+        let listener = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let guest = Client::start(&format!("{LOOPBACK}:{port}"), "", guest_events()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        crate::host::refuse(stream, Refusal::Network).unwrap();
+        let refused = LinkState::Refused(Refusal::Network);
+        eventually("the refusal", || guest.state() == refused);
+    }
+
+    fn silent_host_events() -> RecordingHost {
+        let (inputs, _) = mpsc::channel();
+        let (wanted, _) = mpsc::channel();
+        RecordingHost {
             inputs: Mutex::new(inputs),
             wanted: Mutex::new(wanted),
             streaming: AtomicBool::new(false),
-        };
-        let _host = Host::start(config, events).unwrap();
-        // Comes from 127.0.0.1 to 127.0.0.2.
-        let guest = Client::start(&format!("127.0.0.2:{port}"), "", guest_events()).unwrap();
-        let refused = LinkState::Refused(Refusal::Network);
-        eventually("the refusal", || guest.state() == refused);
+        }
+    }
+
+    /// A host on a network address lets a window on this machine in at any of its addresses.
+    #[test]
+    fn this_machine_joins_at_any_of_its_addresses() {
+        // A link-local address of an adapter that is down cannot be reached by anyone.
+        let reachable: Vec<String> = crate::local_addresses()
+            .iter()
+            .filter(|local| !local.address.is_loopback() && !local.address.is_link_local())
+            .map(|local| local.address.to_string())
+            .collect();
+        // Machines without a network have nothing to try this on.
+        let Some(first) = reachable.first() else { return };
+        let config = HostConfig::new(&format!("{first}/32"), 0, "").unwrap();
+        let host = Host::start(config, silent_host_events()).unwrap();
+        let port = host.port();
+        let mut addresses = vec![LOOPBACK.to_owned(), "localhost".to_owned()];
+        addresses.extend(reachable.iter().cloned());
+        for address in addresses {
+            let guest = Client::start(&format!("{address}:{port}"), "", guest_events()).unwrap();
+            let start = Instant::now();
+            while !matches!(guest.state(), LinkState::Connected { .. }) {
+                assert!(start.elapsed() < PATIENCE, "{address}: {:?}", guest.state());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(guest);
+            eventually("the seat to free up", || host.state() == LinkState::Waiting);
+        }
+    }
+
+    /// The default: a host on a loopback address only listens there.
+    #[test]
+    fn a_loopback_host_listens_on_loopback_only() {
+        let config = HostConfig::new(LOOPBACK, 0, "").unwrap();
+        let host = Host::start(config, silent_host_events()).unwrap();
+        let port = host.port();
+        let guest = Client::start(&format!("localhost:{port}"), "", guest_events()).unwrap();
+        eventually("the link", || matches!(guest.state(), LinkState::Connected { .. }));
+        drop(guest);
+
+        let others = crate::local_addresses()
+            .into_iter()
+            .filter(|local| !local.address.is_loopback() && !local.address.is_link_local());
+        for other in others {
+            let at = SocketAddr::from((other.address, port));
+            assert!(
+                TcpStream::connect_timeout(&at, CONNECT_TIMEOUT).is_err(),
+                "{}",
+                other.interface
+            );
+        }
+    }
+
+    #[test]
+    fn hosts_refuse_addresses_of_other_machines() {
+        // From the block reserved for documentation: never a real adapter's.
+        let config = HostConfig::new("192.0.2.1", 0, "").unwrap();
+        assert!(Host::start(config, silent_host_events()).is_err());
+    }
+
+    #[test]
+    fn a_network_is_as_large_as_the_adapter_says() {
+        for local in crate::local_addresses() {
+            let config = HostConfig::new(&local.address.to_string(), 0, "").unwrap();
+            assert_eq!(config.prefix, local.prefix, "{}", local.interface);
+        }
     }
 
     #[test]
     fn hosts_admit_their_own_network_only() {
         let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
-        let home = HostConfig::new(" 192.168.1.10 ", 0, "").unwrap();
+        let home = HostConfig::new(" 192.168.1.10/24 ", 0, "").unwrap();
+        let at = ip("192.168.1.10");
         assert_eq!(home.network(), "192.168.1.0/24");
-        assert!(home.admits(ip("192.168.1.200")));
-        assert!(home.admits(ip("::ffff:192.168.1.200")));
-        assert!(!home.admits(ip("192.168.2.10")));
-        assert!(!home.admits(ip("8.8.8.8")));
-        assert!(!home.admits(ip("fe80::1")));
+        assert!(home.admits(ip("192.168.1.200"), at));
+        assert!(home.admits(ip("::ffff:192.168.1.200"), at));
+        assert!(!home.admits(ip("192.168.2.10"), at));
+        assert!(!home.admits(ip("8.8.8.8"), at));
+        assert!(!home.admits(ip("fe80::1"), at));
 
         let wide = HostConfig::new("10.1.2.3/16", 0, "").unwrap();
+        let at = ip("10.1.2.3");
         assert_eq!(wide.network(), "10.1.0.0/16");
-        assert!(wide.admits(ip("10.1.200.1")));
-        assert!(!wide.admits(ip("10.2.0.1")));
+        assert!(wide.admits(ip("10.1.200.1"), at));
+        assert!(!wide.admits(ip("10.2.0.1"), at));
+
+        // Two machines on a VPN, whose network spans a whole /8.
+        let vpn = HostConfig::new("26.1.2.3/8", 0, "").unwrap();
+        let at = ip("26.1.2.3");
+        assert_eq!(vpn.network(), "26.0.0.0/8");
+        assert!(vpn.admits(ip("26.200.3.4"), at));
+        assert!(!vpn.admits(ip("27.62.81.253"), at));
+
+        // This machine, at whichever address, even one off the host's network.
+        assert!(home.admits(ip("127.0.0.1"), ip("127.0.0.1")));
+        assert!(home.admits(ip("::1"), ip("::1")));
+        assert!(home.admits(ip("26.1.2.3"), ip("26.1.2.3")));
+        // Another machine that merely reached this one at that address.
+        assert!(!home.admits(ip("26.200.3.4"), ip("26.1.2.3")));
 
         assert!(HostConfig::new("not an address", 0, "").is_err());
         assert!(HostConfig::new("10.0.0.1/33", 0, "").is_err());

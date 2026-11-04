@@ -15,8 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         app:
-          - package: shocora_egui
-            app_name: shocora_egui
+          - package: shocora
+            app_name: shocora
 
         target:
           # - target: aarch64-apple-darwin

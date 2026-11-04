@@ -1,27 +1,33 @@
-//! A second player on the local network.
+//! A second player on the local network or a VPN.
 //!
 //! ```text
 //!   host: runs the title                     guest: only a screen and a controller
 //!   ───────────────────                      ─────────────────────────────────────
 //!   TV, thinned to 20 fps ── JPEG ─────────► shown
+//!   GamePad, thinned to 10 fps ── JPEG ────► shown next to it
+//!   status, once a second ────────────────► status bar
 //!   sound, 48 kHz → 16 kHz ── PCM ─────────► played, upsampled by the audio output
-//!   Pro Controller 1 ◄───── buttons, sticks  keyboard and controllers
+//!   Pro Controller 1 or GamePad ◄── buttons, sticks, touch  keyboard, controllers, mouse
 //!   ping ◄──────────────────────────────────► ping: 3 s of silence ends the link
 //! ```
 //!
-//! One TCP connection carries everything. The host listens on the address it is given and
-//! only lets in guests from that address's network; a password is optional. The password
-//! itself never travels, but nothing is encrypted: anyone on the network can see the pictures,
-//! and could try to guess the password from a recorded greeting.
+//! One TCP connection carries everything. A host given a loopback address can only be reached
+//! from this machine. Any other address makes it listen on all of this machine's addresses, but
+//! it only lets in this machine and guests from that address's network. A password is optional.
+//! The password itself never travels, but nothing is encrypted: anyone on the network can see
+//! the pictures, and could try to guess the password from a recorded greeting.
 pub mod client;
 pub mod host;
 pub mod protocol;
 
-use std::time::Duration;
+use std::{net::Ipv4Addr, time::Duration};
 
 pub use client::{Client, ClientEvents};
 pub use host::{Host, HostConfig, HostEvents};
-pub use protocol::{DEFAULT_PORT, Frame, Refusal};
+use if_addrs::IfAddr;
+pub use protocol::{
+    DEFAULT_PORT, Display, Frame, FrameRate, GuestInput, HostState, HostStatus, Refusal,
+};
 
 /// How often each side asks whether the other is still there.
 pub const PING_INTERVAL: Duration = Duration::from_secs(1);
@@ -46,10 +52,31 @@ pub enum LinkState {
     },
 }
 
-/// The address of this machine others on the network would use, if it has one.
-pub fn local_address() -> Option<std::net::IpAddr> {
-    // Connecting a UDP socket sends nothing: it only makes the system choose a route.
-    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("192.0.2.1", 9)).ok()?;
-    socket.local_addr().ok().map(|address| address.ip())
+/// An IPv4 address of this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalAddress {
+    /// The adapter's name, like `Radmin VPN`.
+    pub(crate) interface: String,
+    pub(crate) address: Ipv4Addr,
+    /// Bits of the address that make up the adapter's network.
+    pub(crate) prefix: u8,
+}
+
+/// This machine's IPv4 addresses; none if the system does not tell.
+pub(crate) fn local_addresses() -> Vec<LocalAddress> {
+    let interfaces = if_addrs::get_if_addrs().unwrap_or_else(|error| {
+        log::warn!("netplay: cannot list this machine's addresses: {error}");
+        Vec::new()
+    });
+    interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            IfAddr::V4(v4) => Some(LocalAddress {
+                interface: interface.name,
+                address: v4.ip,
+                prefix: v4.prefixlen,
+            }),
+            IfAddr::V6(_) => None,
+        })
+        .collect()
 }

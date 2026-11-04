@@ -402,6 +402,8 @@ pub enum RenderCommand {
     /// The console rebooted: shader ids start over and no surface survives.
     Reset,
     Upload(Box<TextureUpload>),
+    /// A texture nobody used for long: it is uploaded again from guest memory when needed.
+    ForgetTexture(SurfaceKey),
     Clear {
         color: Option<(SurfaceKey, u32, [f32; 4])>,
         depth: Option<DepthClear>,

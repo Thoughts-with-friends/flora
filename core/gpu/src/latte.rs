@@ -28,7 +28,7 @@ use crate::{
 };
 
 /// Size of the arena every vertex, index and uniform byte goes through.
-pub const ARENA_SIZE: u32 = 0x2000_0000;
+pub const ARENA_SIZE: u32 = 0x1000_0000;
 /// The end of the arena holds stream-out results, which outlive the rest.
 pub const STREAM_REGION_SIZE: u32 = 0x400_0000;
 /// Where the stream region starts.
@@ -39,6 +39,13 @@ const PARAMS_ALIGN: u32 = 256;
 const PARAMS_SIZE: usize = 32 + 4 * 16 * 4 + 36 + 16;
 /// Texture contents are re-checked once per this many frames at most.
 const TEXTURE_RECHECK_FRAMES: u64 = 2;
+/// Frames without use after which a texture is forgotten, as in Cemu's texture cache. Only
+/// what guest memory can restore is ever forgotten, never what the GPU drew.
+const TEXTURE_EXPIRE_FRAMES: u64 = 2000;
+/// How often to look for such textures.
+const TEXTURE_SWEEP_FRAMES: u64 = 120;
+/// Textures forgotten at a time: making room should not cost a stutter (Cemu does the same).
+const MAX_TEXTURES_FORGOTTEN: usize = 32;
 /// Bytes hashed per step when checking whether a texture changed.
 const HASH_STRIDE: usize = 64;
 
@@ -403,8 +410,31 @@ const fn masked_address(address: u32, tile: u32) -> u32 {
 }
 
 impl Latte {
-    pub const fn end_frame(&mut self) {
+    pub fn end_frame(&mut self) {
         self.frame += 1;
+        if self.frame.is_multiple_of(TEXTURE_SWEEP_FRAMES) {
+            self.forget_unused_textures();
+        }
+    }
+
+    /// Frees the host's copies of textures that were not used for long.
+    fn forget_unused_textures(&mut self) {
+        let frame = self.frame;
+        let targets = &self.host_surfaces;
+        let expired: Vec<SurfaceKey> = self
+            .textures
+            .iter()
+            .filter(|(key, known)| {
+                frame.wrapping_sub(known.last_check) >= TEXTURE_EXPIRE_FRAMES
+                    && !targets.contains_key(&(key.address, key.width, key.height))
+            })
+            .take(MAX_TEXTURES_FORGOTTEN)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            self.textures.remove(&key);
+            self.commands.push(RenderCommand::ForgetTexture(key));
+        }
     }
 
     fn arena_reserve(&mut self, size: u32, align: u32) -> u32 {

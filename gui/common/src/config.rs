@@ -28,13 +28,18 @@ pub struct AppConfig {
     pub launcher_background: [u8; 4],
     /// Generate a picture between frames: a title made for 30 fps shows at 60.
     pub frame_generation: bool,
+    /// Compile shaders in the background: no stalls, but what uses a new one appears late.
+    pub background_shaders: bool,
     /// Picture behind the start screen's color.
     pub launcher_image: Option<PathBuf>,
     /// Language of the window: `eng` or `jpn`.
     pub language: String,
-    /// The host a guest last joined.
+    /// Directories scanned for titles.
+    pub rom_dirs: Vec<PathBuf>,
+    /// The host a guest joins.
     pub netplay_host: String,
-    /// This machine's address when hosting, optionally with `/prefix`.
+    /// This machine's address when hosting, optionally with `/prefix`. Open to this machine
+    /// only until told otherwise.
     pub netplay_address: String,
     /// How many times larger than on the console the title's pictures are drawn.
     pub resolution_factor: u32,
@@ -55,10 +60,12 @@ impl Default for AppConfig {
             swap_interval: None,
             launcher_background: [231, 234, 237, 255],
             frame_generation: false,
+            background_shaders: true,
             launcher_image: None,
             language: "jpn".to_owned(),
-            netplay_host: String::new(),
-            netplay_address: String::new(),
+            rom_dirs: Vec::new(),
+            netplay_host: "127.0.0.1".to_owned(),
+            netplay_address: "127.0.0.1".to_owned(),
             resolution_factor: 1,
             min_swap_interval: None,
         }
@@ -73,12 +80,22 @@ impl AppConfig {
 
     /// Loads `path`, falling back to defaults when missing or invalid.
     pub fn load(path: &Path) -> Self {
+        Self::read(path).unwrap_or_else(|error| {
+            log::warn!("{error}; using defaults");
+            Self::default()
+        })
+    }
+
+    /// Reads `path`; a missing file means the defaults.
+    ///
+    /// # Errors
+    /// Says what is wrong with a file that exists: it holds the user's settings, so it had
+    /// better not be overwritten.
+    pub fn read(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                log::warn!("{}: {e}; using defaults", path.display());
-                Self::default()
-            }),
-            Err(_) => Self::default(),
+            Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!("{}: {error}", path.display())),
         }
     }
 
@@ -107,7 +124,13 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let config = AppConfig { graphics_api: GraphicsApi::OpenGl, ..AppConfig::default() };
+        let config = AppConfig {
+            graphics_api: GraphicsApi::OpenGl,
+            rom_dirs: vec![PathBuf::from("D:\\Roms")],
+            netplay_host: "10.0.0.2".to_owned(),
+            netplay_address: "10.0.0.1/8".to_owned(),
+            ..AppConfig::default()
+        };
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(text.contains("graphics_api = \"opengl\""));
         assert_eq!(toml::from_str::<AppConfig>(&text).unwrap(), config);

@@ -2,13 +2,15 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use shocora_game_library::{DEFAULT_PATH, GameLibrary, RomPaths, RomPathsError};
+use shocora_game_library::{GameLibrary, LEGACY_PATH, legacy_rom_dirs};
 use shocora_gui_common::{
     config::AppConfig,
     console::{Console, ConsoleCommand},
     input::{Controllers, merge},
 };
-use shocora_netplay::{DEFAULT_PORT, HostConfig, LinkState, Refusal};
+use shocora_netplay::{
+    DEFAULT_PORT, FrameRate, HostConfig, HostState, HostStatus, LinkState, Refusal,
+};
 use shocora_render::{GraphicsApi, ResolutionScale, Screen, UpscaleMethod, upscale};
 use wiiu_emu::{GamePadState, GameSpeed, Status, VpadButtons};
 
@@ -16,19 +18,11 @@ use crate::{
     lang::{self, tr, trf},
     launcher::Launcher,
     netplay::{self, Netplay},
-    presenter::Presenter,
+    presenter::{Presenter, ScreenView},
 };
 
 /// Lines of guest output kept in the log panel.
 const LOG_LINES: usize = 500;
-
-/// The choices of the frame rate setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrameRate {
-    Title,
-    Max30,
-    Force60,
-}
 
 /// `width` x `height` drawn `factor` times larger, as far as the limit allows.
 fn scaled_size(factor: u32, width: u32, height: u32) -> String {
@@ -105,7 +99,7 @@ pub struct ShocoraApp {
     /// The controller's speed button was down at the last look: a press changes it once.
     speed_button_down: bool,
     controllers: Controllers,
-    /// Titles found in the directories listed in `roms.json`.
+    /// Titles found in the directories listed in `shocora.toml`.
     library: GameLibrary,
     library_error: Option<String>,
     show_library: bool,
@@ -141,18 +135,13 @@ impl ShocoraApp {
         let render = presenter.sender().ok_or("the render thread is not running")?;
         let console =
             Console::spawn(config.emulator_config(), render, move || ctx.request_repaint())?;
-        let mut config = config;
         lang::set_language(&config.language);
-        if config.netplay_address.is_empty() {
-            if let Some(address) = shocora_netplay::local_address() {
-                config.netplay_address = address.to_string();
-            }
-        }
         let picture_path = config
             .launcher_image
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
         presenter.set_frame_generation(config.frame_generation);
+        presenter.set_background_shaders(config.background_shaders);
         let mut app = Self {
             netplay: Netplay::Off,
             netplay_error: None,
@@ -185,6 +174,7 @@ impl ShocoraApp {
             boot_pending: false,
             touch: None,
         };
+        app.adopt_old_rom_list();
         app.reload_library();
         if let Some(path) = boot {
             app.boot(path);
@@ -200,46 +190,52 @@ impl ShocoraApp {
         self.save_config();
     }
 
-    /// Re-reads `roms.json` and rescans its directories.
+    /// The directories of a `roms.json` from before `shocora.toml` listed them.
+    fn adopt_old_rom_list(&mut self) {
+        if self.config.rom_dirs.is_empty() {
+            if let Some(dirs) = legacy_rom_dirs(Path::new(LEGACY_PATH)) {
+                self.config.rom_dirs = dirs;
+                self.save_config();
+            }
+        }
+    }
+
+    /// Re-reads the directories from `shocora.toml`, which may have been edited, and rescans.
     fn reload_library(&mut self) {
-        let path = std::path::Path::new(shocora_game_library::DEFAULT_PATH);
-        match RomPaths::load(path) {
-            Ok(paths) => {
-                self.library = GameLibrary::scan(&paths);
+        match AppConfig::read(&self.config_path) {
+            Ok(saved) => {
+                // Nothing saved yet: what is known so far must not get lost.
+                if self.config_path.exists() {
+                    self.config.rom_dirs = saved.rom_dirs;
+                }
+                self.library = GameLibrary::scan(&self.config.rom_dirs);
                 self.library_error = None;
                 self.log.extend(self.library.problems.iter().cloned());
                 self.log.push(trf("library.count", &[("count", &self.library.games.len())]));
             }
             Err(error) => {
                 self.library = GameLibrary::default();
-                self.library_error = Some(error.to_string());
+                self.library_error = Some(error);
             }
         }
     }
 
-    /// Asks for a directory of titles, adds it to `roms.json` and rescans.
+    /// Asks for a directory of titles, adds it to `shocora.toml` and rescans.
     fn pick_rom_folder(&mut self) {
         let Some(dir) = rfd::FileDialog::new().set_title(tr("dialog.rom_folder")).pick_folder()
         else {
             return;
         };
-        let path = Path::new(DEFAULT_PATH);
-        let mut paths = match RomPaths::load(path) {
-            Ok(paths) => paths,
-            Err(RomPathsError::Missing(_)) => RomPaths::default(),
-            Err(error) => {
-                // Never overwrite a file that only failed to parse: it holds the user's list.
-                self.log.push(error.to_string());
-                self.library_error = Some(error.to_string());
-                return;
-            }
-        };
-        if !paths.rom_dirs.contains(&dir) {
-            paths.rom_dirs.push(dir);
+        // Never overwrite a file that only failed to parse: it holds the user's list.
+        if let Err(error) = AppConfig::read(&self.config_path) {
+            self.log.push(error.clone());
+            self.library_error = Some(error);
+            return;
         }
-        if let Err(error) = paths.save(path) {
-            self.log.push(format!("{}: {error}", path.display()));
+        if !self.config.rom_dirs.contains(&dir) {
+            self.config.rom_dirs.push(dir);
         }
+        self.save_config();
         self.reload_library();
     }
 
@@ -299,6 +295,33 @@ impl ShocoraApp {
         self.title = snapshot.title;
         self.fps = snapshot.fps;
         self.instructions = snapshot.stats.instructions;
+        if let Netplay::Host(hosting) = &self.netplay {
+            hosting.publish(self.host_status());
+        }
+    }
+
+    /// What this emulator is doing, in the words of the status bars of both players.
+    fn host_status(&self) -> HostStatus {
+        HostStatus {
+            state: match (&self.status, self.paused) {
+                (Some(Status::Running), true) => HostState::Paused,
+                (Some(Status::Running), false) => HostState::Running,
+                (Some(Status::Exited(code)), _) => HostState::Exited(*code),
+                (Some(Status::Crashed(_)), _) => HostState::Crashed,
+                (Some(Status::Idle) | None, _) => HostState::Idle,
+            },
+            fps: self.fps,
+            rate: self.frame_rate(),
+            speed: self.speed.label().to_string(),
+            frame_generation: self.config.frame_generation,
+            xbrz: match self.config.upscale.method {
+                UpscaleMethod::None => 0,
+                UpscaleMethod::Xbrz => self.config.upscale.factor,
+            },
+            title: self.title.clone().unwrap_or_default(),
+            instructions: self.instructions,
+            player1: false,
+        }
     }
 
     fn poll_input(&mut self, ctx: &egui::Context) {
@@ -337,11 +360,12 @@ impl ShocoraApp {
         }
         if pad != self.last_gamepad {
             self.last_gamepad = pad;
-            // A guest's controller belongs to the host's second player.
-            if let Netplay::Guest(guest) = &self.netplay {
-                guest.client.set_input(pad);
-            } else {
-                self.console.send(ConsoleCommand::GamePad(pad));
+            match &mut self.netplay {
+                // A guest's controller belongs to the host's second player.
+                Netplay::Guest(guest) => guest.set_pad(pad),
+                // Who plays what depends on the guest, too.
+                Netplay::Host(hosting) => hosting.set_pad(pad),
+                Netplay::Off => self.console.send(ConsoleCommand::GamePad(pad)),
             }
         }
     }
@@ -367,10 +391,11 @@ impl ShocoraApp {
         };
         self.netplay_network = config.network();
         let address = config.address;
-        match netplay::host(config, commands, self.presenter.stream_tap()) {
-            Ok(host) => {
-                self.console.send(ConsoleCommand::AudioTap(Some(host.audio_sink())));
-                self.netplay = Netplay::Host(host);
+        let [tv, gamepad] = self.presenter.stream_taps();
+        match netplay::host(config, commands, tv, gamepad, self.last_gamepad) {
+            Ok(hosting) => {
+                self.console.send(ConsoleCommand::AudioTap(Some(hosting.host.audio_sink())));
+                self.netplay = Netplay::Host(hosting);
                 self.netplay_error = None;
                 self.save_config();
             }
@@ -402,6 +427,41 @@ impl ShocoraApp {
         self.netplay = Netplay::Off;
     }
 
+    /// What only applies while linked: the first player's rights on the host, and where the
+    /// buttons go on a guest.
+    fn netplay_controls(&mut self, ui: &mut egui::Ui) {
+        match &mut self.netplay {
+            Netplay::Off => {}
+            Netplay::Host(hosting) => {
+                let guest_here = matches!(hosting.host.state(), LinkState::Connected { .. });
+                let player1 = hosting.player1();
+                let label =
+                    if player1 { tr("netplay.take_player1") } else { tr("netplay.give_player1") };
+                if ui
+                    .add_enabled(guest_here, egui::Button::new(label))
+                    .on_hover_text(tr("netplay.give_player1_hint"))
+                    .clicked()
+                {
+                    hosting.set_player1(!player1);
+                }
+            }
+            Netplay::Guest(guest) => {
+                if guest.status().is_some_and(|status| status.player1) {
+                    ui.label(tr("netplay.you_are_player1"));
+                } else {
+                    let mut to_gamepad = guest.to_gamepad();
+                    if ui
+                        .checkbox(&mut to_gamepad, tr("netplay.to_gamepad"))
+                        .on_hover_text(tr("netplay.to_gamepad_hint"))
+                        .changed()
+                    {
+                        guest.set_to_gamepad(to_gamepad);
+                    }
+                }
+            }
+        }
+    }
+
     fn netplay_settings(&mut self, ui: &mut egui::Ui) {
         match self.netplay {
             Netplay::Off => {
@@ -430,7 +490,9 @@ impl ShocoraApp {
             Netplay::Host(_) | Netplay::Guest(_) => {
                 if ui.button(tr("netplay.disconnect")).clicked() {
                     self.stop_netplay();
+                    return;
                 }
+                self.netplay_controls(ui);
             }
         }
         if let Some(status) = self.netplay_status() {
@@ -481,6 +543,16 @@ impl ShocoraApp {
             .changed()
         {
             self.set_frame_generation(generate);
+        }
+        let mut background = self.config.background_shaders;
+        if ui
+            .checkbox(&mut background, tr("graphics.background_shaders"))
+            .on_hover_text(tr("graphics.background_shaders_hint"))
+            .changed()
+        {
+            self.config.background_shaders = background;
+            self.presenter.set_background_shaders(background);
+            self.save_config();
         }
         ui.separator();
         ui.label(tr("graphics.api"));
@@ -562,19 +634,16 @@ impl ShocoraApp {
         self.settings_tab = open.then_some(tab);
     }
 
-    /// The guest's screen: what the host sends.
+    /// The guest's screens: what the host sends, laid out like the host's.
     fn guest_screen(&mut self, ui: &mut egui::Ui) {
         let Netplay::Guest(guest) = &mut self.netplay else { return };
-        let Some(texture) = guest.texture(ui.ctx()) else {
+        let views = guest.views(ui.ctx());
+        if views.iter().all(Option::is_none) {
+            self.touch = None;
             ui.centered_and_justified(|ui| ui.label(tr("netplay.waiting_picture")));
             return;
-        };
-        let size = texture.size_vec2();
-        let available = ui.available_size();
-        let scale = (available.x / size.x).min(available.y / size.y).max(0.01);
-        ui.centered_and_justified(|ui| {
-            ui.add(egui::Image::new((texture.id(), size * scale)));
-        });
+        }
+        self.touch = show_screens(ui, views);
     }
 
     fn netplay_status(&self) -> Option<String> {
@@ -591,12 +660,12 @@ impl ShocoraApp {
         };
         match &self.netplay {
             Netplay::Off => self.netplay_error.as_ref().map(|error| format!("2P: {error}")),
-            Netplay::Host(host) => Some(trf(
+            Netplay::Host(hosting) => Some(trf(
                 "netplay.hosting",
                 &[
                     ("network", &self.netplay_network),
-                    ("port", &host.port()),
-                    ("state", &link(&host.state())),
+                    ("port", &hosting.host.port()),
+                    ("state", &link(&hosting.host.state())),
                 ],
             )),
             Netplay::Guest(guest) => Some(format!("2P: {}", link(&guest.client.state()))),
@@ -879,15 +948,13 @@ impl ShocoraApp {
                 .on_hover_text(hint)
                 .clicked()
         }
+        if matches!(self.netplay, Netplay::Guest(_)) {
+            self.guest_status_bar(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             let running = self.status == Some(Status::Running);
-            let state = match (&self.status, self.paused) {
-                (Some(Status::Running), true) => tr("status.paused").to_owned(),
-                (Some(Status::Running), false) => tr("status.running").to_owned(),
-                (Some(Status::Exited(code)), _) => trf("status.exited", &[("code", code)]),
-                (Some(Status::Crashed(_)), _) => tr("status.crashed").to_owned(),
-                (Some(Status::Idle) | None, _) => tr("status.idle").to_owned(),
-            };
+            let state = state_text(self.host_status().state);
             if running {
                 if setting(ui, state, tr("status.pause_hint")) {
                     self.console.send(if self.paused {
@@ -900,12 +967,7 @@ impl ShocoraApp {
                 ui.label(state);
             }
             ui.separator();
-            let rate = match self.frame_rate() {
-                FrameRate::Title => tr("status.rate_title"),
-                FrameRate::Max30 => tr("status.rate_max30"),
-                FrameRate::Force60 => tr("status.rate_force60"),
-            };
-            let fps = format!("{:.1} fps ({rate})", self.fps);
+            let fps = fps_text(self.fps, self.frame_rate());
             if setting(ui, fps, tr("status.rate_hint")) {
                 self.toggle_frame_rate();
             }
@@ -946,6 +1008,9 @@ impl ShocoraApp {
                 ui.separator();
                 ui.label(status);
             }
+            if matches!(self.netplay, Netplay::Host(_)) {
+                self.netplay_controls(ui);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let api = format!("{} ({})", self.active_api.label(), Presenter::backend_name());
                 if setting(ui, api, tr("status.api_hint")) {
@@ -961,7 +1026,44 @@ impl ShocoraApp {
         });
     }
 
-    /// Titles from `roms.json`; double-click or tr("library.boot") starts one.
+    /// What a guest's status bar shows: the host's state, which the guest cannot change.
+    fn guest_status_bar(&mut self, ui: &mut egui::Ui) {
+        let Netplay::Guest(guest) = &self.netplay else { return };
+        let linked = matches!(guest.client.state(), LinkState::Connected { .. });
+        let status = guest.status().filter(|_| linked).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(state_text(status.state));
+            ui.separator();
+            ui.label(fps_text(status.fps, status.rate));
+            ui.separator();
+            ui.label(trf("status.speed", &[("speed", &status.speed)]));
+            ui.separator();
+            ui.label(if status.frame_generation {
+                tr("status.framegen_on")
+            } else {
+                tr("status.framegen_off")
+            });
+            ui.separator();
+            ui.label(if status.xbrz == 0 {
+                tr("status.xbrz_off").to_owned()
+            } else {
+                format!("xBRZ {}x", status.xbrz)
+            });
+            ui.separator();
+            ui.label(if status.title.is_empty() { tr("status.no_title") } else { &status.title });
+            ui.separator();
+            #[allow(clippy::cast_precision_loss)]
+            let millions = format!("{:.1}", status.instructions as f64 / 1e6);
+            ui.label(trf("status.instructions", &[("millions", &millions)]));
+            if let Some(link) = self.netplay_status() {
+                ui.separator();
+                ui.label(link);
+            }
+            self.netplay_controls(ui);
+        });
+    }
+
+    /// Titles from `shocora.toml`'s directories; double-click or tr("library.boot") starts one.
     fn library_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading(tr("library.games"));
@@ -1140,59 +1242,85 @@ impl ShocoraApp {
 
     /// TV and GamePad side by side, scaled to fit while keeping aspect ratio.
     fn screens(&mut self, ui: &mut egui::Ui) {
-        let available = ui.available_size();
-        let sizes = Screen::ALL.map(|screen| {
-            self.presenter.view(screen).map_or_else(
-                || {
-                    let (w, h) = screen.default_size();
-                    #[allow(clippy::cast_precision_loss)]
-                    egui::vec2(w as f32, h as f32)
-                },
-                |view| view.size,
-            )
-        });
-        let spacing = ui.spacing().item_spacing.x;
-        let total_width = sizes.iter().map(|s| s.x).sum::<f32>();
-        let max_height = sizes.iter().map(|s| s.y).fold(0.0, f32::max);
-        let scale = ((available.x - spacing) / total_width).min(available.y / max_height).max(0.01);
+        let views = Screen::ALL.map(|screen| self.presenter.view(screen));
+        self.touch = show_screens(ui, views);
+    }
+}
 
-        let mut touch = None;
-        ui.horizontal_centered(|ui| {
-            for (screen, size) in Screen::ALL.into_iter().zip(sizes) {
-                let size = size * scale;
-                match self.presenter.view(screen) {
-                    // The GamePad's screen is a touch screen: the mouse is the finger.
-                    Some(view) if screen == Screen::Drc => {
-                        let response = ui
-                            .add(egui::Image::new((view.texture, size)).sense(egui::Sense::drag()));
-                        touch = touch_position(&response);
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                    }
-                    Some(view) => {
-                        ui.add(egui::Image::new((view.texture, size)));
-                    }
-                    None => {
-                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                        let label = match screen {
-                            Screen::Tv => "TV",
-                            Screen::Drc => "GamePad",
-                        };
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            egui::FontId::proportional(16.0),
-                            egui::Color32::DARK_GRAY,
-                        );
+/// TV and GamePad side by side, scaled to fit while keeping aspect ratio. Returns where the
+/// mouse touches the GamePad's screen.
+fn show_screens(ui: &mut egui::Ui, views: [Option<ScreenView>; 2]) -> Option<(u16, u16)> {
+    let available = ui.available_size();
+    let sizes = [0, 1].map(|index| {
+        views[index].map_or_else(
+            || {
+                let (w, h) = Screen::ALL[index].default_size();
+                #[allow(clippy::cast_precision_loss)]
+                egui::vec2(w as f32, h as f32)
+            },
+            |view| view.size,
+        )
+    });
+    let spacing = ui.spacing().item_spacing.x;
+    let total_width = sizes.iter().map(|s| s.x).sum::<f32>();
+    let max_height = sizes.iter().map(|s| s.y).fold(0.0, f32::max);
+    let scale = ((available.x - spacing) / total_width).min(available.y / max_height).max(0.01);
+
+    let mut touch = None;
+    ui.horizontal_centered(|ui| {
+        for ((screen, size), view) in Screen::ALL.into_iter().zip(sizes).zip(views) {
+            let size = size * scale;
+            match view {
+                // The GamePad's screen is a touch screen: the mouse is the finger.
+                Some(view) if screen == Screen::Drc => {
+                    let response =
+                        ui.add(egui::Image::new((view.texture, size)).sense(egui::Sense::drag()));
+                    touch = touch_position(&response);
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
+                Some(view) => {
+                    ui.add(egui::Image::new((view.texture, size)));
+                }
+                None => {
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                    let label = match screen {
+                        Screen::Tv => "TV",
+                        Screen::Drc => "GamePad",
+                    };
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::DARK_GRAY,
+                    );
+                }
             }
-        });
-        self.touch = touch;
+        }
+    });
+    touch
+}
+
+fn state_text(state: HostState) -> String {
+    match state {
+        HostState::Paused => tr("status.paused").to_owned(),
+        HostState::Running => tr("status.running").to_owned(),
+        HostState::Exited(code) => trf("status.exited", &[("code", &code)]),
+        HostState::Crashed => tr("status.crashed").to_owned(),
+        HostState::Idle => tr("status.idle").to_owned(),
     }
+}
+
+fn fps_text(fps: f32, rate: FrameRate) -> String {
+    let rate = match rate {
+        FrameRate::Title => tr("status.rate_title"),
+        FrameRate::Max30 => tr("status.rate_max30"),
+        FrameRate::Force60 => tr("status.rate_force60"),
+    };
+    format!("{fps:.1} fps ({rate})")
 }
 
 /// Where the mouse button holds `response`, in pixels of the GamePad's screen. A drag that
