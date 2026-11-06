@@ -18,6 +18,8 @@ pub const SHT_RPL_FILEINFO: u32 = 0x8000_0004;
 pub const SHF_WRITE: u32 = 0x1;
 pub const SHF_ALLOC: u32 = 0x2;
 pub const SHF_EXECINSTR: u32 = 0x4;
+/// Thread-local storage (`.tdata`, `.thrbss`); the RPL toolchain's own bit.
+pub const SHF_RPL_TLS: u32 = 0x0400_0000;
 /// Section data is zlib-compressed, prefixed by its inflated size.
 pub const SHF_RPL_ZLIB: u32 = 0x0800_0000;
 

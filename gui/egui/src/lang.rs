@@ -92,9 +92,8 @@ mod tests {
     /// Every `tr("key")` and `trf("key"` in the sources, and whether the files agree.
     #[test]
     fn the_sources_and_the_files_use_the_same_keys() {
-        let sources = [include_str!("app.rs"), include_str!("launcher.rs")];
         let mut used = BTreeSet::new();
-        for source in sources {
+        for source in sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) {
             for call in ["tr(", "trf("] {
                 for piece in source.split(call).skip(1) {
                     // A long call has its key on the next line.
@@ -109,6 +108,22 @@ mod tests {
         assert!(used.len() > 50, "only {} keys found", used.len());
         assert_eq!(used.difference(&known).collect::<Vec<_>>(), Vec::<&String>::new(), "no text");
         assert_eq!(known.difference(&used).collect::<Vec<_>>(), Vec::<&String>::new(), "unused");
+    }
+
+    /// Every source file under `dir` but this one, whose tests ask for keys that do not exist.
+    fn sources(dir: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|n| n != "lang.rs")
+            {
+                found.push(std::fs::read_to_string(&path).unwrap());
+            }
+        }
+        found
     }
 
     #[test]

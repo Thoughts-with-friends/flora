@@ -705,6 +705,7 @@ impl Latte {
                 kind,
                 comp_sel: [comp(16), comp(19), comp(22), comp(25)],
                 comparison,
+                compare_function: ((sampler_word0 >> 26) & 7) as u8,
             },
             words,
         ))
@@ -856,6 +857,7 @@ impl Latte {
             key.push(signature.kind as u8);
             key.extend_from_slice(&signature.comp_sel);
             key.push(u8::from(signature.comparison));
+            key.push(signature.compare_function);
         }
         let hash = xxh3_64(&key);
         self.key_buffer = key;

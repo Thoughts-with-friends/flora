@@ -63,9 +63,12 @@ pub fn dispatch(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
     // untouched: undo the return value the thunk wrote.
     let arguments = (ctx.cpu.gpr[3], ctx.cpu.gpr[4], ctx.cpu.fpr[1]);
     let generation = ctx.os.callbacks.generation;
+    // A callback can borrow the core of a thread that is already blocked; its
+    // calls did not block and keep their results.
+    let blocked_before = ctx.os.coreinit.threads.current_is_blocked();
     call(ctx, index)?;
     let callback_switched = ctx.os.callbacks.generation != generation;
-    if !callback_switched && ctx.os.coreinit.threads.current_is_blocked() {
+    if !callback_switched && !blocked_before && ctx.os.coreinit.threads.current_is_blocked() {
         (ctx.cpu.gpr[3], ctx.cpu.gpr[4], ctx.cpu.fpr[1]) = arguments;
     }
     // Scheduling waits until no callback is borrowing the core.

@@ -593,7 +593,7 @@ impl<'a> Translator<'a> {
                 let swizzled = self.swizzle_texel(signature, &bits);
                 self.write_tex_result(op, &swizzled);
             }
-            tex::FETCH4 if signature.dim == TextureDim::D2 => {
+            tex::FETCH4 if signature.dim != TextureDim::D3 => {
                 let call = self.sample_call(op, signature, unit as u32, &tex_name, &sampler_name);
                 let bits = if matches!(signature.kind, TextureKind::Uint) {
                     call
@@ -708,9 +708,13 @@ impl<'a> Translator<'a> {
                 };
                 format!("textureSampleGrad({tex_name}, {sampler_name}, {coords}, {h}, {v}{offset})")
             }
-            tex::FETCH4 if signature.dim == TextureDim::D2 => {
+            tex::FETCH4 if signature.dim != TextureDim::D3 => {
                 // Like Cemu, a small bias against rounding down when point sampling.
-                let coords = format!("{coords} + vec2<f32>(0.0001)");
+                let coords = if signature.dim == TextureDim::D2 {
+                    format!("{coords} + vec2<f32>(0.0001)")
+                } else {
+                    coords
+                };
                 if signature.kind == TextureKind::Depth {
                     format!("textureGather({tex_name}, {sampler_name}, {coords}{offset})")
                 } else {
@@ -726,6 +730,26 @@ impl<'a> Translator<'a> {
             tex::SAMPLE_C | tex::SAMPLE_C_L | tex::SAMPLE_C_LZ => {
                 let reference_slot = if op.opcode == tex::SAMPLE_C_L { 2 } else { 3 };
                 let reference = self.coord(op, reference_slot);
+                if !signature.comparison {
+                    // The host compares only depth surfaces through comparison samplers:
+                    // read the value and compare here.
+                    let value = if signature.kind == TextureKind::Depth {
+                        format!(
+                            "textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0{offset})"
+                        )
+                    } else {
+                        format!(
+                            "textureSampleLevel({tex_name}, {sampler_name}, {coords}, 0.0{offset}).x"
+                        )
+                    };
+                    let passed = compare_expression(signature.compare_function, &reference, &value);
+                    let result = format!("select(0.0, 1.0, {passed})");
+                    return if signature.kind == TextureKind::Depth {
+                        result
+                    } else {
+                        format!("vec4<f32>({result}, 0.0, 0.0, 1.0)")
+                    };
+                }
                 if in_pixel && op.opcode == tex::SAMPLE_C {
                     format!(
                         "textureSampleCompare({tex_name}, {sampler_name}, {coords}, {reference}{offset})"
@@ -738,7 +762,13 @@ impl<'a> Translator<'a> {
             }
             other => {
                 log::warn!("unhandled TEX opcode {other:#x}");
-                "vec4<f32>(0.0)".to_owned()
+                match signature.kind {
+                    TextureKind::Depth => "0.0",
+                    TextureKind::Float => "vec4<f32>(0.0)",
+                    TextureKind::Uint => "vec4<u32>(0u)",
+                    TextureKind::Sint => "vec4<i32>(0)",
+                }
+                .to_owned()
             }
         }
     }
@@ -1017,6 +1047,21 @@ impl<'a> Translator<'a> {
             stream_out: self.stream_out,
         }
     }
+}
+
+/// `reference OP value` for `DEPTH_COMPARE_FUNCTION` `function`.
+fn compare_expression(function: u8, reference: &str, value: &str) -> String {
+    let op = match function {
+        1 => "<",
+        2 => "==",
+        3 => "<=",
+        4 => ">",
+        5 => "!=",
+        6 => ">=",
+        7 => return "true".to_owned(),
+        _ => return "false".to_owned(),
+    };
+    format!("({reference} {op} {value})")
 }
 
 fn address_register(mode: u32) -> String {

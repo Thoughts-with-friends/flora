@@ -55,6 +55,14 @@ fn create(
     let mut record = ThreadRecord::new(context, priority);
     record.detached = attr & ATTR_DETACHED != 0;
 
+    // A thread created again at the same address starts with fresh TLS.
+    if let Some(old) = ctx.os.coreinit.threads.threads.get(&thread).map(|r| r.tls_block) {
+        if old != 0 {
+            if let Some(heap) = ctx.os.coreinit.heaps.default_heap_mut() {
+                heap.free(old);
+            }
+        }
+    }
     ctx.memory.fill(thread, super::OS_THREAD_SIZE, 0)?;
     #[allow(clippy::cast_possible_truncation)]
     {
@@ -229,6 +237,33 @@ fn thread_return(ctx: &mut HleContext<'_>) -> Result<(), HleError> {
 #[hle_export(lib = "coreinit", name = "OSGetCurrentThread")]
 fn os_get_current_thread(ctx: &mut HleContext<'_>) -> u32 {
     ctx.os.coreinit.threads.current
+}
+
+/// `__tls_get_addr(tls_index*)`: address of a thread-local variable of the
+/// current thread. Each thread's block is a copy of the module's TLS image,
+/// made on first use (as Cafe OS does).
+#[hle_export(lib = "coreinit", name = "__tls_get_addr")]
+fn tls_get_addr(ctx: &mut HleContext<'_>, index: GuestPtr<u32>) -> Result<u32, HleError> {
+    let module = ctx.memory.read_u32(index.address())?;
+    let offset = ctx.memory.read_u32(index.address() + 4)?;
+    let Some(image) = ctx.os.coreinit.tls_image.filter(|image| image.module_index == module) else {
+        return Err(HleError::Fatal(format!("__tls_get_addr: no TLS module {module}")));
+    };
+    let thread = ctx.os.coreinit.threads.current;
+    let Some(block) = ctx.os.coreinit.threads.threads.get(&thread).map(|r| r.tls_block) else {
+        return Err(HleError::Fatal(format!("__tls_get_addr: unknown thread {thread:#010x}")));
+    };
+    if block != 0 {
+        return Ok(block + offset);
+    }
+    let size = image.size.max(4);
+    let block = match ctx.os.coreinit.heaps.default_heap_mut().and_then(|h| h.alloc(size, 0x20)) {
+        Some(block) => block,
+        None => ctx.os.registry.allocate_data(size, 0x20),
+    };
+    ctx.memory.copy_within(block, image.start, image.size)?;
+    with_thread(ctx, thread, |record| record.tls_block = block)?;
+    Ok(block + offset)
 }
 
 #[hle_export(lib = "coreinit", name = "OSGetDefaultThread")]

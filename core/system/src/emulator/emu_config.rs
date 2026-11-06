@@ -28,6 +28,10 @@ pub struct Config {
     pub min_swap_interval: Option<u32>,
     /// Host directory holding per-title cheat codes (`<dir>/<title id>.txt`).
     pub cheats_dir: PathBuf,
+    /// System storage (`mlc01`) searched in order for installed updates.
+    pub mlc_dirs: Vec<PathBuf>,
+    /// Let titles that refuse to start without an update start without one.
+    pub skip_update_check: bool,
 }
 
 impl Default for Config {
@@ -44,6 +48,8 @@ impl Default for Config {
             resolution_factor: 1,
             min_swap_interval: None,
             cheats_dir: PathBuf::from("cheats"),
+            mlc_dirs: wiiu_title::update::default_mlc_dirs(),
+            skip_update_check: true,
         }
     }
 }

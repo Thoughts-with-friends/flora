@@ -106,6 +106,7 @@ pub const EXPORTS: &[HleExport] = &[
     api::OS_EXIT_THREAD,
     api::THREAD_RETURN,
     api::OS_GET_CURRENT_THREAD,
+    api::TLS_GET_ADDR,
     api::OS_GET_DEFAULT_THREAD,
     api::OS_GET_THREAD_PRIORITY,
     api::OS_SET_THREAD_PRIORITY,

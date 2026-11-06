@@ -124,6 +124,7 @@ impl CafeOs {
         let mut allocator = LinearAllocator::new(TEXT, MEM2, LOADER);
         let module = wiiu_rpl::load(&file, name, memory, &mut allocator, &mut self.registry)?;
         log::info!("loaded {name}: entry {:#010x}, segments {:x?}", module.entry, module.segments);
+        self.coreinit.tls_image = module.tls;
 
         let heap_start = allocator.cursor(SegmentKind::Data).next_multiple_of(HEAP_ALIGN);
         let heap_size = u32::try_from(MEM2.end() - u64::from(heap_start)).unwrap_or(0);

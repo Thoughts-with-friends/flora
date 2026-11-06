@@ -84,6 +84,10 @@ pub const LOCKED_CACHE: Region = Region::new("LOCKED_CACHE", 0xFFC0_0000, 0x000C
 /// Linear windows onto tiled surfaces (see `gx2::aperture`).
 pub const TILING_APERTURE: Region = Region::new("TILING_APERTURE", 0xE800_0000, 0x0200_0000);
 
+/// Overlay arena: mapped only once the title calls `OSEnableOverlayArena`
+/// (as on hardware, where it is memory borrowed from the system).
+pub const OVERLAY_ARENA: Region = Region::new("OVERLAY_ARENA", 0xA000_0000, 0x1C00_0000);
+
 /// Every region mapped for a game process.
 pub const GAME_REGIONS: [Region; 9] =
     [TEXT, HLE, MEM2, FOREGROUND, TILING_APERTURE, MEM1, LOADER, SHARED, LOCKED_CACHE];
@@ -102,8 +106,9 @@ pub const fn effective_to_physical(address: u32) -> Option<u32> {
         Some(address - MEM2.start + MEM2_PHYSICAL_BASE)
     } else if MEM1.contains(address) {
         Some(address - MEM1.start + MEM1_PHYSICAL_BASE)
-    } else if FOREGROUND.contains(address) {
-        // Scan buffers live here; the bucket is not remapped.
+    } else if FOREGROUND.contains(address) || OVERLAY_ARENA.contains(address) {
+        // Scan buffers live here; the bucket is not remapped. The overlay
+        // arena is not remapped either: its range collides with no other.
         Some(address)
     } else {
         None
@@ -116,7 +121,7 @@ pub const fn physical_to_effective(address: u32) -> Option<u32> {
         Some(address - MEM2_PHYSICAL_BASE + MEM2.start)
     } else if address < MEM1.size {
         Some(address + MEM1.start)
-    } else if FOREGROUND.contains(address) {
+    } else if FOREGROUND.contains(address) || OVERLAY_ARENA.contains(address) {
         Some(address)
     } else {
         None
@@ -129,8 +134,9 @@ mod tests {
 
     #[test]
     fn regions_do_not_overlap() {
-        for (i, a) in GAME_REGIONS.iter().enumerate() {
-            for b in &GAME_REGIONS[i + 1..] {
+        let all: Vec<Region> = GAME_REGIONS.into_iter().chain([OVERLAY_ARENA]).collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
                 let disjoint = a.end() <= b.start as u64 || b.end() <= a.start as u64;
                 assert!(disjoint, "{} overlaps {}", a.name, b.name);
             }

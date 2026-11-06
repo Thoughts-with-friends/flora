@@ -20,6 +20,7 @@ serde = { workspace = true }
 toml = "0.9"
 wiiu_emu = { workspace = true }
 wiiu_peripherals = { workspace = true }
+wiiu_title = { workspace = true }
 
 [lints]
 workspace = true

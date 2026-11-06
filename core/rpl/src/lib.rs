@@ -22,5 +22,8 @@ pub mod rpl;
 
 pub use allocator::LinearAllocator;
 pub use error::LoadError;
-pub use loader::{ImportKind, ImportResolver, LoadedModule, SegmentAllocator, SegmentKind, load};
+pub use loader::{
+    ImportKind, ImportResolver, LoadedModule, SegmentAllocator, SegmentKind, TLS_MODULE_INDEX,
+    TlsImage, load,
+};
 pub use rpl::{FileInfo, RplFile};

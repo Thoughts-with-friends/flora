@@ -6,10 +6,10 @@ use wiiu_memory::Memory;
 use crate::{
     LoadError, RplFile,
     elf::{
-        RELA_SIZE, Rela, SHN_ABS, SHN_UNDEF, SHT_NOBITS, SHT_RELA, SHT_RPL_CRCS, SHT_RPL_FILEINFO,
-        SHT_RPL_IMPORTS, SYMBOL_SIZE, Symbol, name_at,
+        RELA_SIZE, Rela, SHF_RPL_TLS, SHN_ABS, SHN_UNDEF, SHT_NOBITS, SHT_RELA, SHT_RPL_CRCS,
+        SHT_RPL_FILEINFO, SHT_RPL_IMPORTS, SYMBOL_SIZE, Symbol, name_at,
     },
-    relocation::{self, R_PPC_REL24, TRAMPOLINE_SIZE, Trampolines},
+    relocation::{self, R_PPC_DTPMOD32, R_PPC_DTPREL32, R_PPC_REL24, TRAMPOLINE_SIZE, Trampolines},
     rpl::Section,
 };
 
@@ -59,7 +59,25 @@ pub struct LoadedModule {
     pub segments: HashMap<SegmentKind, (u32, u32)>,
     /// Exports, relocated to their final addresses.
     pub exports: HashMap<String, u32>,
+    /// The module's thread-local storage, if it has any.
+    pub tls: Option<TlsImage>,
 }
+
+/// TLS index of the main executable. System RPLs are HLE and have no TLS, so
+/// the RPX is the only module that ever needs one.
+pub const TLS_MODULE_INDEX: u32 = 1;
+
+/// Initial contents of a module's thread-local storage: every thread gets a
+/// copy of `size` bytes from `start` on its first `__tls_get_addr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsImage {
+    pub module_index: u32,
+    pub start: u32,
+    pub size: u32,
+}
+
+/// `STT_TLS`: the symbol's value is an offset into the TLS block.
+const STT_TLS: u8 = 6;
 
 /// Link-time extent of one segment and where it was placed.
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +188,25 @@ pub fn load(
         }
     }
 
+    // TLS sections are laid out contiguously in the data segment.
+    let tls_sections: Vec<&Section> = file
+        .sections
+        .iter()
+        .filter(|s| s.header.flags & SHF_RPL_TLS != 0 && segment_of(s).is_some())
+        .collect();
+    let tls = tls_sections.iter().min_by_key(|s| s.header.address).and_then(|first| {
+        let end =
+            tls_sections.iter().map(|s| s.header.address + s.memory_size()).max().unwrap_or(0);
+        Some((
+            first.header.address,
+            TlsImage {
+                module_index: TLS_MODULE_INDEX,
+                start: section_address(first)?,
+                size: end - first.header.address,
+            },
+        ))
+    });
+
     // 3. Relocate.
     let mut symbol_cache: HashMap<(usize, u32), u32> = HashMap::new();
     for rela_section in file.sections.iter().filter(|s| s.header.kind == SHT_RELA) {
@@ -178,6 +215,21 @@ pub fn load(
         let symtab_index = rela_section.header.link as usize;
         for entry in rela_section.data.as_chunks::<RELA_SIZE>().0 {
             let rela = Rela::parse(entry, 0)?;
+            let place = target_address + (rela.offset - target.header.address);
+            if matches!(rela.kind, R_PPC_DTPMOD32 | R_PPC_DTPREL32) {
+                let Some((link_start, image)) = tls else {
+                    return Err(LoadError::UnsupportedRelocation(rela.kind));
+                };
+                let word = if rela.kind == R_PPC_DTPMOD32 {
+                    image.module_index
+                } else {
+                    #[allow(clippy::cast_sign_loss)]
+                    tls_offset(file, symtab_index, rela.symbol, link_start)?
+                        .wrapping_add(rela.addend as u32)
+                };
+                memory.write_u32(place, word)?;
+                continue;
+            }
             let symbol_value = match symbol_cache.get(&(symtab_index, rela.symbol)) {
                 Some(&value) => value,
                 None => {
@@ -194,7 +246,6 @@ pub fn load(
             };
             #[allow(clippy::cast_sign_loss)]
             let value = symbol_value.wrapping_add(rela.addend as u32);
-            let place = target_address + (rela.offset - target.header.address);
             relocation::apply(memory, rela.kind, place, value, &mut trampolines)?;
         }
     }
@@ -226,6 +277,28 @@ pub fn load(
         stack_size: info.stack_size,
         segments,
         exports,
+        tls: tls.map(|(_, image)| image),
+    })
+}
+
+/// Offset of a TLS symbol from the start of the module's TLS block.
+fn tls_offset(
+    file: &RplFile,
+    symtab_index: usize,
+    index: u32,
+    link_start: u32,
+) -> Result<u32, LoadError> {
+    let symtab = file
+        .sections
+        .get(symtab_index)
+        .ok_or_else(|| LoadError::UndefinedSymbol(format!("#{index}")))?;
+    let symbol = Symbol::parse(&symtab.data, index as usize * SYMBOL_SIZE)?;
+    // `STT_TLS` symbols already hold the offset; section symbols hold the
+    // section's link-time address.
+    Ok(if symbol.info & 0xF == STT_TLS {
+        symbol.value
+    } else {
+        symbol.value.wrapping_sub(link_start)
     })
 }
 

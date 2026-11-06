@@ -48,6 +48,9 @@ pub struct TextureSignature {
     pub comp_sel: [u8; 4],
     /// The unit is used with a comparison sampler.
     pub comparison: bool,
+    /// `DEPTH_COMPARE_FUNCTION` of the sampler (`0` never ... `7` always): what a
+    /// comparing fetch does when the host cannot compare (not a depth surface).
+    pub compare_function: u8,
 }
 
 /// Texture units of one stage.

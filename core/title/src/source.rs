@@ -25,9 +25,39 @@ pub struct TitleInfo {
     pub code_dir: PathBuf,
     pub content_dir: Option<PathBuf>,
     pub meta_dir: Option<PathBuf>,
+    /// Installed update whose `code/`, `content/` and `meta/` lie over the title's.
+    pub update_dir: Option<PathBuf>,
 }
 
 impl TitleInfo {
+    /// Applies the update installed at `dir`: its XML files and its RPX replace the
+    /// title's (`/vol/*` then serve its files over the title's).
+    ///
+    /// # Errors
+    /// Fails if the update's XML is malformed.
+    pub fn with_update(mut self, dir: &Path) -> Result<Self, TitleError> {
+        let code_dir = dir.join("code");
+        if let Some((text, path)) = read_if_file(code_dir.join("app.xml"))? {
+            self.meta.apply_app_xml(&text, &path)?;
+        }
+        if let Some((text, path)) = read_if_file(code_dir.join("cos.xml"))? {
+            self.meta.apply_cos_xml(&text, &path)?;
+        }
+        if let Some((text, path)) = read_if_file(dir.join("meta/meta.xml"))? {
+            self.meta.apply_meta_xml(&text, &path)?;
+        }
+        let rpx_name = self
+            .meta
+            .rpx_name
+            .clone()
+            .or_else(|| self.rpx_path.file_name().map(|n| n.to_string_lossy().into_owned()));
+        if let Some(rpx) = rpx_name.map(|name| code_dir.join(name)).filter(|p| p.is_file()) {
+            self.rpx_path = rpx;
+        }
+        self.update_dir = Some(dir.to_owned());
+        Ok(self)
+    }
+
     /// Name to show in the UI.
     pub fn display_name(&self) -> String {
         self.meta.long_name_ja.clone().or_else(|| self.meta.long_name.clone()).unwrap_or_else(
@@ -65,6 +95,7 @@ impl TitleSource {
                 code_dir,
                 content_dir: None,
                 meta_dir: None,
+                update_dir: None,
             });
         }
         if path.is_dir() {
@@ -87,13 +118,7 @@ impl TitleSource {
         let (content_dir, meta_dir) = (existing("content"), existing("meta"));
 
         let mut meta = TitleMeta::default();
-        let read = |path: PathBuf| -> Result<Option<(String, PathBuf)>, TitleError> {
-            if path.is_file() {
-                Ok(Some((fs::read_to_string(&path).map_err(TitleError::io(&path))?, path)))
-            } else {
-                Ok(None)
-            }
-        };
+        let read = read_if_file;
         if let Some((text, path)) = read(code_dir.join("app.xml"))? {
             meta.apply_app_xml(&text, &path)?;
         }
@@ -117,7 +142,17 @@ impl TitleSource {
             code_dir,
             content_dir,
             meta_dir,
+            update_dir: None,
         })
+    }
+}
+
+/// Contents of `path` if it is a file.
+fn read_if_file(path: PathBuf) -> Result<Option<(String, PathBuf)>, TitleError> {
+    if path.is_file() {
+        Ok(Some((fs::read_to_string(&path).map_err(TitleError::io(&path))?, path)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -157,6 +192,27 @@ mod tests {
         assert_eq!(info.content_dir, Some(root.join("content")));
         assert_eq!(TitleSource::open(&root.join("code")).unwrap().rpx_path, info.rpx_path);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_replaces_rpx_and_version() {
+        let root = temp_dir("base");
+        fs::create_dir_all(root.join("code")).unwrap();
+        fs::write(root.join("code/game.rpx"), b"").unwrap();
+        let update = temp_dir("update");
+        fs::create_dir_all(update.join("code")).unwrap();
+        fs::write(update.join("code/game.rpx"), b"").unwrap();
+        fs::write(
+            update.join("code/app.xml"),
+            "<app><title_version type=\"hexBinary\">00D0</title_version></app>",
+        )
+        .unwrap();
+
+        let info = TitleSource::open(&root).unwrap().with_update(&update).unwrap();
+        assert_eq!(info.rpx_path, update.join("code/game.rpx"));
+        assert_eq!(info.meta.title_version, Some(208));
+        assert_eq!(info.update_dir.as_deref(), Some(update.as_path()));
+        let _ = (fs::remove_dir_all(root), fs::remove_dir_all(update));
     }
 
     #[test]

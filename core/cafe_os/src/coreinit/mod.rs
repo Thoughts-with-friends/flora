@@ -58,6 +58,8 @@ pub struct CoreinitState {
     /// Stack pointer and return address under each thread's running fibers.
     pub fibers: std::collections::HashMap<u32, Vec<(u32, u32)>>,
     pub serial_interface: hw_interface::SerialInterface,
+    /// Initial thread-local storage of the RPX, copied per thread by `__tls_get_addr`.
+    pub tls_image: Option<wiiu_rpl::TlsImage>,
 }
 
 pub const EXPORTS: &[HleExport] = &[
@@ -225,6 +227,11 @@ pub const EXPORTS: &[HleExport] = &[
     memory::MEMSET,
     memory::OS_BLOCK_MOVE,
     memory::OS_BLOCK_SET,
+    memory::OS_IS_ENABLED_OVERLAY_ARENA,
+    memory::OS_ENABLE_OVERLAY_ARENA,
+    memory::OS_DISABLE_OVERLAY_ARENA,
+    memory::OS_GET_OVERLAY_ARENA_RANGE,
+    memory::OS_IS_ADDRESS_VALID,
     misc::OS_BLOCK_THREADS_ON_EXIT,
     misc::OS_ENABLE_HOME_BUTTON_MENU,
     misc::OS_IS_HOME_BUTTON_MENU_ENABLED,

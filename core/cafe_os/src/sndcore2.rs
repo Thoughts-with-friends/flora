@@ -646,6 +646,16 @@ fn ax_get_voice_loop_count(ctx: &mut HleContext<'_>, voice: u32) -> u32 {
     ctx.os.ax.voices.get(&voice).map_or(0, |v| v.loop_count)
 }
 
+/// `AX_PB_TYPE_STREAM`: the samples are a ring buffer the title keeps refilling.
+const VOICE_TYPE_STREAM: u32 = 1;
+
+#[hle_export(lib = "sndcore2", name = "AXSetVoiceType")]
+fn ax_set_voice_type(ctx: &mut HleContext<'_>, voice: u32, kind: u32) {
+    if let Some(entry) = ctx.os.ax.voices.get_mut(&voice) {
+        entry.voice.stream = kind == VOICE_TYPE_STREAM;
+    }
+}
+
 #[hle_export(lib = "sndcore2", name = "AXSetVoiceLoop")]
 fn ax_set_voice_loop(ctx: &mut HleContext<'_>, voice: u32, looping: u32) {
     if let Some(entry) = ctx.os.ax.voices.get_mut(&voice) {
@@ -876,6 +886,7 @@ pub const EXPORTS: &[HleExport] = &[
     AX_GET_VOICE_CURRENT_OFFSET_EX,
     AX_GET_VOICE_LOOP_COUNT,
     AX_SET_VOICE_LOOP,
+    AX_SET_VOICE_TYPE,
     AX_SET_VOICE_LOOP_OFFSET,
     AX_SET_VOICE_LOOP_OFFSET_EX,
     AX_SET_VOICE_END_OFFSET,

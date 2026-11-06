@@ -133,6 +133,7 @@ fn fs_open_file(
 ) -> Result<i32, HleError> {
     let file = path(ctx, client, raw_path)?;
     let mode = ctx.memory.read_c_string(mode.address(), 16)?;
+    log::trace!("FSOpenFile({file}, {mode})");
     let result = ctx.iosu.fsa.open_file(&file, &mode);
     if let Ok(handle) = result {
         handle_out.write(ctx.memory, handle)?;
@@ -306,6 +307,7 @@ fn fs_get_stat(
     _error_mask: u32,
 ) -> Result<i32, HleError> {
     let file = path(ctx, client, raw_path)?;
+    log::trace!("FSGetStat({file})");
     let result = ctx.iosu.fsa.stat(&file);
     if let Ok(stat) = result {
         write_stat(ctx.memory, stat_out.address(), stat)?;

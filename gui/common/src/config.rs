@@ -45,6 +45,13 @@ pub struct AppConfig {
     pub resolution_factor: u32,
     /// Least vertical blanks per flip: `2` caps a title at 30 fps.
     pub min_swap_interval: Option<u32>,
+    /// Wii U system storage (`mlc01`) holding installed updates
+    /// (`usr/title/0005000e/<id>`). Cemu's is searched after it.
+    pub mlc_dir: Option<PathBuf>,
+    /// Let titles that refuse to start without an update start without one.
+    pub skip_update_check: bool,
+    /// Show the GamePad's screen in a window of its own.
+    pub gamepad_window: bool,
 }
 
 impl Default for AppConfig {
@@ -68,6 +75,9 @@ impl Default for AppConfig {
             netplay_address: "127.0.0.1".to_owned(),
             resolution_factor: 1,
             min_swap_interval: None,
+            mlc_dir: None,
+            skip_update_check: true,
+            gamepad_window: false,
         }
     }
 }
@@ -113,6 +123,13 @@ impl AppConfig {
             swap_interval: self.swap_interval,
             resolution_factor: self.resolution_factor,
             min_swap_interval: self.min_swap_interval,
+            mlc_dirs: self
+                .mlc_dir
+                .iter()
+                .cloned()
+                .chain(wiiu_title::update::default_mlc_dirs())
+                .collect(),
+            skip_update_check: self.skip_update_check,
             ..wiiu_emu::Config::default()
         }
     }

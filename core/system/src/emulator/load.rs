@@ -3,11 +3,11 @@ use std::path::Path;
 
 use wiiu_cafe_os::{BootInfo, CafeOs};
 use wiiu_cpu::CpuState;
-use wiiu_fs::{HostDirectory, Vfs};
+use wiiu_fs::{HostDirectory, Overlay, Vfs};
 use wiiu_gpu::Gpu;
 use wiiu_iosu::Iosu;
 use wiiu_memory::Memory;
-use wiiu_title::{TitleInfo, TitleSource};
+use wiiu_title::{TitleInfo, TitleSource, update};
 
 use super::{BootSource, CORE_COUNT, EmuStats, Emulator, MAIN_CORE, Status};
 use crate::EmuError;
@@ -18,7 +18,13 @@ impl Emulator {
     /// # Errors
     /// Fails if the path is not a bootable title or the RPX does not load.
     pub fn load_title(&mut self, path: &Path) -> Result<(), EmuError> {
-        let info = TitleSource::open(path)?;
+        let mut info = TitleSource::open(path)?;
+        let installed =
+            info.meta.title_id.and_then(|id| update::find_update(id, &self.config.mlc_dirs));
+        if let Some(dir) = installed {
+            info = info.with_update(&dir)?;
+            log::info!("update {}: version {:?}", dir.display(), info.meta.title_version);
+        }
         let rpx = std::fs::read(&info.rpx_path)
             .map_err(|source| EmuError::Io { path: info.rpx_path.clone(), source })?;
         let vfs = self.mount_volumes(&info)?;
@@ -60,13 +66,29 @@ impl Emulator {
     }
 
     fn mount_volumes(&self, info: &TitleInfo) -> Result<Vfs, EmuError> {
+        // An installed update's files lie over the title's.
+        let volume = |base: &Path, name: &str| {
+            let update = info.update_dir.as_ref().map(|dir| dir.join(name)).filter(|d| d.is_dir());
+            update
+                .into_iter()
+                .fold(Overlay::new(), |overlay, dir| overlay.layer(HostDirectory::read_only(dir)))
+                .layer(HostDirectory::read_only(base))
+        };
         let mut vfs = Vfs::new();
-        vfs.mount("/vol/code", HostDirectory::read_only(&info.code_dir))?;
+        vfs.mount("/vol/code", volume(&info.code_dir, "code"))?;
         if let Some(content) = &info.content_dir {
-            vfs.mount("/vol/content", HostDirectory::read_only(content))?;
+            let mut content = volume(content, "content");
+            let gate = info.meta.title_id.and_then(update::version_gate);
+            if let Some(gate) =
+                gate.filter(|_| info.update_dir.is_none() && self.config.skip_update_check)
+            {
+                log::info!("no update installed: skipping the title's update check");
+                content = content.file(gate.file, gate.contents)?;
+            }
+            vfs.mount("/vol/content", content)?;
         }
         if let Some(meta) = &info.meta_dir {
-            vfs.mount("/vol/meta", HostDirectory::read_only(meta))?;
+            vfs.mount("/vol/meta", volume(meta, "meta"))?;
         }
         let title_id =
             info.meta.title_id.map_or_else(|| "homebrew".to_owned(), |id| format!("{id:016x}"));

@@ -34,6 +34,10 @@ pub struct Voice {
     pub adpcm_state: AdpcmState,
     /// Decoder history at the loop start (`AXSetVoiceAdpcmLoop`).
     pub adpcm_loop_state: Option<AdpcmState>,
+    /// A ring buffer of one continuous sound (`AX_PB_TYPE_STREAM`): looping goes on
+    /// decoding with the history it has, as the loop start follows the loop end.
+    #[serde(default)]
+    pub stream: bool,
     /// Fractional part of the resampling position, between the two samples below.
     phase: f32,
     previous: i16,
@@ -56,6 +60,7 @@ impl Voice {
             adpcm_coefficients: [0; 16],
             adpcm_state: AdpcmState::default(),
             adpcm_loop_state: None,
+            stream: false,
             phase: 0.0,
             previous: 0,
             current: 0,
@@ -96,7 +101,7 @@ impl Voice {
             if self.looping {
                 self.current_offset = self.loop_offset;
                 if self.format == SampleFormat::Adpcm {
-                    if let Some(state) = self.adpcm_loop_state {
+                    if let Some(state) = self.adpcm_loop_state.filter(|_| !self.stream) {
                         self.adpcm_state = state;
                     }
                     if self.current_offset.is_multiple_of(NIBBLES_PER_FRAME) {
@@ -190,6 +195,22 @@ mod tests {
             voice.render(&memory);
         }
         assert_eq!(voice.adpcm_state, start);
+        assert_eq!(voice.current_offset, 2);
+    }
+
+    #[test]
+    fn a_looping_stream_keeps_its_history() {
+        let memory = Bytes(vec![0; 16]);
+        let mut voice = Voice::new(SampleFormat::Adpcm, 0, 4);
+        voice.looping = true;
+        voice.stream = true;
+        voice.loop_offset = 2;
+        voice.adpcm_loop_state = Some(AdpcmState { hist1: 11, hist2: 22 });
+        voice.adpcm_state = AdpcmState { hist1: 500, hist2: 400 };
+        for _ in 0..3 {
+            voice.render(&memory);
+        }
+        assert_ne!(voice.adpcm_state, AdpcmState { hist1: 11, hist2: 22 });
         assert_eq!(voice.current_offset, 2);
     }
 }

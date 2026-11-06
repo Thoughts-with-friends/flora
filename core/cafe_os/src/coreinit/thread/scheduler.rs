@@ -89,6 +89,8 @@ pub struct ThreadRecord {
     pub pending_cond: Option<PendingCond>,
     /// Set by `OSWakeupThread`; lets the restarted `OSSleepThread` return.
     pub woken_from_queue: Option<u32>,
+    /// This thread's copy of the RPX's TLS block (0 until `__tls_get_addr`).
+    pub tls_block: u32,
     last_run: u64,
 }
 
@@ -106,6 +108,7 @@ impl ThreadRecord {
             woke_from: None,
             pending_cond: None,
             woken_from_queue: None,
+            tls_block: 0,
             last_run: 0,
         }
     }

@@ -85,6 +85,8 @@ cargo xtask icon   # gui/egui/assets/shocora.svg -> shocora.png, shocora.ico
 - **ROM Directory Management**: Listed under `rom_dirs` in `shocora.toml`. An old `roms.json` is read once when `rom_dirs` is empty.
   - Supports extracted titles (`<name>/code`, `content`, `meta`) and `.rpx` files.
   - Detected games appear in the **Games** panel; double-click to boot.
+- **Updates**: An installed update is read from Wii U system storage laid out like Cemu's `mlc01` (`usr/title/0005000e/<id>/`). Set `mlc_dir` in `shocora.toml`; Cemu's own `mlc01` is searched after it.
+  - `skip_update_check = true` (default) lets titles that refuse to start without an update (e.g. *Breath of the Wild* 0.9.0) start anyway.
 - **Shader Cache**: Compiled GPU shaders are saved in `shader_cache/` to minimize stuttering on subsequent runs.
 - **Localization**: Change languages in **Settings > General**.
   - Built-in translations: `lang/translation.eng.json` and `lang/translation.jpn.json`.

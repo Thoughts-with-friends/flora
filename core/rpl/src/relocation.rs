@@ -17,6 +17,10 @@ pub const R_PPC_ADDR16_HA: u8 = 6;
 pub const R_PPC_REL24: u8 = 10;
 pub const R_PPC_REL14: u8 = 11;
 pub const R_PPC_REL32: u8 = 26;
+/// `tls_index::module`: which module's TLS block the symbol lives in.
+pub const R_PPC_DTPMOD32: u8 = 68;
+/// `tls_index::offset`: the symbol's offset inside that block.
+pub const R_PPC_DTPREL32: u8 = 78;
 pub const R_PPC_GHS_REL16_HA: u8 = 251;
 pub const R_PPC_GHS_REL16_HI: u8 = 252;
 pub const R_PPC_GHS_REL16_LO: u8 = 253;

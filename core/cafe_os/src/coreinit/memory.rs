@@ -2,6 +2,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use wiiu_hle_macros::hle_export;
+use wiiu_mem_addr::OVERLAY_ARENA;
 use wiiu_memory::GuestPtr;
 
 use crate::hle::{HleContext, HleError};
@@ -60,6 +61,63 @@ fn os_block_set(
 ) -> Result<GuestPtr<u8>, HleError> {
     ctx.memory.fill(dst.address(), size, value as u8)?;
     Ok(dst)
+}
+
+fn overlay_arena_enabled(ctx: &HleContext<'_>) -> bool {
+    ctx.memory.regions().any(|region| region == OVERLAY_ARENA)
+}
+
+fn write_overlay_arena_range(
+    ctx: &mut HleContext<'_>,
+    start: GuestPtr<u32>,
+    size: GuestPtr<u32>,
+) -> Result<(), HleError> {
+    if !start.is_null() {
+        start.write(ctx.memory, OVERLAY_ARENA.start)?;
+    }
+    if !size.is_null() {
+        size.write(ctx.memory, OVERLAY_ARENA.size)?;
+    }
+    Ok(())
+}
+
+#[hle_export(lib = "coreinit", name = "OSIsEnabledOverlayArena")]
+fn os_is_enabled_overlay_arena(ctx: &mut HleContext<'_>) -> bool {
+    overlay_arena_enabled(ctx)
+}
+
+/// Lends the title the overlay arena (memory the system menu would otherwise
+/// use) and reports where it is.
+#[hle_export(lib = "coreinit", name = "OSEnableOverlayArena")]
+fn os_enable_overlay_arena(
+    ctx: &mut HleContext<'_>,
+    _unknown: u32,
+    start: GuestPtr<u32>,
+    size: GuestPtr<u32>,
+) -> Result<(), HleError> {
+    if !overlay_arena_enabled(ctx) {
+        ctx.memory.map(OVERLAY_ARENA)?;
+    }
+    write_overlay_arena_range(ctx, start, size)
+}
+
+/// The arena stays mapped: freeing it would only let stale pointers fault.
+#[hle_export(lib = "coreinit", name = "OSDisableOverlayArena")]
+fn os_disable_overlay_arena(_ctx: &mut HleContext<'_>) {}
+
+#[hle_export(lib = "coreinit", name = "OSGetOverlayArenaRange")]
+fn os_get_overlay_arena_range(
+    ctx: &mut HleContext<'_>,
+    start: GuestPtr<u32>,
+    size: GuestPtr<u32>,
+) -> Result<(), HleError> {
+    write_overlay_arena_range(ctx, start, size)
+}
+
+/// Whether `address` is mapped for the title.
+#[hle_export(lib = "coreinit", name = "OSIsAddressValid")]
+fn os_is_address_valid(ctx: &mut HleContext<'_>, address: u32) -> bool {
+    ctx.memory.regions().any(|region| region.contains(address))
 }
 
 #[cfg(test)]
