@@ -93,6 +93,7 @@ impl HostFormat {
         )
     }
 
+    #[inline]
     pub const fn has_stencil(self) -> bool {
         matches!(self, Self::Depth24PlusStencil8 | Self::Depth32FloatStencil8)
     }
@@ -153,6 +154,7 @@ impl ResolutionScale {
     const MIN_SIDE: u32 = 32;
 
     /// The scale for a title showing a TV picture `tv_width` wide, for a `requested` factor.
+    #[inline]
     pub const fn for_tv(requested: u32, tv_width: u32) -> Self {
         let most = Self::MAX_WIDTH / if tv_width == 0 { 1 } else { tv_width };
         let factor = if requested < most { requested } else { most };
@@ -160,6 +162,7 @@ impl ResolutionScale {
     }
 
     /// The factor on offer below `factor`, for when video memory runs out.
+    #[inline]
     pub fn lower_factor(factor: u32) -> u32 {
         Self::FACTORS.into_iter().rev().find(|f| *f < factor).unwrap_or(1)
     }
@@ -176,6 +179,7 @@ impl ResolutionScale {
     }
 
     /// The factor of the target `key`.
+    #[inline]
     pub const fn of(&self, key: &SurfaceKey) -> u32 {
         if self.applies(key) { self.factor } else { 1 }
     }

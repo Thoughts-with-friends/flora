@@ -64,6 +64,7 @@ impl CommandProcessor {
     ///
     /// # Errors
     /// Fails on malformed packets or accesses outside guest memory.
+    #[inline]
     pub fn execute(&mut self, words: &[u32], ctx: &mut CpContext<'_>) -> Result<(), GpuError> {
         self.execute_nested(words, ctx, 0)
     }

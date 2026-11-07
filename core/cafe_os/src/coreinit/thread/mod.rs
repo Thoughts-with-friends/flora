@@ -60,6 +60,7 @@ pub fn sync_guest(
 }
 
 /// Blocks the calling thread on `wait`; its HLE call restarts when the wait ends.
+#[inline]
 pub fn block(ctx: &mut HleContext<'_>, wait: Wait) {
     ctx.cpu.pc = ctx.cpu.pc.wrapping_sub(4);
     ctx.os.coreinit.threads.block_current(wait);

@@ -121,6 +121,7 @@ impl SectionHeader {
         })
     }
 
+    #[inline]
     pub const fn is_alloc(&self) -> bool {
         self.flags & SHF_ALLOC != 0
     }

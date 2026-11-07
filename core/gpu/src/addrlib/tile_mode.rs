@@ -32,10 +32,12 @@ pub const fn is_thick(tile_mode: u32) -> bool {
     )
 }
 
+#[inline]
 pub const fn thickness(tile_mode: u32) -> u32 {
     if is_thick(tile_mode) { 4 } else { 1 }
 }
 
+#[inline]
 pub const fn is_macro_tiled(tile_mode: u32) -> bool {
     tile_mode >= 4 && tile_mode != TM_LINEAR_SPECIAL
 }

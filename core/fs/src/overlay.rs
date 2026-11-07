@@ -22,6 +22,7 @@ impl std::fmt::Debug for Overlay {
 }
 
 impl Overlay {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,6 +38,7 @@ impl Overlay {
     ///
     /// # Errors
     /// Fails if `path` is not a valid absolute path.
+    #[inline]
     pub fn file(mut self, path: &str, contents: impl Into<Vec<u8>>) -> Result<Self, FsError> {
         self.files.insert(GuestPath::new(path)?, contents.into());
         Ok(self)

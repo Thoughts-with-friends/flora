@@ -97,6 +97,7 @@ impl Streamer {
         }
     }
 
+    #[inline]
     pub fn tap(&self) -> StreamTap {
         self.tap.clone()
     }

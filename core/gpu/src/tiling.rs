@@ -177,6 +177,7 @@ impl Layout {
 }
 
 /// Splits the low address bits Latte uses as pipe/bank swizzle.
+#[inline]
 pub const fn swizzle_from_address(address: u32) -> (u32, u32) {
     ((address >> 8) & 1, (address >> 9) & 3)
 }

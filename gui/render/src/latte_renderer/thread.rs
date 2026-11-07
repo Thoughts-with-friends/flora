@@ -28,11 +28,13 @@ impl RenderThread {
         Ok(Self { sender: Some(sender), thread: Some(thread), screens })
     }
 
+    #[inline]
     pub fn screens(&self) -> ScreenImages {
         self.screens.clone()
     }
 
     /// A clonable handle for the emulation thread.
+    #[inline]
     pub fn sender(&self) -> Option<std::sync::mpsc::SyncSender<Vec<RenderCommand>>> {
         self.sender.clone()
     }

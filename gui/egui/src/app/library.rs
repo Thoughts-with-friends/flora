@@ -150,7 +150,8 @@ impl ShocoraApp {
                         ui,
                         &mut color,
                         egui::color_picker::Alpha::OnlyBlend,
-                    );
+                    )
+                    .on_hover_text(tr("launcher.background_color_hint"));
                     egui::Frame::new()
                         .fill(egui::Color32::from_black_alpha(170))
                         .corner_radius(4.0)

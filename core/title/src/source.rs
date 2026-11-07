@@ -27,6 +27,18 @@ pub struct TitleInfo {
     pub meta_dir: Option<PathBuf>,
     /// Installed update whose `code/`, `content/` and `meta/` lie over the title's.
     pub update_dir: Option<PathBuf>,
+    /// Installed downloadable content, served at `/vol/aoc<id>`.
+    pub dlc: Option<Dlc>,
+}
+
+/// A title's downloadable content on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dlc {
+    /// Holds `code/`, `content/` and `meta/`.
+    pub dir: PathBuf,
+    /// `0005000c` and the low half of the title's ID.
+    pub title_id: u64,
+    pub version: u16,
 }
 
 impl TitleInfo {
@@ -96,6 +108,7 @@ impl TitleSource {
                 content_dir: None,
                 meta_dir: None,
                 update_dir: None,
+                dlc: None,
             });
         }
         if path.is_dir() {
@@ -143,6 +156,7 @@ impl TitleSource {
             content_dir,
             meta_dir,
             update_dir: None,
+            dlc: None,
         })
     }
 }

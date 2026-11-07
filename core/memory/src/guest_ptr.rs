@@ -88,24 +88,29 @@ pub struct GuestPtr<T> {
 impl<T> GuestPtr<T> {
     pub const NULL: Self = Self::new(0);
 
+    #[inline]
     pub const fn new(address: u32) -> Self {
         Self { address, _marker: PhantomData }
     }
 
+    #[inline]
     pub const fn address(self) -> u32 {
         self.address
     }
 
+    #[inline]
     pub const fn is_null(self) -> bool {
         self.address == 0
     }
 
     /// Reinterprets the pointee type.
+    #[inline]
     pub const fn cast<U>(self) -> GuestPtr<U> {
         GuestPtr::new(self.address)
     }
 
     /// Adds a byte offset.
+    #[inline]
     pub const fn byte_add(self, bytes: u32) -> Self {
         Self::new(self.address.wrapping_add(bytes))
     }
@@ -113,18 +118,21 @@ impl<T> GuestPtr<T> {
 
 impl<T: GuestValue> GuestPtr<T> {
     /// Pointer arithmetic in units of `T`.
+    #[inline]
     pub const fn add(self, count: u32) -> Self {
         self.byte_add(count.wrapping_mul(T::SIZE))
     }
 
     /// # Errors
     /// Fails if the pointee is unmapped.
+    #[inline]
     pub fn read(self, memory: &Memory) -> Result<T, MemoryError> {
         T::read(memory, self.address)
     }
 
     /// # Errors
     /// Fails if the pointee is unmapped.
+    #[inline]
     pub fn write(self, memory: &mut Memory, value: T) -> Result<(), MemoryError> {
         value.write(memory, self.address)
     }

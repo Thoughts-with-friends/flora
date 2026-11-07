@@ -24,11 +24,13 @@ impl GuestPath {
         Ok(Self(format!("/{}", parts.join("/"))))
     }
 
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Components after the root.
+    #[inline]
     pub fn components(&self) -> impl Iterator<Item = &str> {
         self.0.split('/').filter(|p| !p.is_empty())
     }

@@ -48,12 +48,13 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn native_options(api: GraphicsApi) -> eframe::NativeOptions {
+fn native_options(api: GraphicsApi, transparent: bool) -> eframe::NativeOptions {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("shocora")
         .with_inner_size([1400.0, 640.0])
-        // The start screen's backdrop color may let the desktop show through.
-        .with_transparent(true);
+        // Only a see-through backdrop color needs the desktop behind the window: a
+        // transparent window is composed by the desktop on every frame, which costs GPU time.
+        .with_transparent(transparent);
 
     match eframe::icon_data::from_png_bytes(include_bytes!("../assets/shocora.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
@@ -100,10 +101,11 @@ fn main() -> eframe::Result {
     }
     let api = config.graphics_api;
     log::info!("graphics API: {}", api.label());
+    let transparent = config.launcher_background[3] < u8::MAX;
 
     eframe::run_native(
         "shocora",
-        native_options(api),
+        native_options(api, transparent),
         Box::new(move |cc| {
             Ok(Box::new(app::ShocoraApp::new(cc, config, config_path, api, args.title)?))
         }),

@@ -48,6 +48,7 @@ macro_rules! be_accessors {
 }
 
 impl Memory {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
@@ -83,10 +84,12 @@ impl Memory {
     }
 
     /// Regions currently mapped, in address order.
+    #[inline]
     pub fn regions(&self) -> impl Iterator<Item = Region> + '_ {
         self.regions.iter().copied()
     }
 
+    #[inline]
     pub fn is_mapped(&self, address: u32, len: u32) -> bool {
         self.contains(address, len)
     }
@@ -94,6 +97,7 @@ impl Memory {
     /// Host address of guest address 0. Guest address `a` is at `host_base() + a`.
     ///
     /// Only mapped regions may be dereferenced; see [`Self::is_mapped`].
+    #[inline]
     pub const fn host_base(&self) -> *mut u8 {
         self.space.base()
     }
@@ -143,24 +147,28 @@ impl Memory {
 
     /// # Errors
     /// Fails if the access touches unmapped memory.
+    #[inline]
     pub fn read_f32(&self, address: u32) -> Result<f32, MemoryError> {
         self.read_u32(address).map(f32::from_bits)
     }
 
     /// # Errors
     /// Fails if the access touches unmapped memory.
+    #[inline]
     pub fn write_f32(&mut self, address: u32, value: f32) -> Result<(), MemoryError> {
         self.write_u32(address, value.to_bits())
     }
 
     /// # Errors
     /// Fails if the access touches unmapped memory.
+    #[inline]
     pub fn read_f64(&self, address: u32) -> Result<f64, MemoryError> {
         self.read_u64(address).map(f64::from_bits)
     }
 
     /// # Errors
     /// Fails if the access touches unmapped memory.
+    #[inline]
     pub fn write_f64(&mut self, address: u32, value: f64) -> Result<(), MemoryError> {
         self.write_u64(address, value.to_bits())
     }
@@ -169,6 +177,7 @@ impl Memory {
     ///
     /// # Errors
     /// Fails if the range is unmapped.
+    #[inline]
     pub fn read_bytes(&self, address: u32, out: &mut [u8]) -> Result<(), MemoryError> {
         out.copy_from_slice(self.slice(address, len_u32(out.len()))?);
         Ok(())
@@ -178,6 +187,7 @@ impl Memory {
     ///
     /// # Errors
     /// Fails if the range is unmapped.
+    #[inline]
     pub fn write_bytes(&mut self, address: u32, bytes: &[u8]) -> Result<(), MemoryError> {
         self.slice_mut(address, len_u32(bytes.len()))?.copy_from_slice(bytes);
         Ok(())
@@ -236,6 +246,7 @@ impl Memory {
     ///
     /// # Errors
     /// Fails if the range is unmapped.
+    #[inline]
     pub fn write_c_string(&mut self, address: u32, text: &str) -> Result<(), MemoryError> {
         self.write_bytes(address, text.as_bytes())?;
         self.write_u8(address + len_u32(text.len()), 0)

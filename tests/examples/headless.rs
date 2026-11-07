@@ -27,6 +27,7 @@
 //! * `SHOCORA_SPEED=0.5|2|3|4`: how fast the title runs.
 //! * `SHOCORA_RES=n`: draws the title's pictures `n` times larger, up to 10240 wide.
 //! * `SHOCORA_BACKGROUND_SHADERS`: compiles shaders in the background, as the GUI does.
+//! * `SHOCORA_NO_PATCHES`: leaves titles' code as it is (no busy-loop patches).
 //! * `SHOCORA_NET_HOST="ip[/prefix],port[,password]"`: lets a second player join (with
 //!   `SHOCORA_SHOTS`); see `netclient`.
 use std::{

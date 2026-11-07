@@ -30,6 +30,7 @@ pub use state::{CpuState, Fpr};
 pub const HLE_CALL_PRIMARY_OPCODE: u32 = 1;
 
 /// Encodes an HLE-call instruction for function `index`.
+#[inline]
 pub const fn encode_hle_call(index: u32) -> u32 {
     (HLE_CALL_PRIMARY_OPCODE << 26) | (index & 0x03FF_FFFF)
 }

@@ -24,6 +24,7 @@ impl Default for ArgReader {
 }
 
 impl ArgReader {
+    #[inline]
     pub const fn new() -> Self {
         Self { gpr: 3, fpr: 1, stack: 8 }
     }

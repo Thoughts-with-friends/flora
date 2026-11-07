@@ -11,6 +11,7 @@ impl MemoryWatch {
     }
 
     /// The factor that did not fit, once for each time it happened.
+    #[inline]
     pub fn take(&self) -> Option<u32> {
         Some(self.0.swap(0, std::sync::atomic::Ordering::Relaxed)).filter(|factor| *factor != 0)
     }

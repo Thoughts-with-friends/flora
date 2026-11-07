@@ -9,12 +9,14 @@ pub const WIIU_EPOCH_UNIX_SECONDS: u64 = 946_684_800;
 
 /// Converts a duration to timebase ticks.
 #[allow(clippy::cast_possible_truncation)]
+#[inline]
 pub const fn duration_to_ticks(duration: Duration) -> u64 {
     (duration.as_nanos() * FREQUENCY as u128 / 1_000_000_000) as u64
 }
 
 /// Converts timebase ticks to a duration.
 #[allow(clippy::cast_possible_truncation)]
+#[inline]
 pub const fn ticks_to_duration(ticks: u64) -> Duration {
     Duration::from_nanos((ticks as u128 * 1_000_000_000 / FREQUENCY as u128) as u64)
 }
@@ -94,6 +96,7 @@ impl TimeBase {
     }
 
     /// Time runs at `speed` from now on, continuing from where it is.
+    #[inline]
     pub fn set_speed(&mut self, speed: GameSpeed) {
         self.ticks_at_speed_start = self.ticks_since_boot();
         self.speed_start = Instant::now();
@@ -101,12 +104,14 @@ impl TimeBase {
     }
 
     /// Ticks since power-on (`mftb`, `OSGetSystemTime`).
+    #[inline]
     pub fn ticks_since_boot(&self) -> u64 {
         let elapsed = duration_to_ticks(self.speed_start.elapsed());
         self.ticks_at_speed_start + elapsed * u64::from(self.speed.halves()) / 2
     }
 
     /// Ticks since 2000-01-01 (`OSGetTime`).
+    #[inline]
     pub fn ticks_since_epoch(&self) -> u64 {
         self.epoch_ticks_at_boot + self.ticks_since_boot()
     }

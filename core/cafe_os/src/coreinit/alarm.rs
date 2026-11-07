@@ -62,6 +62,7 @@ impl Alarms {
     }
 
     /// Earliest deadline of any armed alarm.
+    #[inline]
     pub fn next_deadline(&self) -> Option<u64> {
         self.armed.values().map(|a| a.deadline).min()
     }

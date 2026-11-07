@@ -122,15 +122,16 @@ fn call_entry(ctx: &mut HleContext<'_>, index: u32) -> HleResult {
     if let Some(function) = ctx.os.registry.function(index) {
         return function(ctx);
     }
-    match ctx.os.registry.entry(index) {
-        Some(Entry::Function { function, .. }) => function(ctx),
-        Some(Entry::Missing { library, name }) => {
-            if ctx.os.registry.note_missing_call(index) {
-                log::warn!("unimplemented: {library}::{name} (lr {:#010x})", ctx.cpu.lr);
-            }
-            ctx.cpu.gpr[3] = 0;
-            Ok(())
-        }
-        None => Err(HleError::Fatal(format!("bad HLE index {index}"))),
+    // Titles call some missing functions millions of times: only the first call looks
+    // the entry up (cloning its names), the others just return 0.
+    if !ctx.os.registry.contains(index) {
+        return Err(HleError::Fatal(format!("bad HLE index {index}")));
     }
+    if ctx.os.registry.note_missing_call(index) {
+        if let Some(Entry::Missing { library, name }) = ctx.os.registry.entry(index) {
+            log::warn!("unimplemented: {library}::{name} (lr {:#010x})", ctx.cpu.lr);
+        }
+    }
+    ctx.cpu.gpr[3] = 0;
+    Ok(())
 }

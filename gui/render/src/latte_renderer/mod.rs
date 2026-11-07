@@ -321,27 +321,32 @@ impl LatteRenderer {
         }
     }
 
+    #[inline]
     pub fn screens(&self) -> ScreenImages {
         self.screens.clone()
     }
 
     /// Reports when video memory runs out, while the renderer runs.
+    #[inline]
     pub fn memory_watch(&self) -> MemoryWatch {
         self.memory_watch.clone()
     }
 
     /// Where a second player's pictures come from, while the renderer runs.
+    #[inline]
     pub fn stream_tap(&self, screen: Screen) -> StreamTap {
         let index = Screen::ALL.iter().position(|each| *each == screen).unwrap_or(0);
         self.streamers[index].tap()
     }
 
     /// Handle to switch frame generation while the renderer runs.
+    #[inline]
     pub fn frame_gen_setting(&self) -> FrameGenSetting {
         self.frame_generator.setting()
     }
 
     /// The last generated picture of a screen as RGBA8 (tools and tests).
+    #[inline]
     pub fn read_generated(&mut self, screen: Screen) -> Option<(u32, u32, Vec<u8>)> {
         self.submit();
         let image = self.frame_generator.image(screen)?.clone();
@@ -349,10 +354,12 @@ impl LatteRenderer {
     }
 
     /// Handle to change the screens' upscaling while the renderer runs.
+    #[inline]
     pub fn upscale_setting(&self) -> UpscaleSetting {
         self.upscaler.setting()
     }
 
+    #[inline]
     pub const fn device(&self) -> &wgpu::Device {
         &self.device
     }

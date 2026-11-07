@@ -40,6 +40,7 @@
   "input.keyboard": "Keyboard",
   "input.speed_keys": "Tab or pressing the left stick: change the game speed",
   "launcher.background_color": "Background color",
+  "launcher.background_color_hint": "See-through colors show the desktop after a restart; an opaque window costs the GPU less.",
   "launcher.pick_picture": "Choose a background picture",
   "launcher.picture": "Background picture",
   "launcher.picture_path": "Background picture path",

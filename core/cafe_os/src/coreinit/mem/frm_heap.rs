@@ -39,20 +39,24 @@ const fn alignment(align: i32) -> u32 {
 }
 
 impl FrmHeap {
+    #[inline]
     pub const fn new(start: u32, size: u32) -> Self {
         let start = start.next_multiple_of(4);
         let end = (start.saturating_add(size)) & !3;
         Self { start, end, head: start, tail: end, last_head_block: None, states: Vec::new() }
     }
 
+    #[inline]
     pub const fn start(&self) -> u32 {
         self.start
     }
 
+    #[inline]
     pub const fn end(&self) -> u32 {
         self.end
     }
 
+    #[inline]
     pub const fn contains(&self, address: u32) -> bool {
         address >= self.start && address < self.end
     }
@@ -101,6 +105,7 @@ impl FrmHeap {
             .unwrap_or(0)
     }
 
+    #[inline]
     pub fn record_state(&mut self, id: u32) {
         self.states.push(RecordedState { id, head: self.head, tail: self.tail });
     }

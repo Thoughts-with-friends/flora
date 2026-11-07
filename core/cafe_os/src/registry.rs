@@ -153,11 +153,19 @@ impl HleRegistry {
         }
     }
 
+    /// Whether `index` names an entry, implemented or not.
+    #[inline]
+    pub fn contains(&self, index: u32) -> bool {
+        (index as usize) < self.entries.len()
+    }
+
+    #[inline]
     pub fn entry(&self, index: u32) -> Option<Entry> {
         self.entries.get(index as usize).cloned()
     }
 
     /// `SHOCORA_TRACE_HLE` lists comma-separated export names to log every call of.
+    #[inline]
     pub fn is_traced(&self, index: u32) -> bool {
         self.traced.get(index as usize).copied().unwrap_or(false)
     }
@@ -228,6 +236,7 @@ impl HleRegistry {
     }
 
     /// Adds host time spent in entry `index`.
+    #[inline]
     pub fn note_time(&mut self, index: u32, nanos: u64) {
         if let Some(total) = self.call_nanos.get_mut(index as usize) {
             *total += nanos;
@@ -246,6 +255,7 @@ impl HleRegistry {
     }
 
     /// Returns `true` the first time a missing entry is called.
+    #[inline]
     pub fn note_missing_call(&mut self, index: u32) -> bool {
         self.missing_called
             .get_mut(index as usize)
@@ -253,11 +263,13 @@ impl HleRegistry {
     }
 
     /// Entry index of an implemented export.
+    #[inline]
     pub fn function_index(&self, library: &str, name: &str) -> Option<u32> {
         self.functions.get(&key(library, name)).copied()
     }
 
     /// Bump-allocates `size` bytes in the HLE data area (zeroed by the region mapping).
+    #[inline]
     pub fn allocate_data(&mut self, size: u32, align: u32) -> u32 {
         let address = self.data_cursor.next_multiple_of(align.max(4));
         self.data_cursor = address + size;

@@ -51,6 +51,7 @@ pub struct Iosu {
 }
 
 impl Iosu {
+    #[inline]
     pub fn new(vfs: Vfs) -> Self {
         Self { fsa: Fsa::new(vfs), ..Self::default() }
     }
@@ -72,14 +73,17 @@ impl Iosu {
     ///
     /// # Errors
     /// Fails for handles that are not open.
+    #[inline]
     pub fn close(&mut self, handle: DeviceHandle) -> Result<(), IosError> {
         self.open_devices.remove(&handle).map(|_| ()).ok_or(IosError::BadHandle(handle.0))
     }
 
+    #[inline]
     pub fn device(&self, handle: DeviceHandle) -> Option<DeviceKind> {
         self.open_devices.get(&handle).copied()
     }
 
+    #[inline]
     pub const fn vfs_mut(&mut self) -> &mut Vfs {
         self.fsa.vfs_mut()
     }

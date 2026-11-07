@@ -45,6 +45,7 @@ pub struct FrameGenSetting {
 }
 
 impl FrameGenSetting {
+    #[inline]
     pub fn set(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
@@ -54,6 +55,7 @@ impl FrameGenSetting {
     }
 
     /// Pictures generated so far.
+    #[inline]
     pub fn images_generated(&self) -> u64 {
         self.generated.load(Ordering::Relaxed)
     }
@@ -214,16 +216,19 @@ pub struct FrameGenerator {
 }
 
 impl FrameGenerator {
+    #[inline]
     pub fn setting(&self) -> FrameGenSetting {
         self.setting.clone()
     }
 
     /// The last picture generated for `screen`.
+    #[inline]
     pub fn image(&self, screen: Screen) -> Option<&ScreenImage> {
         self.states.get(&screen).map(|state| &state.output)
     }
 
     /// Forgets the frames of the previous boot.
+    #[inline]
     pub fn reset(&mut self) {
         self.states.clear();
     }

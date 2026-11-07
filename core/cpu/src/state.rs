@@ -34,6 +34,7 @@ pub struct Fpr {
 
 impl Fpr {
     /// Both slots set to `value` (single-precision results).
+    #[inline]
     pub const fn splat(value: f64) -> Self {
         Self { ps0: value, ps1: value }
     }
@@ -94,6 +95,7 @@ impl CpuState {
         }
     }
 
+    #[inline]
     pub fn core_id(&self) -> u32 {
         self.spr[spr::UPIR as usize]
     }
@@ -114,6 +116,7 @@ impl CpuState {
     }
 
     /// CR bit `bit`, numbered PowerPC-style (0 = MSB = CR0[LT]).
+    #[inline]
     pub const fn cr_bit(&self, bit: usize) -> bool {
         (self.cr >> (31 - bit)) & 1 != 0
     }
@@ -128,10 +131,12 @@ impl CpuState {
     }
 
     /// 4-bit CR field `field` (0 = CR0).
+    #[inline]
     pub const fn cr_field(&self, field: usize) -> u32 {
         (self.cr >> (28 - 4 * field)) & 0xF
     }
 
+    #[inline]
     pub const fn set_cr_field(&mut self, field: usize, value: u32) {
         let shift = 28 - 4 * field;
         self.cr = (self.cr & !(0xF << shift)) | ((value & 0xF) << shift);
@@ -149,11 +154,13 @@ impl CpuState {
     }
 
     /// Sets CR1 from FPSCR[FX, FEX, VX, OX] (the `.` form of FP instructions).
+    #[inline]
     pub const fn update_cr1(&mut self) {
         self.set_cr_field(1, self.fpscr >> 28);
     }
 
     /// `gpr[ra]`, or 0 when `ra` is r0 (the `(rA|0)` addressing rule).
+    #[inline]
     pub const fn ra_or_zero(&self, ra: usize) -> u32 {
         if ra == 0 { 0 } else { self.gpr[ra] }
     }

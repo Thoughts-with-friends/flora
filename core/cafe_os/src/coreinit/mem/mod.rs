@@ -86,6 +86,7 @@ pub struct HeapTable {
 
 impl HeapTable {
     /// Creates an expanded heap over `[start, start + size)`; returns its handle.
+    #[inline]
     pub fn create_expanded(&mut self, start: u32, size: u32) -> Option<u32> {
         let usable = size.checked_sub(EXP_HEAP_HEADER)?;
         self.heaps.insert(start, Heap::Expanded(ExpHeap::new(start + EXP_HEAP_HEADER, usable)));
@@ -93,6 +94,7 @@ impl HeapTable {
     }
 
     /// Creates a frame heap over `[start, start + size)`; returns its handle.
+    #[inline]
     pub fn create_frame(&mut self, start: u32, size: u32) -> Option<u32> {
         let usable = size.checked_sub(FRM_HEAP_HEADER)?;
         self.heaps.insert(start, Heap::Frame(FrmHeap::new(start + FRM_HEAP_HEADER, usable)));
@@ -122,16 +124,19 @@ impl HeapTable {
     }
 
     /// The MEM2 base heap, target of `MEMAllocFromDefaultHeap`.
+    #[inline]
     pub fn default_heap_mut(&mut self) -> Option<&mut ExpHeap> {
         let handle = self.base(arena::MEM2);
         self.expanded_mut(handle)
     }
 
+    #[inline]
     pub fn base(&self, arena: u32) -> u32 {
         self.base.get(arena as usize).copied().unwrap_or(0)
     }
 
     /// Sets a base heap slot unconditionally (used after `__preinit_user`).
+    #[inline]
     pub fn replace_base(&mut self, arena: u32, handle: u32) {
         if let Some(slot) = self.base.get_mut(arena as usize) {
             *slot = handle;
@@ -152,6 +157,7 @@ impl HeapTable {
     }
 
     /// Handle of the heap whose area contains `address` (`MEMFindContainHeap`).
+    #[inline]
     pub fn find_containing(&self, address: u32) -> Option<u32> {
         self.heaps.iter().find(|(_, heap)| heap.contains(address)).map(|(handle, _)| *handle)
     }

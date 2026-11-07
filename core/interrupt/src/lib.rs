@@ -48,19 +48,23 @@ impl Interrupt {
 pub struct PendingInterrupts(u32);
 
 impl PendingInterrupts {
+    #[inline]
     pub const fn raise(&mut self, interrupt: Interrupt) {
         self.0 |= interrupt.bit();
     }
 
+    #[inline]
     pub const fn is_pending(&self, interrupt: Interrupt) -> bool {
         self.0 & interrupt.bit() != 0
     }
 
+    #[inline]
     pub const fn any(&self) -> bool {
         self.0 != 0
     }
 
     /// Removes and returns the highest-priority (lowest numbered) pending interrupt.
+    #[inline]
     pub fn take_next(&mut self) -> Option<Interrupt> {
         let next = Interrupt::ALL.into_iter().find(|i| self.is_pending(*i))?;
         self.0 &= !next.bit();

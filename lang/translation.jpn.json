@@ -40,6 +40,7 @@
   "input.keyboard": "キーボード",
   "input.speed_keys": "Tab または左スティック押し込み: ゲーム速度の切り替え",
   "launcher.background_color": "背景色",
+  "launcher.background_color_hint": "半透明にした色でデスクトップが透けるのは再起動後。不透明のほうがGPU負荷は低い",
   "launcher.pick_picture": "背景画像を選ぶ",
   "launcher.picture": "背景画像",
   "launcher.picture_path": "背景画像のパス",

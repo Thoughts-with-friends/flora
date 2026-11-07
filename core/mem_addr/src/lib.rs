@@ -35,20 +35,24 @@ pub struct Region {
 }
 
 impl Region {
+    #[inline]
     pub const fn new(name: &'static str, start: u32, size: u32) -> Self {
         Self { name, start, size }
     }
 
     /// One past the last address (as `u64` so the top of memory does not overflow).
+    #[inline]
     pub const fn end(&self) -> u64 {
         self.start as u64 + self.size as u64
     }
 
+    #[inline]
     pub const fn contains(&self, address: u32) -> bool {
         address >= self.start && (address as u64) < self.end()
     }
 
     /// `true` if `[address, address + len)` lies entirely inside the region.
+    #[inline]
     pub const fn contains_range(&self, address: u32, len: u32) -> bool {
         address >= self.start && address as u64 + len as u64 <= self.end()
     }

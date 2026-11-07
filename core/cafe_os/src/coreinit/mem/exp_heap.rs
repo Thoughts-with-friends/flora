@@ -23,10 +23,12 @@ impl ExpHeap {
         Self { start: start_aligned, end, free, used: BTreeMap::new() }
     }
 
+    #[inline]
     pub const fn start(&self) -> u32 {
         self.start
     }
 
+    #[inline]
     pub const fn end(&self) -> u32 {
         self.end
     }
@@ -104,10 +106,12 @@ impl ExpHeap {
             & !3
     }
 
+    #[inline]
     pub fn total_free(&self) -> u32 {
         self.free.values().sum()
     }
 
+    #[inline]
     pub fn allocation_size(&self, address: u32) -> Option<u32> {
         self.used.get(&address).copied()
     }

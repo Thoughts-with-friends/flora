@@ -179,6 +179,7 @@ impl Host {
         Ok(Self { state, audio, stop, thread: Some(thread), port })
     }
 
+    #[inline]
     pub const fn port(&self) -> u16 {
         self.port
     }
@@ -188,6 +189,7 @@ impl Host {
     }
 
     /// Where the emulator sends a copy of its sound (48 kHz stereo). Full means dropped.
+    #[inline]
     pub fn audio_sink(&self) -> SyncSender<Vec<i16>> {
         self.audio.clone()
     }

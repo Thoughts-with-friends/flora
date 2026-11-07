@@ -1,5 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
+use wiiu_title::update::AddOnKind;
+
 /// Host-side emulator settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -30,6 +32,11 @@ pub struct Config {
     pub cheats_dir: PathBuf,
     /// System storage (`mlc01`) searched in order for installed updates.
     pub mlc_dirs: Vec<PathBuf>,
+    /// Folders of updates for any titles (each one, or each of its subfolders, holding
+    /// `code/`, `content/`, `meta/`), searched before `mlc_dirs`.
+    pub update_dirs: Vec<PathBuf>,
+    /// Folders of downloadable content, laid out like `update_dirs`.
+    pub dlc_dirs: Vec<PathBuf>,
     /// Let titles that refuse to start without an update start without one.
     pub skip_update_check: bool,
 }
@@ -49,6 +56,8 @@ impl Default for Config {
             min_swap_interval: None,
             cheats_dir: PathBuf::from("cheats"),
             mlc_dirs: wiiu_title::update::default_mlc_dirs(),
+            update_dirs: wiiu_title::update::default_library_dirs(AddOnKind::Update),
+            dlc_dirs: wiiu_title::update::default_library_dirs(AddOnKind::Dlc),
             skip_update_check: true,
         }
     }

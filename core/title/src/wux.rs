@@ -64,10 +64,12 @@ impl<R: Read + Seek> WuxReader<R> {
     }
 
     /// Size of the WUD image.
+    #[inline]
     pub const fn len(&self) -> u64 {
         self.uncompressed_size
     }
 
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.uncompressed_size == 0
     }

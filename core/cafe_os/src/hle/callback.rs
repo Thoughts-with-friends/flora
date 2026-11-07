@@ -28,19 +28,23 @@ pub struct Callbacks {
 }
 
 impl Callbacks {
+    #[inline]
     pub fn push(&mut self, call: GuestCall) {
         self.queue.push_back(call);
     }
 
+    #[inline]
     pub const fn active(&self) -> bool {
         self.saved.is_some()
     }
 
+    #[inline]
     pub fn has_pending(&self) -> bool {
         !self.queue.is_empty()
     }
 
     /// Calls waiting to run.
+    #[inline]
     pub fn pending(&self) -> usize {
         self.queue.len()
     }

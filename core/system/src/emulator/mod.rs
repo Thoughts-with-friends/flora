@@ -119,10 +119,12 @@ impl Emulator {
         })
     }
 
+    #[inline]
     pub const fn status(&self) -> &Status {
         &self.status
     }
 
+    #[inline]
     pub const fn title(&self) -> Option<&TitleInfo> {
         self.title.as_ref()
     }
@@ -137,23 +139,27 @@ impl Emulator {
     }
 
     /// Register state of core `index` (for the debugger).
+    #[inline]
     pub fn core(&self, index: usize) -> Option<&CpuState> {
         self.cores.get(index)
     }
 
     /// Vertical blanks per flip from now on, whatever the title asks for.
+    #[inline]
     pub fn set_swap_interval(&mut self, interval: Option<u32>) {
         self.config.swap_interval = interval;
         self.os.gx2.forced_swap_interval = interval;
     }
 
     /// Draws the title's pictures this many times larger from now on.
+    #[inline]
     pub fn set_resolution_factor(&mut self, factor: u32) {
         self.config.resolution_factor = factor;
         self.gpu.set_resolution_factor(factor);
     }
 
     /// Time runs at `speed` from now on: the title, its timers and its sound.
+    #[inline]
     pub fn set_speed(&mut self, speed: GameSpeed) {
         self.speed = speed;
         self.os.timebase.set_speed(speed);
@@ -162,6 +168,7 @@ impl Emulator {
     }
 
     /// Least vertical blanks per flip from now on.
+    #[inline]
     pub fn set_min_swap_interval(&mut self, interval: Option<u32>) {
         self.config.min_swap_interval = interval;
         self.os.gx2.min_swap_interval = interval.unwrap_or(0);
@@ -193,11 +200,13 @@ impl Emulator {
     }
 
     /// Feeds the latest GamePad sample.
+    #[inline]
     pub const fn set_gamepad(&mut self, state: GamePadState) {
         self.os.gamepad = state;
     }
 
     /// Plugs in, updates or (with `None`) unplugs the Pro Controller on `channel`.
+    #[inline]
     pub fn set_pro_controller(&mut self, channel: usize, state: Option<GamePadState>) {
         if let Some(slot) = self.os.pro_controllers.get_mut(channel) {
             *slot = state;
@@ -205,6 +214,7 @@ impl Emulator {
     }
 
     /// Drains render commands produced since the last call.
+    #[inline]
     pub fn take_render_commands(&mut self) -> Vec<RenderCommand> {
         self.gpu.take_render_commands()
     }
@@ -224,21 +234,25 @@ impl Emulator {
     }
 
     /// Reads a guest word (debugging).
+    #[inline]
     pub fn peek_u32(&self, address: u32) -> Option<u32> {
         self.memory.read_u32(address).ok()
     }
 
     /// One line per guest thread (debugging).
+    #[inline]
     pub fn thread_report(&self) -> Vec<String> {
         self.os.coreinit.threads.report()
     }
 
     /// The most recent HLE calls (for crash reports).
+    #[inline]
     pub fn hle_trace(&self) -> Vec<String> {
         self.os.registry.recent_calls()
     }
 
     /// The most frequently called HLE functions (for profiling).
+    #[inline]
     pub fn hle_profile(&self, limit: usize) -> Vec<(String, u64)> {
         self.os.registry.hottest(limit)
     }
@@ -252,6 +266,7 @@ impl Emulator {
     }
 
     /// The HLE functions that took longest, when profiling.
+    #[inline]
     pub fn hle_slowest(&self, limit: usize) -> Vec<(String, u64, u64)> {
         self.os.registry.slowest(limit)
     }
@@ -263,6 +278,7 @@ impl Emulator {
     }
 
     /// Drains guest console output (`OSReport`, ...).
+    #[inline]
     pub fn take_console(&mut self) -> Vec<String> {
         std::mem::take(&mut self.os.console)
     }

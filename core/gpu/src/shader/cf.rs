@@ -91,6 +91,7 @@ const CF_EXPORT: u32 = 0x27;
 const CF_EXPORT_DONE: u32 = 0x28;
 
 /// Reads little-endian 32-bit words of a program.
+#[inline]
 pub fn word_at(code: &[u8], index: u32) -> u32 {
     let at = index as usize * 4;
     code.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))

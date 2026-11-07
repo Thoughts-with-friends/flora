@@ -175,6 +175,7 @@ impl Scheduler {
         self.current = thread;
     }
 
+    #[inline]
     pub fn current_mut(&mut self) -> Option<&mut ThreadRecord> {
         self.threads.get_mut(&self.current)
     }
@@ -188,6 +189,7 @@ impl Scheduler {
         });
     }
 
+    #[inline]
     pub const fn take_request(&mut self) -> Option<Reschedule> {
         self.pending.take()
     }
@@ -201,6 +203,7 @@ impl Scheduler {
     }
 
     /// Consumes the wait the current thread just returned from.
+    #[inline]
     pub fn take_woke_from(&mut self) -> Option<Wait> {
         self.current_mut().and_then(|t| t.woke_from.take())
     }
@@ -345,6 +348,7 @@ impl Scheduler {
             .collect()
     }
 
+    #[inline]
     pub fn current_is_blocked(&self) -> bool {
         self.threads.get(&self.current).is_some_and(|t| t.state != ThreadState::Running)
     }

@@ -20,6 +20,7 @@ pub struct Packets<'a> {
 }
 
 /// Splits `words` into packets.
+#[inline]
 pub const fn parse(words: &[u32]) -> Packets<'_> {
     Packets { words, index: 0 }
 }
@@ -56,6 +57,7 @@ impl<'a> Iterator for Packets<'a> {
 
 /// Encodes a type-3 header for a body of `body_len` words.
 #[allow(clippy::cast_possible_truncation)]
+#[inline]
 pub const fn type3_header(opcode: u8, body_len: usize) -> u32 {
     (3 << 30) | (((body_len as u32).saturating_sub(1) & 0x3FFF) << 16) | ((opcode as u32) << 8)
 }

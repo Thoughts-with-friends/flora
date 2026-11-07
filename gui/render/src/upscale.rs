@@ -70,6 +70,7 @@ impl UpscaleConfig {
 }
 
 /// Whether this build contains xBRZ (GPL-3.0-only, behind the `xbrz` feature).
+#[inline]
 pub const fn available() -> bool {
     cfg!(feature = "xbrz")
 }
@@ -88,6 +89,7 @@ impl Default for UpscaleSetting {
 }
 
 impl UpscaleSetting {
+    #[inline]
     pub fn set(&self, config: UpscaleConfig) {
         self.factor.store(config.effective_factor(), Ordering::Relaxed);
     }
@@ -97,6 +99,7 @@ impl UpscaleSetting {
     }
 
     /// Upscaled images made so far.
+    #[inline]
     pub fn images_shown(&self) -> u64 {
         self.shown.load(Ordering::Relaxed)
     }
@@ -171,11 +174,13 @@ fn create_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGr
 }
 
 impl Upscaler {
+    #[inline]
     pub fn setting(&self) -> UpscaleSetting {
         self.setting.clone()
     }
 
     /// `true` while the UI should see the upscaled image of `screen`, not the native one.
+    #[inline]
     pub fn shows(&self, screen: Screen) -> bool {
         self.setting.factor() > 1 && self.images.contains_key(&screen)
     }

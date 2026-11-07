@@ -65,10 +65,12 @@ pub struct Fsa {
 }
 
 impl Fsa {
+    #[inline]
     pub fn new(vfs: Vfs) -> Self {
         Self { vfs, ..Self::default() }
     }
 
+    #[inline]
     pub const fn vfs_mut(&mut self) -> &mut Vfs {
         &mut self.vfs
     }
@@ -80,6 +82,7 @@ impl Fsa {
 
     /// # Errors
     /// Fails if the path is missing (for read modes) or a directory.
+    #[inline]
     pub fn stat(&self, path: &str) -> Result<FsaStat, FsaError> {
         let meta = self.vfs.metadata(path)?;
         Ok(FsaStat { is_directory: meta.is_dir, size: meta.size })
@@ -141,6 +144,7 @@ impl Fsa {
 
     /// # Errors
     /// Fails for unknown handles.
+    #[inline]
     pub fn set_position(&mut self, handle: u32, position: u64) -> Result<(), FsaError> {
         self.files.get_mut(&handle).ok_or(FsaError::InvalidHandle)?.position = position;
         Ok(())
@@ -150,30 +154,35 @@ impl Fsa {
     ///
     /// # Errors
     /// Fails for unknown handles.
+    #[inline]
     pub fn file_info(&self, handle: u32) -> Result<(u64, u64), FsaError> {
         self.files.get(&handle).map(|f| (f.position, f.size)).ok_or(FsaError::InvalidHandle)
     }
 
     /// # Errors
     /// Fails for unknown handles.
+    #[inline]
     pub fn close_file(&mut self, handle: u32) -> Result<(), FsaError> {
         self.files.remove(&handle).map(|_| ()).ok_or(FsaError::InvalidHandle)
     }
 
     /// # Errors
     /// Fails if the path is missing or read-only.
+    #[inline]
     pub fn remove(&mut self, path: &str) -> Result<(), FsaError> {
         Ok(self.vfs.remove(path)?)
     }
 
     /// # Errors
     /// Fails if `from` is missing or read-only.
+    #[inline]
     pub fn rename(&mut self, from: &str, to: &str) -> Result<(), FsaError> {
         Ok(self.vfs.rename(from, to)?)
     }
 
     /// # Errors
     /// Fails if the path is read-only.
+    #[inline]
     pub fn make_dir(&mut self, path: &str) -> Result<(), FsaError> {
         Ok(self.vfs.make_dir(path)?)
     }
@@ -221,6 +230,7 @@ impl Fsa {
     ///
     /// # Errors
     /// Fails for unknown handles.
+    #[inline]
     pub fn rewind_dir(&mut self, handle: u32) -> Result<(), FsaError> {
         self.dirs.get_mut(&handle).ok_or(FsaError::InvalidHandle)?.next = 0;
         Ok(())
@@ -228,6 +238,7 @@ impl Fsa {
 
     /// # Errors
     /// Fails for unknown handles.
+    #[inline]
     pub fn close_dir(&mut self, handle: u32) -> Result<(), FsaError> {
         self.dirs.remove(&handle).map(|_| ()).ok_or(FsaError::InvalidHandle)
     }

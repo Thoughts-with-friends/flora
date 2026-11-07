@@ -19,6 +19,7 @@ impl std::fmt::Debug for Vfs {
 }
 
 impl Vfs {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
@@ -35,10 +36,12 @@ impl Vfs {
         Ok(())
     }
 
+    #[inline]
     pub fn unmount_all(&mut self) {
         self.mounts.clear();
     }
 
+    #[inline]
     pub fn is_mounted(&self, point: &str) -> bool {
         GuestPath::new(point).is_ok_and(|p| self.mounts.iter().any(|m| m.point == p))
     }
@@ -53,6 +56,7 @@ impl Vfs {
 
     /// # Errors
     /// Fails if nothing is mounted there or the path does not exist.
+    #[inline]
     pub fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let (mount, rest) = self.resolve(path)?;
         mount.device.metadata(&rest)
@@ -60,6 +64,7 @@ impl Vfs {
 
     /// # Errors
     /// Fails if nothing is mounted there or the file cannot be read.
+    #[inline]
     pub fn read_at(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let (mount, rest) = self.resolve(path)?;
         mount.device.read_at(&rest, offset, buf)
@@ -95,6 +100,7 @@ impl Vfs {
 
     /// # Errors
     /// Fails if nothing is mounted there or the path is not a directory.
+    #[inline]
     pub fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let (mount, rest) = self.resolve(path)?;
         mount.device.read_dir(&rest)
@@ -110,6 +116,7 @@ impl Vfs {
 
     /// # Errors
     /// Fails if nothing is mounted there or the device rejects the removal.
+    #[inline]
     pub fn remove(&mut self, path: &str) -> Result<(), FsError> {
         let (mount, rest) = self.resolve_mut(path)?;
         mount.device.remove(&rest)
@@ -129,6 +136,7 @@ impl Vfs {
 
     /// # Errors
     /// Fails if nothing is mounted there or the device rejects the creation.
+    #[inline]
     pub fn make_dir(&mut self, path: &str) -> Result<(), FsError> {
         let (mount, rest) = self.resolve_mut(path)?;
         mount.device.make_dir(&rest)
@@ -136,6 +144,7 @@ impl Vfs {
 
     /// # Errors
     /// Fails if nothing is mounted there or the device rejects the resize.
+    #[inline]
     pub fn truncate(&mut self, path: &str, len: u64) -> Result<(), FsError> {
         let (mount, rest) = self.resolve_mut(path)?;
         mount.device.truncate(&rest, len)

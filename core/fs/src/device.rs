@@ -56,10 +56,12 @@ pub struct HostDirectory {
 }
 
 impl HostDirectory {
+    #[inline]
     pub fn read_only(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into(), writable: false }
     }
 
+    #[inline]
     pub fn writable(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into(), writable: true }
     }

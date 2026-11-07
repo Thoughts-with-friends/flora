@@ -48,6 +48,7 @@ impl LatteRenderer {
     }
 
     /// Handle to choose whether draws wait for their pipelines while the renderer runs.
+    #[inline]
     pub fn pipeline_setting(&self) -> PipelineSetting {
         self.pipeline_setting.clone()
     }

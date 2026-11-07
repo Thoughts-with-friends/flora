@@ -12,6 +12,18 @@ const CONSOLE_TYPE_RETAIL: u32 = 0x0300_0050;
 /// Latte hardware version reported by `bspGetHardwareVersion`.
 const HARDWARE_VERSION: u32 = 0x1100_0000;
 
+/// Memory barriers order the guest's own accesses: one host thread runs them in order.
+#[hle_export(lib = "coreinit", name = "OSMemoryBarrier")]
+fn os_memory_barrier(_ctx: &mut HleContext<'_>) {}
+
+#[hle_export(lib = "coreinit", name = "OSCoherencyBarrier")]
+fn os_coherency_barrier(_ctx: &mut HleContext<'_>) {}
+
+#[hle_export(lib = "coreinit", name = "OSIsDebuggerPresent")]
+fn os_is_debugger_present(_ctx: &mut HleContext<'_>) -> bool {
+    false
+}
+
 #[hle_export(lib = "coreinit", name = "DCFlushRange")]
 fn dc_flush_range(_ctx: &mut HleContext<'_>, _address: u32, _size: u32) {}
 

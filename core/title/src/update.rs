@@ -1,20 +1,75 @@
-//! Updates installed in Wii U system storage, and titles that refuse to start
-//! without one.
+//! A title's update and its downloadable content, and titles that refuse to start without
+//! an update.
+//!
+//! Both are looked for, in this order (`update` stands for `dlc` with downloadable content):
 //!
 //! ```text
-//!  <mlc>/usr/title/00050000/<id>/   base title (not used here: booted from where it is)
-//!  <mlc>/usr/title/0005000e/<id>/   its update: code/, content/, meta/ that lie over the base
+//!  <title>/update/                    next to the title's own code/, content/ and meta/
+//!  <exe>/update/  <exe>/update/*/     a folder of updates for any number of titles
+//!  <mlc>/usr/title/0005000e/<id>/     the console's storage (`mlc01`) as Cemu lays it out
+//!                 0005000c/<id>/      (downloadable content)
 //! ```
 //!
-//! `<mlc>` is the console's internal storage (`mlc01`) as Cemu lays it out.
-use std::path::{Path, PathBuf};
+//! Each holds `code/`, `content/` and `meta/`. A folder only counts when its `code/app.xml`
+//! names the update (or content) of this very title: dumps of the wrong title, or ones still
+//! encrypted, are passed over with the reason. In a folder of many titles' updates, the
+//! other titles' are passed over silently.
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-/// High half of the title ID of every update.
-const UPDATE_TITLE_TYPE: u64 = 0x0005_000E;
+use crate::meta::TitleMeta;
+
+/// Folder inside a title's folder that holds its update.
+pub const BUNDLED_DIR: &str = "update";
+
+/// What lies over a title's files, or next to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOnKind {
+    Update,
+    /// Downloadable content (`AOC`).
+    Dlc,
+}
+
+impl AddOnKind {
+    /// High half of the title ID of every add-on of this kind.
+    const fn title_type(self) -> u64 {
+        match self {
+            Self::Update => 0x0005_000E,
+            Self::Dlc => 0x0005_000C,
+        }
+    }
+
+    /// Title ID of this add-on of `title_id`.
+    #[inline]
+    pub const fn title_id(self, title_id: u64) -> u64 {
+        (self.title_type() << 32) | (title_id & 0xFFFF_FFFF)
+    }
+
+    /// Name of the folder that holds add-ons of this kind, in a title's folder or by the exe.
+    #[inline]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Update => BUNDLED_DIR,
+            Self::Dlc => "dlc",
+        }
+    }
+}
 
 /// Title ID of the update of `title_id`.
+#[inline]
 pub const fn update_title_id(title_id: u64) -> u64 {
-    (UPDATE_TITLE_TYPE << 32) | (title_id & 0xFFFF_FFFF)
+    AddOnKind::Update.title_id(title_id)
+}
+
+/// `<exe>/update` or `<exe>/dlc`: where add-ons dropped next to the emulator are found.
+pub fn default_library_dirs(kind: AddOnKind) -> Vec<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(kind.dir_name())))
+        .into_iter()
+        .collect()
 }
 
 /// Where Cemu keeps its system storage on this machine, if the platform has a known place.
@@ -32,23 +87,122 @@ pub fn default_mlc_dirs() -> Vec<PathBuf> {
     dir.map(|d| d.join("mlc01")).into_iter().collect()
 }
 
-/// The installed update of `title_id`: the first `<mlc>/usr/title/0005000e/<id>` with a
-/// `code/` directory, searching `mlc_dirs` in order.
-pub fn find_update(title_id: u64, mlc_dirs: &[PathBuf]) -> Option<PathBuf> {
-    let id = update_title_id(title_id);
+/// Why a folder that looks like an update is not used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UpdateProblem {
+    #[error("code/app.xml cannot be read as XML (an encrypted dump?)")]
+    Unreadable,
+    #[error("code/app.xml names no title")]
+    NoTitleId,
+    #[error("it holds title {found:016X}, not {wanted:016X}")]
+    OtherTitle { found: u64, wanted: u64 },
+}
+
+/// Where the add-on was found, and the folders passed over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateSearch {
+    pub found: Option<PathBuf>,
+    /// `title_version` of what was found, from its `code/app.xml`.
+    pub version: Option<u32>,
+    pub rejected: Vec<(PathBuf, UpdateProblem)>,
+}
+
+/// Looks for the update of `title_id`: in `<root>/update` first (if the title has a folder),
+/// then in each of `mlc_dirs`.
+#[inline]
+pub fn find_update(title_id: u64, root: Option<&Path>, mlc_dirs: &[PathBuf]) -> UpdateSearch {
+    find_add_on(AddOnKind::Update, title_id, root, &[], mlc_dirs)
+}
+
+/// Looks for the add-on of `title_id`: in `<root>/<kind>` first (if the title has a folder),
+/// then in each of `library_dirs` and their subfolders, then in each of `mlc_dirs`.
+pub fn find_add_on(
+    kind: AddOnKind,
+    title_id: u64,
+    root: Option<&Path>,
+    library_dirs: &[PathBuf],
+    mlc_dirs: &[PathBuf],
+) -> UpdateSearch {
+    let id = kind.title_id(title_id);
     let (high, low) = (id >> 32, id & 0xFFFF_FFFF);
     // Cemu writes lowercase; a copy made by hand may not be.
     let names = [
         (format!("{high:08x}"), format!("{low:08x}")),
         (format!("{high:08X}"), format!("{low:08X}")),
     ];
-    mlc_dirs.iter().find_map(|mlc| {
-        names.iter().map(|(h, l)| mlc.join("usr/title").join(h).join(l)).find(|dir| is_title(dir))
-    })
+    // `true`: a folder shared by many titles.
+    let mut candidates: Vec<(PathBuf, bool)> =
+        root.map(|root| (root.join(kind.dir_name()), false)).into_iter().collect();
+    for dir in library_dirs {
+        candidates.extend(library_entries(dir).into_iter().map(|dir| (dir, true)));
+    }
+    for mlc in mlc_dirs {
+        candidates.extend(names.iter().map(|(h, l)| (mlc.join("usr/title").join(h).join(l), false)));
+    }
+
+    let mut search = UpdateSearch::default();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for (dir, shared) in candidates {
+        if !dir.join("code").is_dir() || seen.contains(&dir) {
+            continue;
+        }
+        seen.push(dir.clone());
+        match verify_add_on(&dir, kind, title_id) {
+            Ok(meta) => {
+                search.version = meta.title_version;
+                search.found = Some(dir);
+                break;
+            }
+            // Other titles' add-ons are expected in a folder shared by many titles.
+            Err(UpdateProblem::OtherTitle { .. }) if shared => {}
+            Err(problem) => search.rejected.push((dir, problem)),
+        }
+    }
+    search
 }
 
-fn is_title(dir: &Path) -> bool {
-    dir.join("code").is_dir()
+/// `dir` itself, then its subfolders by name.
+fn library_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut children: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    children.sort();
+    std::iter::once(dir.to_owned()).chain(children).collect()
+}
+
+/// Whether `dir` holds the update of `title_id`, as its `code/app.xml` says.
+///
+/// # Errors
+/// Says what is wrong with the folder.
+#[inline]
+pub fn verify(dir: &Path, title_id: u64) -> Result<(), UpdateProblem> {
+    verify_add_on(dir, AddOnKind::Update, title_id).map(drop)
+}
+
+/// Whether `dir` holds the add-on of `title_id`, as its `code/app.xml` says; what that says.
+///
+/// # Errors
+/// Says what is wrong with the folder.
+pub fn verify_add_on(
+    dir: &Path,
+    kind: AddOnKind,
+    title_id: u64,
+) -> Result<TitleMeta, UpdateProblem> {
+    let path = dir.join("code/app.xml");
+    let text = fs::read(&path).map_err(|_| UpdateProblem::Unreadable)?;
+    let mut meta = TitleMeta::default();
+    meta.apply_app_xml(&String::from_utf8_lossy(&text), &path)
+        .map_err(|_| UpdateProblem::Unreadable)?;
+    let wanted = kind.title_id(title_id);
+    match meta.title_id {
+        Some(found) if found == wanted => Ok(meta),
+        Some(found) => Err(UpdateProblem::OtherTitle { found, wanted }),
+        None => Err(UpdateProblem::NoTitleId),
+    }
 }
 
 /// A file a title's base version checks before starting, and what it holds once updated.
@@ -71,6 +225,7 @@ const BREATH_OF_THE_WILD: (&[u64], VersionGate) = (
 const GATES: &[(&[u64], VersionGate)] = &[BREATH_OF_THE_WILD];
 
 /// The gate of `title_id`, for titles known to refuse to start without an update.
+#[inline]
 pub fn version_gate(title_id: u64) -> Option<VersionGate> {
     GATES.iter().find(|(ids, _)| ids.contains(&title_id)).map(|&(_, gate)| gate)
 }
@@ -81,19 +236,75 @@ mod tests {
 
     use super::*;
 
+    fn write_app_xml(dir: &Path, contents: &[u8]) {
+        fs::create_dir_all(dir.join("code")).unwrap();
+        fs::write(dir.join("code/app.xml"), contents).unwrap();
+    }
+
+    fn app_xml(title_id: u64) -> Vec<u8> {
+        format!("<app><title_id type=\"hexBinary\">{title_id:016X}</title_id></app>").into_bytes()
+    }
+
+    const BASE: u64 = 0x0005_0000_101C_9300;
+
     #[test]
     fn finds_updates_in_mlc_layout() {
-        let mlc =
-            std::env::temp_dir().join(format!("shocora-mlc-{}", std::process::id())).join("mlc01");
-        let _ = fs::remove_dir_all(&mlc);
+        let temp = std::env::temp_dir().join(format!("shocora-mlc-{}", std::process::id()));
+        let mlc = temp.join("mlc01");
+        let _ = fs::remove_dir_all(&temp);
         let update = mlc.join("usr/title/0005000e/101c9300");
-        fs::create_dir_all(update.join("code")).unwrap();
+        write_app_xml(&update, &app_xml(update_title_id(BASE)));
 
-        let base = 0x0005_0000_101C_9300;
-        assert_eq!(update_title_id(base), 0x0005_000E_101C_9300);
-        assert_eq!(find_update(base, &[PathBuf::from("missing"), mlc.clone()]), Some(update));
-        assert_eq!(find_update(0x0005_0000_1010_EC00, std::slice::from_ref(&mlc)), None);
-        let _ = fs::remove_dir_all(mlc.parent().unwrap());
+        assert_eq!(update_title_id(BASE), 0x0005_000E_101C_9300);
+        let search = find_update(BASE, None, &[PathBuf::from("missing"), mlc.clone()]);
+        assert_eq!(search.found, Some(update));
+        assert_eq!(find_update(0x0005_0000_1010_EC00, None, &[mlc]).found, None);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn the_title_folder_comes_first_and_wrong_dumps_are_passed_over() {
+        let temp = std::env::temp_dir().join(format!("shocora-bundled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let (root, mlc) = (temp.join("title"), temp.join("mlc01"));
+        let installed = mlc.join("usr/title/0005000e/101c9300");
+        write_app_xml(&installed, &app_xml(update_title_id(BASE)));
+
+        // A system title dumped next to the game, then one still encrypted.
+        write_app_xml(&root.join(BUNDLED_DIR), &app_xml(0x0005_0010_1006_0000));
+        let search = find_update(BASE, Some(&root), std::slice::from_ref(&mlc));
+        assert_eq!(search.found, Some(installed));
+        assert!(matches!(search.rejected[..], [(_, UpdateProblem::OtherTitle { .. })]));
+        write_app_xml(&root.join(BUNDLED_DIR), &[0x8F, 0x00, 0xC3, 0x12]);
+        let search = find_update(BASE, Some(&root), &[]);
+        assert_eq!(search.rejected[0].1, UpdateProblem::Unreadable);
+
+        write_app_xml(&root.join(BUNDLED_DIR), &app_xml(update_title_id(BASE)));
+        let search = find_update(BASE, Some(&root), &[mlc]);
+        assert_eq!(search.found, Some(root.join(BUNDLED_DIR)));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn finds_add_ons_dropped_in_a_shared_folder() {
+        let temp = std::env::temp_dir().join(format!("shocora-library-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let (updates, dlc) = (temp.join("update"), temp.join("dlc"));
+        // Another title's update first by name: passed over without a word.
+        write_app_xml(&updates.join("1010ec00"), &app_xml(update_title_id(0x0005_0000_1010_EC00)));
+        write_app_xml(&updates.join("any name"), &app_xml(update_title_id(BASE)));
+        let dlc_id = AddOnKind::Dlc.title_id(BASE);
+        write_app_xml(&dlc, &format!(
+            "<app><title_id type=\"hexBinary\">{dlc_id:016X}</title_id>             <title_version type=\"hexBinary\">0050</title_version></app>"
+        ).into_bytes());
+
+        let found = find_add_on(AddOnKind::Update, BASE, None, std::slice::from_ref(&updates), &[]);
+        assert_eq!(found.found, Some(updates.join("any name")));
+        assert!(found.rejected.is_empty());
+        let found = find_add_on(AddOnKind::Dlc, BASE, None, std::slice::from_ref(&dlc), &[]);
+        assert_eq!((found.found, found.version), (Some(dlc), Some(0x50)));
+        assert_eq!(dlc_id, 0x0005_000C_101C_9300);
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

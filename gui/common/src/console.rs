@@ -23,8 +23,10 @@ use crate::audio::AudioOutput;
 const IDLE_POLL: Duration = Duration::from_millis(66);
 /// Rate of the samples the emulator produces.
 const AUDIO_RATE: u32 = 48_000;
-/// Longest time between repaints without a new picture: input is read when painting.
-const MAX_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
+/// Longest time between repaints without a new picture: controllers are read when painting
+/// (keys repaint by themselves). Titles flip all the time; this is for loading and pauses,
+/// where drawing the window 30 times a second only kept the GPU busy.
+const MAX_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Requests from the UI.
 #[derive(Debug, Clone)]
@@ -120,10 +122,12 @@ impl Console {
 
     /// A handle for sending commands from another thread. Keeps the emulation thread alive:
     /// drop it before the console.
+    #[inline]
     pub fn commands(&self) -> Option<Sender<ConsoleCommand>> {
         self.tx.clone()
     }
 
+    #[inline]
     pub fn send(&self, command: ConsoleCommand) {
         if let Some(tx) = &self.tx {
             // The thread only exits when `tx` is dropped, so this cannot fail while we hold it.

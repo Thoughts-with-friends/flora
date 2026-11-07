@@ -13,6 +13,7 @@ pub struct LinearAllocator {
 }
 
 impl LinearAllocator {
+    #[inline]
     pub const fn new(text: Region, data: Region, load: Region) -> Self {
         Self { regions: [text, data, load], cursors: [text.start, data.start, load.start] }
     }
@@ -26,6 +27,7 @@ impl LinearAllocator {
     }
 
     /// First free address of `kind`'s region.
+    #[inline]
     pub const fn cursor(&self, kind: SegmentKind) -> u32 {
         self.cursors[Self::slot(kind)]
     }

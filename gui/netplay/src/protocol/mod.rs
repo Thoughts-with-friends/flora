@@ -81,6 +81,7 @@ pub fn answer(challenge: &[u8; CHALLENGE_SIZE], password: &str) -> [u8; ANSWER_S
 }
 
 /// Whether two answers are equal, taking the same time wherever they differ.
+#[inline]
 pub fn answers_match(a: &[u8; ANSWER_SIZE], b: &[u8; ANSWER_SIZE]) -> bool {
     a.iter().zip(b).fold(0, |difference, (x, y)| difference | (x ^ y)) == 0
 }

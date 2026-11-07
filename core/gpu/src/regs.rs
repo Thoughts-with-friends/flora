@@ -117,10 +117,12 @@ impl Default for RegisterFile {
 }
 
 impl RegisterFile {
+    #[inline]
     pub fn get(&self, index: u32) -> u32 {
         self.regs.get(index as usize).copied().unwrap_or(0)
     }
 
+    #[inline]
     pub fn set(&mut self, index: u32, value: u32) {
         if let Some(reg) = self.regs.get_mut(index as usize) {
             *reg = value;
@@ -128,6 +130,7 @@ impl RegisterFile {
     }
 
     /// Writes consecutive registers starting at `index` (out-of-range writes are dropped).
+    #[inline]
     pub fn set_range(&mut self, index: u32, values: &[u32]) {
         let start = (index as usize).min(REGISTER_COUNT);
         let end = (start + values.len()).min(REGISTER_COUNT);

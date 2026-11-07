@@ -60,6 +60,13 @@ const OPTIMIZING_WORKERS: usize = 2;
 /// How often finished translations are taken in while running: making code executable means
 /// asking the system to change page protections.
 const COLLECT_INTERVAL: Duration = Duration::from_millis(1);
+/// Runs after which a block is optimized. Most blocks run a handful of times (start-up,
+/// loading); optimizing all of them doubled the time spent translating for no gain.
+const HOT_RUNS: u32 = 1000;
+/// How often the run counters are looked at.
+const HOT_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+/// Run counters per allocation; they never move, as translated code holds their address.
+const COUNTER_CHUNK: usize = 4096;
 
 /// What a block's helper calls need besides the registers.
 pub(crate) struct HelperContext {
@@ -144,8 +151,14 @@ pub struct Jit {
     pages: Vec<Option<Box<Page>>>,
     /// Instruction count of blocks that are queued, or that failed to translate.
     untranslated: HashMap<u32, u32>,
-    /// Blocks being translated for the first time, to optimize once that is done.
+    /// Blocks being translated for the first time, to optimize once they are hot.
     awaiting: HashMap<u32, Job>,
+    /// Quickly translated blocks and where they count their runs, until they become hot.
+    candidates: Vec<(Job, *const u32)>,
+    /// Storage of the run counters.
+    counters: Vec<Box<[u32; COUNTER_CHUNK]>>,
+    counters_used: usize,
+    last_hot_scan: Instant,
     board: Arc<JobBoard>,
     finished: Receiver<Translated>,
     last_collect: Instant,
@@ -290,6 +303,10 @@ impl Jit {
             pages,
             untranslated: HashMap::new(),
             awaiting: HashMap::new(),
+            candidates: Vec::new(),
+            counters: Vec::new(),
+            counters_used: 0,
+            last_hot_scan: Instant::now(),
             board,
             finished,
             last_collect: Instant::now(),
@@ -301,16 +318,19 @@ impl Jit {
     }
 
     /// Whether to wait for each translation instead of interpreting meanwhile.
+    #[inline]
     pub const fn set_synchronous(&mut self, synchronous: bool) {
         self.synchronous = synchronous;
     }
 
     /// Host time spent translating so far, summed over the workers.
+    #[inline]
     pub const fn compile_nanos(&self) -> u64 {
         self.compile_nanos
     }
 
     /// Number of blocks translated so far.
+    #[inline]
     pub const fn compiled_blocks(&self) -> u64 {
         self.compiled_blocks
     }
@@ -321,6 +341,10 @@ impl Jit {
         self.generation += 1;
         self.untranslated.clear();
         self.awaiting.clear();
+        self.candidates.retain_mut(|(job, _)| {
+            job.set_generation(self.generation);
+            !job.overlaps(address, address.saturating_add(size))
+        });
         let end = address.saturating_add(size);
         // What is waiting for optimizing elsewhere is still good, and would otherwise stay slow.
         let generation = self.generation;
@@ -385,25 +409,58 @@ impl Jit {
             log::error!("JIT: cannot make code executable: {error}");
             return;
         }
-        let mut to_optimize = Vec::new();
         for (pc, optimized, id) in defined {
             let code = self.module.get_finalized_function(id);
             self.insert(pc, code);
             if !optimized {
                 self.untranslated.remove(&pc);
                 self.compiled_blocks += 1;
-                to_optimize.extend(self.awaiting.remove(&pc).map(Job::into_optimized));
+                if let Some(job) = self.awaiting.remove(&pc) {
+                    let counter = job.counter_address();
+                    self.candidates.push((job, counter));
+                }
             }
         }
-        if !to_optimize.is_empty() {
-            self.board.change(|queues| queues.optimize.extend(to_optimize));
+    }
+
+    /// Queues the blocks that ran often enough since the last look for optimizing.
+    fn optimize_hot_blocks(&mut self) {
+        self.last_hot_scan = Instant::now();
+        let mut hot = Vec::new();
+        self.candidates.retain(|(job, counter)| {
+            // SAFETY: counters live as long as the `Jit`; only this thread runs the code
+            // that writes them.
+            let runs = unsafe { counter.read() };
+            if runs < HOT_RUNS {
+                return true;
+            }
+            hot.push(job.clone().into_optimized());
+            false
+        });
+        if !hot.is_empty() {
+            self.board.change(|queues| queues.optimize.extend(hot));
         }
+    }
+
+    /// A fresh run counter for a block's quick translation.
+    fn new_counter(&mut self) -> *mut u32 {
+        let index = self.counters_used % COUNTER_CHUNK;
+        if index == 0 {
+            self.counters.push(Box::new([0; COUNTER_CHUNK]));
+        }
+        self.counters_used += 1;
+        let chunk = self.counters.last_mut().map_or(std::ptr::null_mut(), |c| c.as_mut_ptr());
+        // SAFETY: `index` is within the chunk just taken from.
+        unsafe { chunk.add(index) }
     }
 
     /// Takes in what the workers finished, unless that was just done.
     fn collect_if_due(&mut self) {
         if self.last_collect.elapsed() >= COLLECT_INTERVAL {
             self.collect(None);
+        }
+        if self.last_hot_scan.elapsed() >= HOT_SCAN_INTERVAL {
+            self.optimize_hot_blocks();
         }
     }
 
@@ -413,7 +470,8 @@ impl Jit {
         if let Some(count) = self.untranslated.get(&pc) {
             return Ok(*count);
         }
-        let job = emit::decode_block::<B>(pc, bus, self.generation)?;
+        let mut job = emit::decode_block::<B>(pc, bus, self.generation)?;
+        job.count_runs_at(self.new_counter());
         let count = job.instructions.len() as u32;
         self.untranslated.insert(pc, count);
         self.awaiting.insert(pc, job.clone());

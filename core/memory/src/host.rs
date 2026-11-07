@@ -15,16 +15,19 @@ mod os {
         VirtualFree,
     };
 
+    #[inline]
     pub fn reserve(size: usize) -> *mut u8 {
         // SAFETY: asks the OS for a fresh range; touches no existing memory.
         unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS).cast() }
     }
 
+    #[inline]
     pub fn commit(address: *mut u8, size: usize) -> bool {
         // SAFETY: `address..address + size` lies inside our reservation.
         !unsafe { VirtualAlloc(address.cast(), size, MEM_COMMIT, PAGE_READWRITE) }.is_null()
     }
 
+    #[inline]
     pub fn release(address: *mut u8, _size: usize) {
         // SAFETY: `address` is the base of a reservation owned by the caller.
         unsafe { VirtualFree(address.cast(), 0, MEM_RELEASE) };
@@ -48,11 +51,13 @@ mod os {
         if address == libc::MAP_FAILED { std::ptr::null_mut() } else { address.cast() }
     }
 
+    #[inline]
     pub fn commit(address: *mut u8, size: usize) -> bool {
         // SAFETY: `address..address + size` lies inside our reservation.
         unsafe { libc::mprotect(address.cast(), size, libc::PROT_READ | libc::PROT_WRITE) == 0 }
     }
 
+    #[inline]
     pub fn release(address: *mut u8, size: usize) {
         // SAFETY: the range is a mapping owned by the caller.
         unsafe { libc::munmap(address.cast(), size) };
@@ -76,12 +81,14 @@ impl AddressSpace {
     /// # Panics
     /// If the host cannot reserve 4 GiB of address space (64-bit hosts always can).
     #[allow(clippy::expect_used, reason = "only fails on hosts shocora cannot run on")]
+    #[inline]
     pub fn new() -> Self {
         let base = NonNull::new(os::reserve(ADDRESS_SPACE))
             .expect("cannot reserve the guest address space");
         Self { base }
     }
 
+    #[inline]
     pub const fn base(&self) -> *mut u8 {
         self.base.as_ptr()
     }

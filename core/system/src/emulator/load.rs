@@ -7,7 +7,11 @@ use wiiu_fs::{HostDirectory, Overlay, Vfs};
 use wiiu_gpu::Gpu;
 use wiiu_iosu::Iosu;
 use wiiu_memory::Memory;
-use wiiu_title::{TitleInfo, TitleSource, update};
+use wiiu_cafe_os::aoc::AocTitle;
+use wiiu_title::{
+    Dlc, TitleInfo, TitleSource,
+    update::{self, AddOnKind},
+};
 
 use super::{BootSource, CORE_COUNT, EmuStats, Emulator, MAIN_CORE, Status};
 use crate::EmuError;
@@ -19,12 +23,7 @@ impl Emulator {
     /// Fails if the path is not a bootable title or the RPX does not load.
     pub fn load_title(&mut self, path: &Path) -> Result<(), EmuError> {
         let mut info = TitleSource::open(path)?;
-        let installed =
-            info.meta.title_id.and_then(|id| update::find_update(id, &self.config.mlc_dirs));
-        if let Some(dir) = installed {
-            info = info.with_update(&dir)?;
-            log::info!("update {}: version {:?}", dir.display(), info.meta.title_version);
-        }
+        let notices = self.apply_update(&mut info)?;
         let rpx = std::fs::read(&info.rpx_path)
             .map_err(|source| EmuError::Io { path: info.rpx_path.clone(), source })?;
         let vfs = self.mount_volumes(&info)?;
@@ -33,12 +32,61 @@ impl Emulator {
             .file_name()
             .map_or_else(|| "main.rpx".into(), |n| n.to_string_lossy().into_owned());
         self.boot(&name, &rpx, Iosu::new(vfs))?;
+        self.os.aoc = info
+            .dlc
+            .iter()
+            .map(|dlc| AocTitle { title_id: dlc.title_id, version: dlc.version })
+            .collect();
+        // Shown in the window's log: the first thing to look at when a title will not start.
+        self.os.console.extend(notices);
         self.title = Some(info);
         self.boot_source = Some(BootSource::Title(path.to_owned()));
         if let Err(error) = self.reload_cheats() {
             log::warn!("{error}");
         }
         Ok(())
+    }
+
+    /// Finds the title's update and lays it over the title, and finds its downloadable
+    /// content. Returns what the log should say: what is used, and which folders were passed
+    /// over and why.
+    fn apply_update(&self, info: &mut TitleInfo) -> Result<Vec<String>, EmuError> {
+        let Some(title_id) = info.meta.title_id else { return Ok(Vec::new()) };
+        let root = match &info.source {
+            TitleSource::Directory(root) => Some(root.clone()),
+            TitleSource::Rpx(_) => None,
+        };
+        let config = &self.config;
+        let find = |kind, libraries: &[std::path::PathBuf]| {
+            update::find_add_on(kind, title_id, root.as_deref(), libraries, &config.mlc_dirs)
+        };
+        let updates = find(AddOnKind::Update, &config.update_dirs);
+        let dlc = find(AddOnKind::Dlc, &config.dlc_dirs);
+        let mut notices: Vec<String> = updates
+            .rejected
+            .iter()
+            .chain(&dlc.rejected)
+            .map(|(dir, problem)| format!("[shocora] ignored: {}: {problem}", dir.display()))
+            .collect();
+        if let Some(dir) = updates.found {
+            let base = info.clone();
+            *info = base.with_update(&dir)?;
+            let version = info.meta.title_version.unwrap_or(0);
+            notices.push(format!("[shocora] update v{version}: {}", dir.display()));
+        }
+        if let Some(dir) = dlc.found {
+            let version = dlc.version.unwrap_or(0);
+            notices.push(format!("[shocora] DLC v{version}: {}", dir.display()));
+            info.dlc = Some(Dlc {
+                dir,
+                title_id: AddOnKind::Dlc.title_id(title_id),
+                version: u16::try_from(version).unwrap_or(u16::MAX),
+            });
+        }
+        for notice in &notices {
+            log::info!("{notice}");
+        }
+        Ok(notices)
     }
 
     /// Reboots what was booted last, like the console's reset; `false` if nothing was.
@@ -89,6 +137,10 @@ impl Emulator {
         }
         if let Some(meta) = &info.meta_dir {
             vfs.mount("/vol/meta", volume(meta, "meta"))?;
+        }
+        if let Some(dlc) = &info.dlc {
+            let aoc = AocTitle { title_id: dlc.title_id, version: dlc.version };
+            vfs.mount(&aoc.path(), HostDirectory::read_only(dlc.dir.join("content")))?;
         }
         let title_id =
             info.meta.title_id.map_or_else(|| "homebrew".to_owned(), |id| format!("{id:016x}"));

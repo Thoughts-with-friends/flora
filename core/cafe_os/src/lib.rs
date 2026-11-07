@@ -14,10 +14,12 @@
 //!
 //! Only the main thread runs for now; thread-related exports behave as if no
 //! other thread exists.
+pub mod aoc;
 pub mod coreinit;
 pub mod gx2;
 pub mod hle;
 pub mod nn;
+pub mod patches;
 pub mod proc_ui;
 pub mod process;
 pub mod registry;
@@ -62,6 +64,8 @@ pub struct CafeOs {
     pub exit_code: Option<i32>,
     /// Set when the guest waits for vsync: the current frame should end.
     pub frame_done: bool,
+    /// Downloadable content installed for the title, as `nn_aoc` lists it.
+    pub aoc: Vec<aoc::AocTitle>,
 }
 
 impl CafeOs {
@@ -80,7 +84,9 @@ impl CafeOs {
         registry.register_functions(process::EXPORTS);
         registry.register_functions(coreinit::fs::mutate::EXPORTS);
         registry.register_functions(nn::EXPORTS);
+        registry.register_functions(aoc::EXPORTS);
         registry.register_functions(sndcore2::EXPORTS);
+        registry.register_functions(patches::EXPORTS);
         Self {
             registry,
             timebase: TimeBase::new(),
@@ -101,6 +107,7 @@ impl CafeOs {
             console: Vec::new(),
             exit_code: None,
             frame_done: false,
+            aoc: Vec::new(),
         }
     }
 
@@ -137,6 +144,7 @@ impl CafeOs {
     }
 
     /// `true` while the running thread is blocked (nothing to execute).
+    #[inline]
     pub fn current_thread_blocked(&self) -> bool {
         self.coreinit.threads.current_is_blocked()
     }

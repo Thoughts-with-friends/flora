@@ -56,6 +56,7 @@ impl FileInfo {
         })
     }
 
+    #[inline]
     pub const fn is_rpx(&self) -> bool {
         self.flags & FILE_INFO_FLAG_RPX != 0
     }
@@ -74,6 +75,7 @@ pub struct Section {
 impl Section {
     /// In-memory size: inflated data length, or the header size for `.bss`.
     #[allow(clippy::cast_possible_truncation)]
+    #[inline]
     pub fn memory_size(&self) -> u32 {
         if self.header.kind == SHT_NOBITS { self.header.size } else { self.data.len() as u32 }
     }
@@ -86,6 +88,7 @@ impl Section {
         self.name.strip_prefix(".fimport_").or_else(|| self.name.strip_prefix(".dimport_"))
     }
 
+    #[inline]
     pub fn is_function_import(&self) -> bool {
         self.name.starts_with(".fimport_")
     }

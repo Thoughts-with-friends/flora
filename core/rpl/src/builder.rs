@@ -46,6 +46,7 @@ pub struct RplBuilder {
 }
 
 impl RplBuilder {
+    #[inline]
     pub fn new() -> Self {
         Self { stack_size: 0x1_0000, ..Self::default() }
     }
@@ -58,6 +59,7 @@ impl RplBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn data(mut self, bytes: &[u8]) -> Self {
         self.data = bytes.to_vec();
         self
@@ -65,6 +67,7 @@ impl RplBuilder {
 
     /// Entry point as a byte offset into `.text`.
     #[must_use]
+    #[inline]
     pub const fn entry(mut self, text_offset: u32) -> Self {
         self.entry_offset = text_offset;
         self
@@ -72,6 +75,7 @@ impl RplBuilder {
 
     /// Stores `.text` zlib-compressed, like retail RPX files.
     #[must_use]
+    #[inline]
     pub const fn compress_text(mut self) -> Self {
         self.compress_text = true;
         self

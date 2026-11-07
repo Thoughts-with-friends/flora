@@ -72,6 +72,7 @@ mod final_mix {
     pub const PLAY_DELAY: u32 = super::MAX_CATCH_UP as u32;
 
     /// `(channels, devices)` of the callback's view of `device`.
+    #[inline]
     pub const fn layout(device: u32) -> (u32, u32) {
         if device == super::DEVICE_TV { (6, 1) } else { (4, 2) }
     }

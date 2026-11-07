@@ -1458,6 +1458,8 @@ pub(super) struct Job {
     generation: u64,
     /// Worth the time to make it run as fast as it can.
     optimized: bool,
+    /// Where the quick translation counts its runs (0: it does not count).
+    counter: usize,
 }
 
 impl Job {
@@ -1475,7 +1477,17 @@ impl Job {
 
     /// The same block again, to be made as fast as it can run.
     pub(super) fn into_optimized(self) -> Self {
-        Self { optimized: true, ..self }
+        Self { optimized: true, counter: 0, ..self }
+    }
+
+    /// Where the quick translation counts its runs.
+    pub(super) fn counter_address(&self) -> *const u32 {
+        self.counter as *const u32
+    }
+
+    /// Has the quick translation count its runs at `counter`, a `u32` that outlives the code.
+    pub(super) fn count_runs_at(&mut self, counter: *mut u32) {
+        self.counter = counter as usize;
     }
 
     /// Whether the block has code in `[start, end)`.
@@ -1534,7 +1546,15 @@ pub(super) fn decode_block<B: Bus>(pc: u32, bus: &mut B, generation: u64) -> Res
     }
     let helper =
         interpret_one::<B> as unsafe extern "C" fn(*mut CpuState, *mut HelperContext) -> u32;
-    Ok(Job { pc, instructions, next: at, helper: helper as usize, generation, optimized: false })
+    Ok(Job {
+        pc,
+        instructions,
+        next: at,
+        helper: helper as usize,
+        generation,
+        optimized: false,
+        counter: 0,
+    })
 }
 
 /// One translation thread.
@@ -1593,6 +1613,14 @@ impl Worker {
             let interpret_sig = b.import_signature(signature);
             let block_sig = b.import_signature(block_signature(pointer));
             let interpret = b.ins().iconst(pointer, job.helper as i64);
+            if job.counter != 0 {
+                // Three instructions per run tell the hot blocks, the ones worth optimizing,
+                // from the many that run a few times only.
+                let counter = b.ins().iconst(pointer, job.counter as i64);
+                let runs = b.ins().load(I32, flags(), counter, 0);
+                let runs = b.ins().iadd_imm_u(runs, 1);
+                b.ins().store(flags(), runs, counter, 0);
+            }
 
             let mut emit = Emit {
                 b: &mut b,

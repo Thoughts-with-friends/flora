@@ -2,6 +2,7 @@
 use std::path::{Path, PathBuf};
 
 use shocora_render::{GraphicsApi, UpscaleConfig};
+use wiiu_title::update::AddOnKind;
 
 use crate::input::{KeyBindings, PadBindings};
 
@@ -48,6 +49,11 @@ pub struct AppConfig {
     /// Wii U system storage (`mlc01`) holding installed updates
     /// (`usr/title/0005000e/<id>`). Cemu's is searched after it.
     pub mlc_dir: Option<PathBuf>,
+    /// Folders of updates for any titles, searched before `update/` next to the exe.
+    /// Each one, or each of its subfolders, holds an update's `code/`, `content/`, `meta/`.
+    pub update_dirs: Vec<PathBuf>,
+    /// Folders of downloadable content, searched before `dlc/` next to the exe.
+    pub dlc_dirs: Vec<PathBuf>,
     /// Let titles that refuse to start without an update start without one.
     pub skip_update_check: bool,
     /// Show the GamePad's screen in a window of its own.
@@ -76,6 +82,8 @@ impl Default for AppConfig {
             resolution_factor: 1,
             min_swap_interval: None,
             mlc_dir: None,
+            update_dirs: Vec::new(),
+            dlc_dirs: Vec::new(),
             skip_update_check: true,
             gamepad_window: false,
         }
@@ -84,6 +92,7 @@ impl Default for AppConfig {
 
 impl AppConfig {
     /// Default location: `shocora.toml` in the working directory.
+    #[inline]
     pub fn default_path() -> PathBuf {
         PathBuf::from("shocora.toml")
     }
@@ -129,10 +138,17 @@ impl AppConfig {
                 .cloned()
                 .chain(wiiu_title::update::default_mlc_dirs())
                 .collect(),
+            update_dirs: library_dirs(&self.update_dirs, AddOnKind::Update),
+            dlc_dirs: library_dirs(&self.dlc_dirs, AddOnKind::Dlc),
             skip_update_check: self.skip_update_check,
             ..wiiu_emu::Config::default()
         }
     }
+}
+
+/// `dirs`, then the folder of this kind next to the exe.
+fn library_dirs(dirs: &[PathBuf], kind: AddOnKind) -> Vec<PathBuf> {
+    dirs.iter().cloned().chain(wiiu_title::update::default_library_dirs(kind)).collect()
 }
 
 #[cfg(test)]

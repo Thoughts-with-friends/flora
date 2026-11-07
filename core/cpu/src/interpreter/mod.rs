@@ -172,20 +172,24 @@ pub(crate) mod test_bus {
 #[cfg(test)]
 pub(crate) mod asm {
     //! Tiny encoders for tests.
+    #[inline]
     pub const fn d(op: u32, rt: u32, ra: u32, imm: i32) -> u32 {
         #[allow(clippy::cast_sign_loss)]
         let imm = imm as u32 & 0xFFFF;
         (op << 26) | (rt << 21) | (ra << 16) | imm
     }
 
+    #[inline]
     pub const fn x(op: u32, rt: u32, ra: u32, rb: u32, xo: u32, rc: bool) -> u32 {
         (op << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (xo << 1) | rc as u32
     }
 
+    #[inline]
     pub const fn a(op: u32, frt: u32, fra: u32, frb: u32, frc: u32, xo: u32) -> u32 {
         (op << 26) | (frt << 21) | (fra << 16) | (frb << 11) | (frc << 6) | (xo << 1)
     }
 
+    #[inline]
     pub const fn li(rt: u32, imm: i32) -> u32 {
         d(14, rt, 0, imm)
     }

@@ -104,6 +104,7 @@ impl SurfaceWords {
         })
     }
 
+    #[inline]
     pub const fn is_valid(&self) -> bool {
         self.address != 0 && self.width != 0 && self.height != 0
     }
@@ -533,6 +534,7 @@ impl Latte {
         self.commands.push(RenderCommand::Clear { color: color_clear, depth: depth_clear });
     }
 
+    #[inline]
     pub fn set_resolution_factor(&mut self, factor: u32) {
         self.requested_factor = factor.max(1);
         self.update_resolution();

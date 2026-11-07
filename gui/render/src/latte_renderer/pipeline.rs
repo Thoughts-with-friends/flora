@@ -28,6 +28,7 @@ pub(super) const PIPELINE_WAIT: Duration = Duration::from_millis(8);
 pub struct PipelineSetting(Arc<AtomicBool>);
 
 impl PipelineSetting {
+    #[inline]
     pub fn set(&self, background: bool) {
         self.0.store(background, Ordering::Relaxed);
     }

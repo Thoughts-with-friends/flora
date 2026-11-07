@@ -45,6 +45,7 @@ pub const fn format_bits(hw_format: u32) -> u32 {
 }
 
 /// BC1..=BC5.
+#[inline]
 pub const fn is_compressed(hw_format: u32) -> bool {
     let f = hw_format & 0x3F;
     f >= 0x31 && f <= 0x35

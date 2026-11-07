@@ -25,11 +25,13 @@ macro_rules! opcodes {
 
         impl Opcode {
             /// Base mnemonic (without `.`/`o` suffixes).
+            #[inline]
             pub const fn mnemonic(self) -> &'static str {
                 match self { $($(Self::$name => $mnemonic,)*)* }
             }
 
             /// Interpreter module responsible for this opcode.
+            #[inline]
             pub const fn unit(self) -> Unit {
                 match self { $($(Self::$name => Unit::$unit,)*)* }
             }

@@ -124,6 +124,9 @@ impl CafeOs {
         let mut allocator = LinearAllocator::new(TEXT, MEM2, LOADER);
         let module = wiiu_rpl::load(&file, name, memory, &mut allocator, &mut self.registry)?;
         log::info!("loaded {name}: entry {:#010x}, segments {:x?}", module.entry, module.segments);
+        if let Some(&text) = module.segments.get(&SegmentKind::Text) {
+            crate::patches::apply(memory, &self.registry, text)?;
+        }
         self.coreinit.tls_image = module.tls;
 
         let heap_start = allocator.cursor(SegmentKind::Data).next_multiple_of(HEAP_ALIGN);

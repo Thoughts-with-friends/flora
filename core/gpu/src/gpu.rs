@@ -29,6 +29,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
@@ -51,11 +52,13 @@ impl Gpu {
 
     /// Draws the title's pictures this many times larger, as far as that stays within
     /// [`ResolutionScale::MAX_WIDTH`](crate::render::ResolutionScale::MAX_WIDTH).
+    #[inline]
     pub fn set_resolution_factor(&mut self, factor: u32) {
         self.latte.set_resolution_factor(factor);
     }
 
     /// Makes the host renderer forget everything of the previous boot.
+    #[inline]
     pub fn reset_renderer(&mut self) {
         self.latte.commands.push(RenderCommand::Reset);
     }
@@ -68,20 +71,24 @@ impl Gpu {
     }
 
     /// Drains pending render commands for the host renderer.
+    #[inline]
     pub fn take_render_commands(&mut self) -> Vec<RenderCommand> {
         std::mem::take(&mut self.latte.commands)
     }
 
     /// Render commands waiting for the host, to keep the queue bounded.
+    #[inline]
     pub const fn pending_commands(&self) -> usize {
         self.latte.commands.len()
     }
 
     /// Drains interrupts raised since the last call.
+    #[inline]
     pub fn take_interrupts(&mut self) -> PendingInterrupts {
         std::mem::take(&mut self.interrupts)
     }
 
+    #[inline]
     pub const fn registers(&self) -> &crate::regs::RegisterFile {
         &self.cp.regs
     }

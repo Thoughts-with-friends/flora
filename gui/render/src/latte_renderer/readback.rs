@@ -155,6 +155,7 @@ impl LatteRenderer {
     }
 
     /// Reads a screen back as RGBA8 (tools and tests).
+    #[inline]
     pub fn read_screen(&mut self, screen: Screen) -> Option<(u32, u32, Vec<u8>)> {
         self.submit();
         let image = self.screens.get(screen)?;
